@@ -1,0 +1,31 @@
+{
+	# No admin API exposed inside the compose network.
+	admin off
+}
+
+{$SERVER_DOMAIN} {
+	# Access logging is OFF, on purpose and permanently.
+	#
+	# Caddy's default log format records `client_ip` and `remote_ip`. The privacy notice says IP
+	# addresses are never stored (PLAN.md §6), and that claim is only true while this block exists -
+	# it is load-bearing for the privacy stance and, because no personal data is retained, for the
+	# GDPR position too. Do not replace this with a redacting format: a format can drift, an absent
+	# log cannot.
+	log {
+		output discard
+	}
+
+	encode zstd gzip
+
+	# X-Forwarded-For is deliberately left intact. The app needs the client address to maintain the
+	# per-/24 rate-limit buckets (PLAN.md §1), which live in memory, are keyed by a hash, and are
+	# never persisted or written to a log line. Transient use, no retention.
+	reverse_proxy api:8080
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

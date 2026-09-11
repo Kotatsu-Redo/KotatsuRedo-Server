@@ -1,0 +1,14 @@
+.env
+build/
+.gradle/
+out/
+*.log
+
+.idea/
+*.iml
+.DS_Store
+
+# Cached upstream word lists. Re-fetched by tools/curate_wordlists.py --fetch; the curated output in
+# src/main/resources/filter/ is what is committed.
+tools/.cache/
+tools/.corpus/

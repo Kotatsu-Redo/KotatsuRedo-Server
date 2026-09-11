@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Kotatsu-Redo moderation</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+
+<section id="login" hidden>
+	<h1>Moderation</h1>
+	<p class="sub">Kotatsu-Redo community server</p>
+	<label for="u">Username</label>
+	<input id="u" autocomplete="username">
+	<label for="p">Password</label>
+	<input id="p" type="password" autocomplete="current-password">
+	<label for="c">Authenticator code</label>
+	<input id="c" inputmode="numeric" autocomplete="one-time-code" placeholder="000000">
+	<div class="row"><button class="primary" id="signin">Sign in</button></div>
+	<div class="error" id="login-error"></div>
+</section>
+
+<section id="enrol" class="enrol" hidden style="margin:12vh auto;max-width:520px;">
+	<div class="card">
+		<h2 style="margin-top:0">Set up two-factor</h2>
+		<p style="color:var(--muted)">
+			Every moderator account needs an authenticator. Until this is done, nothing else in the
+			panel will answer.
+		</p>
+		<p>Add this secret to your authenticator app:</p>
+		<div class="secret mono" id="enrol-secret"></div>
+		<p><a id="enrol-link" href="#">Open in an authenticator app</a></p>
+		<label for="enrol-code">Enter the code it shows</label>
+		<input id="enrol-code" inputmode="numeric" placeholder="000000">
+		<div class="row">
+			<button id="enrol-cancel">Sign out</button>
+			<button class="primary" id="enrol-confirm">Confirm</button>
+		</div>
+		<div class="error" id="enrol-error"></div>
+	</div>
+</section>
+
+<div id="app" hidden>
+	<nav>
+		<h1>Queues</h1>
+		<div id="nav-queues"></div>
+		<h1 style="margin-top:20px">Admin</h1>
+		<div id="nav-admin"></div>
+		<div class="who">
+			<div id="who-name"></div>
+			<div id="who-role"></div>
+			<button id="signout" style="margin-top:8px;width:100%">Sign out</button>
+		</div>
+	</nav>
+	<main>
+		<header><h2 id="view-title"></h2><span class="hint" id="view-hint"></span></header>
+		<div id="view"></div>
+		<div class="error" id="view-error"></div>
+	</main>
+</div>
+
+<dialog id="prompt">
+	<h3 id="prompt-title" style="margin-top:0"></h3>
+	<p id="prompt-note" style="color:var(--muted);font-size:13px"></p>
+	<label for="prompt-input">Reason</label>
+	<input id="prompt-input" autocomplete="off">
+	<div class="row">
+		<button id="prompt-cancel">Cancel</button>
+		<button class="primary" id="prompt-ok">Confirm</button>
+	</div>
+</dialog>
+
+<script src="panel.js"></script>
+</body>
+</html>

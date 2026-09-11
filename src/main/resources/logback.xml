@@ -1,0 +1,21 @@
+<configuration>
+	<!--
+	  Deliberately plain. The pattern below is the only thing written per request, and CallLogging
+	  builds that message from an allow-list of four fields (see plugins/Plugins.kt). Do not add
+	  %header, %X{...} for anything credential-bearing, or a request-body encoder here.
+	-->
+	<appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+		<encoder>
+			<pattern>%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%X{call-id}] %logger{24} - %msg%n</pattern>
+		</encoder>
+	</appender>
+
+	<root level="INFO">
+		<appender-ref ref="STDOUT"/>
+	</root>
+
+	<!-- Hikari and Flyway are chatty at DEBUG and say nothing useful at INFO once running. -->
+	<logger name="com.zaxxer.hikari" level="WARN"/>
+	<logger name="org.flywaydb" level="INFO"/>
+	<logger name="io.netty" level="WARN"/>
+</configuration>

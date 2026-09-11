@@ -1,0 +1,301 @@
+{
+ "data": [
+  {
+   "id": "54139",
+   "type": "manga",
+   "links": {
+    "self": "https://kitsu.app/api/edge/manga/54139"
+   },
+   "attributes": {
+    "createdAt": "2018-12-03T09:06:32.604Z",
+    "updatedAt": "2026-09-10T12:00:27.088Z",
+    "slug": "chainsawman",
+    "synopsis": "The name says it all! Denji's life of poverty is changed forever when he merges with his pet chainsaw dog, Pochita! Now he's living in the big city and an official Devil Hunter. But he's got a lot to learn about his new job and chainsaw powers!\n\n(Source: Mangaplus)\n\nNotes:\n- Nominated for the 2020 Manga Taisho Award.\n- Winner of the 2021 Kono Manga ga Sugoi Award.\n- Winner of the 66th Shogakukan Manga Award in the shounen category.\n- Winner of the 2021 and 2022 Harvey Award for Best Manga.",
+    "description": "The name says it all! Denji's life of poverty is changed forever when he merges with his pet chainsaw dog, Pochita! Now he's living in the big city and an official Devil Hunter. But he's got a lot to learn about his new job and chainsaw powers!\n\n(Source: Mangaplus)\n\nNotes:\n- Nominated for the 2020 Manga Taisho Award.\n- Winner of the 2021 Kono Manga ga Sugoi Award.\n- Winner of the 66th Shogakukan Manga Award in the shounen category.\n- Winner of the 2021 and 2022 Harvey Award for Best Manga.",
+    "coverImageTopOffset": 0,
+    "titles": {
+     "en": "Chainsaw Man",
+     "ja_jp": "チェンソーマン"
+    },
+    "canonicalTitle": "Chainsaw Man",
+    "abbreviatedTitles": [
+     "Chainsawman",
+     "Chensoo Man",
+     "CSM",
+     "Людина-бензопила",
+     "Человек-бензопила",
+     "رجل المنشار",
+     "مرد اره ای",
+     "មនុស្សរណា",
+     "チェンソーマン",
+     "チェンソーマン 第二部",
+     "电锯人",
+     "鏈鋸人",
+     "電鋸人",
+     "체인쏘맨",
+     "Chainsaw Man: Public Safety Saga"
+    ],
+    "averageRating": "84.79",
+    "ratingFrequencies": {
+     "2": "824",
+     "3": "15",
+     "4": "31",
+     "5": "9",
+     "6": "60",
+     "7": "22",
+     "8": "636",
+     "9": "24",
+     "10": "191",
+     "11": "35",
+     "12": "352",
+     "13": "68",
+     "14": "2875",
+     "15": "281",
+     "16": "2426",
+     "17": "738",
+     "18": "3379",
+     "19": "619",
+     "20": "10248"
+    },
+    "userCount": 43751,
+    "favoritesCount": 1588,
+    "startDate": "2018-12-03",
+    "endDate": "2020-12-14",
+    "nextRelease": null,
+    "popularityRank": 25,
+    "ratingRank": 9,
+    "ageRating": "R",
+    "ageRatingGuide": "Violence & blood, partial nudity",
+    "subtype": "manga",
+    "status": "finished",
+    "tba": null,
+    "posterImage": {
+     "tiny": "https://media.kitsu.app/manga/54139/poster_image/tiny-74397fc2bef16a7435c07dbf7be601ec.jpeg",
+     "large": "https://media.kitsu.app/manga/54139/poster_image/large-abe06849b6452458885bb1d22c29ed23.jpeg",
+     "small": "https://media.kitsu.app/manga/54139/poster_image/small-820164ca2c8731ee78c141ed2977e728.jpeg",
+     "medium": "https://media.kitsu.app/manga/54139/poster_image/medium-9491633b3d19666dba2e36e07413389e.jpeg",
+     "original": "https://media.kitsu.app/manga/54139/poster_image/0e1fd07d0df5d9187b84b16128438382.jpg",
+     "meta": {
+      "dimensions": {
+       "tiny": {
+        "width": 110,
+        "height": 156
+       },
+       "large": {
+        "width": 550,
+        "height": 780
+       },
+       "small": {
+        "width": 284,
+        "height": 402
+       },
+       "medium": {
+        "width": 390,
+        "height": 554
+       }
+      }
+     }
+    },
+    "coverImage": {
+     "tiny": "https://media.kitsu.app/manga/54139/cover_image/tiny-b07af0eb9be16ec35666efdeabd34ba1.jpeg",
+     "large": "https://media.kitsu.app/manga/54139/cover_image/large-259b90cae4de586d5b68e32253b183ca.jpeg",
+     "small": "https://media.kitsu.app/manga/54139/cover_image/small-38a84934fe95ecab6d88679f39ba4b9b.jpeg",
+     "original": "https://media.kitsu.app/manga/54139/cover_image/69c39e98b1799c8e115745df9aa36e6e.png",
+     "meta": {
+      "dimensions": {
+       "tiny": {
+        "width": 840,
+        "height": 200
+       },
+       "large": {
+        "width": 3360,
+        "height": 800
+       },
+       "small": {
+        "width": 1680,
+        "height": 400
+       }
+      }
+     }
+    },
+    "chapterCount": 97,
+    "volumeCount": 11,
+    "serialization": "Shounen Jump (Weekly)",
+    "mangaType": "manga"
+   },
+   "relationships": {
+    "genres": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/genres",
+      "related": "https://kitsu.app/api/edge/manga/54139/genres"
+     }
+    },
+    "categories": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/categories",
+      "related": "https://kitsu.app/api/edge/manga/54139/categories"
+     }
+    },
+    "castings": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/castings",
+      "related": "https://kitsu.app/api/edge/manga/54139/castings"
+     }
+    },
+    "installments": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/installments",
+      "related": "https://kitsu.app/api/edge/manga/54139/installments"
+     }
+    },
+    "mappings": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/mappings",
+      "related": "https://kitsu.app/api/edge/manga/54139/mappings"
+     },
+     "data": [
+      {
+       "type": "mappings",
+       "id": "257503"
+      },
+      {
+       "type": "mappings",
+       "id": "251395"
+      },
+      {
+       "type": "mappings",
+       "id": "251396"
+      }
+     ]
+    },
+    "reviews": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/reviews",
+      "related": "https://kitsu.app/api/edge/manga/54139/reviews"
+     }
+    },
+    "mediaRelationships": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/media-relationships",
+      "related": "https://kitsu.app/api/edge/manga/54139/media-relationships"
+     }
+    },
+    "characters": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/characters",
+      "related": "https://kitsu.app/api/edge/manga/54139/characters"
+     }
+    },
+    "staff": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/staff",
+      "related": "https://kitsu.app/api/edge/manga/54139/staff"
+     }
+    },
+    "productions": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/productions",
+      "related": "https://kitsu.app/api/edge/manga/54139/productions"
+     }
+    },
+    "quotes": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/quotes",
+      "related": "https://kitsu.app/api/edge/manga/54139/quotes"
+     }
+    },
+    "chapters": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/chapters",
+      "related": "https://kitsu.app/api/edge/manga/54139/chapters"
+     }
+    },
+    "mangaCharacters": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/manga-characters",
+      "related": "https://kitsu.app/api/edge/manga/54139/manga-characters"
+     }
+    },
+    "mangaStaff": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54139/relationships/manga-staff",
+      "related": "https://kitsu.app/api/edge/manga/54139/manga-staff"
+     }
+    }
+   }
+  }
+ ],
+ "included": [
+  {
+   "id": "257503",
+   "type": "mappings",
+   "links": {
+    "self": "https://kitsu.app/api/edge/mappings/257503"
+   },
+   "attributes": {
+    "createdAt": "2020-05-02T18:21:49.400Z",
+    "updatedAt": "2020-05-02T18:21:49.400Z",
+    "externalSite": "anilist/manga",
+    "externalId": "105778"
+   },
+   "relationships": {
+    "item": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/mappings/257503/relationships/item",
+      "related": "https://kitsu.app/api/edge/mappings/257503/item"
+     }
+    }
+   }
+  },
+  {
+   "id": "251395",
+   "type": "mappings",
+   "links": {
+    "self": "https://kitsu.app/api/edge/mappings/251395"
+   },
+   "attributes": {
+    "createdAt": "2019-04-30T15:19:01.200Z",
+    "updatedAt": "2022-07-12T15:52:50.697Z",
+    "externalSite": "myanimelist/manga",
+    "externalId": "116778"
+   },
+   "relationships": {
+    "item": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/mappings/251395/relationships/item",
+      "related": "https://kitsu.app/api/edge/mappings/251395/item"
+     }
+    }
+   }
+  },
+  {
+   "id": "251396",
+   "type": "mappings",
+   "links": {
+    "self": "https://kitsu.app/api/edge/mappings/251396"
+   },
+   "attributes": {
+    "createdAt": "2019-04-30T15:20:17.623Z",
+    "updatedAt": "2022-07-12T15:52:50.700Z",
+    "externalSite": "mangaupdates",
+    "externalId": "151847"
+   },
+   "relationships": {
+    "item": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/mappings/251396/relationships/item",
+      "related": "https://kitsu.app/api/edge/mappings/251396/item"
+     }
+    }
+   }
+  }
+ ],
+ "meta": {
+  "count": 12
+ },
+ "links": {
+  "first": "https://kitsu.app/api/edge/manga?filter%5Btext%5D=chainsaw+man&include=mappings&page%5Blimit%5D=1&page%5Boffset%5D=0",
+  "next": "https://kitsu.app/api/edge/manga?filter%5Btext%5D=chainsaw+man&include=mappings&page%5Blimit%5D=1&page%5Boffset%5D=1",
+  "last": "https://kitsu.app/api/edge/manga?filter%5Btext%5D=chainsaw+man&include=mappings&page%5Blimit%5D=1&page%5Boffset%5D=11"
+ }
+}

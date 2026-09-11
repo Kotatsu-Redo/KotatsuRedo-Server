@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # Integration tests need a real Postgres: bytea semantics, the unique index on secret_sha256 and
+    # the user_trust view are all Postgres behaviour an in-memory database would fake differently.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: kotatsuredo
+          POSTGRES_USER: kotatsuredo
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kotatsuredo"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: jdbc:postgresql://localhost:5432/kotatsuredo
+      TEST_DATABASE_USER: kotatsuredo
+      TEST_DATABASE_PASSWORD: ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test
+        run: ./gradlew --no-daemon build
+
+      # The integration tests skip themselves when no database is configured, which would let a
+      # broken CI database turn into a silently green build. Fail loudly instead.
+      - name: Fail if integration tests were skipped
+        run: |
+          if grep -rq 'skipped="[1-9]' build/test-results/test/*.xml; then
+            echo "Integration tests were skipped - TEST_DATABASE_URL is not reaching the test JVM."
+            grep -rl 'skipped="[1-9]' build/test-results/test/*.xml
+            exit 1
+          fi
+
+      - name: Verify the Docker image builds
+        run: docker build -t kotatsuredo-server:ci .
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: build/reports/tests/test

@@ -1,0 +1,19 @@
+# Local development only. Publishes ports so tests and a phone on the same network can reach the
+# stack directly.
+#
+# Kept separate from docker-compose.yml rather than being an override file, because an override is
+# loaded automatically and would silently expose the database in a real deployment too.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+#
+# The api is published as plain HTTP on 8080 so a device can talk to it without a trusted
+# certificate: Caddy serves a self-signed cert for `localhost`, which a phone will refuse. Point the
+# app at http://<this machine's LAN ip>:8080 to try the community features for real.
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  api:
+    ports:
+      - "8080:8080"

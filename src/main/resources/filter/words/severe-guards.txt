@@ -1,0 +1,31 @@
+# Innocent words that contain a `severe` term.
+#
+# `severe` matches as a substring, so each of these would be blocked if the dictionary
+# did not know it. Generated from SEVERE_SUPERSTRINGS in tools/curate_wordlists.py, and
+# asserted by WordFilterTest - adding a severe term without its superstrings fails the
+# build rather than quietly blocking `raccoon`.
+
+auspicious
+cocoon
+cocoons
+conspicuous
+despicable
+dykes
+fagoting
+pakistan
+pakistani
+pakistanis
+perspicacious
+raccoon
+raccoons
+retardant
+retardants
+retardation
+spice
+spices
+spicy
+suspicion
+suspicions
+suspicious
+tycoon
+tycoons

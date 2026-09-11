@@ -1,0 +1,299 @@
+{
+ "data": [
+  {
+   "id": "54114",
+   "type": "manga",
+   "links": {
+    "self": "https://kitsu.app/api/edge/manga/54114"
+   },
+   "attributes": {
+    "createdAt": "2018-11-11T17:13:07.946Z",
+    "updatedAt": "2026-09-10T12:00:27.088Z",
+    "slug": "solo-levelling",
+    "synopsis": "In a world where awakened beings called “Hunters” must battle deadly monsters to protect humanity, Sung Jinwoo, nicknamed “the weakest hunter of all mankind,” finds himself in a constant struggle for survival. One day, after a brutal encounter in an overpowered dungeon wipes out his party and threatens to end his life, a mysterious System chooses him as its sole player: Jinwoo has been granted the rare opportunity to level up his abilities, possibly beyond any known limits. Follow Jinwoo’s journey as he takes on ever-stronger enemies, both human and monster, to discover the secrets deep within the dungeons and the ultimate extent of his powers.\n\n(Source: Tappytoon)\n\nNote: Chapter count includes a prologue and 21 side stories.",
+    "description": "In a world where awakened beings called “Hunters” must battle deadly monsters to protect humanity, Sung Jinwoo, nicknamed “the weakest hunter of all mankind,” finds himself in a constant struggle for survival. One day, after a brutal encounter in an overpowered dungeon wipes out his party and threatens to end his life, a mysterious System chooses him as its sole player: Jinwoo has been granted the rare opportunity to level up his abilities, possibly beyond any known limits. Follow Jinwoo’s journey as he takes on ever-stronger enemies, both human and monster, to discover the secrets deep within the dungeons and the ultimate extent of his powers.\n\n(Source: Tappytoon)\n\nNote: Chapter count includes a prologue and 21 side stories.",
+    "coverImageTopOffset": 0,
+    "titles": {
+     "en_jp": "Boku dake Level Up na Ken",
+     "en_kr": "Na Honjaman Level Up",
+     "en_us": "Solo Leveling",
+     "ja_jp": "俺だけレベルアップな件",
+     "ko_kr": "나 혼자만 레벨업"
+    },
+    "canonicalTitle": "Solo Leveling",
+    "abbreviatedTitles": [
+     "Only I level up",
+     "I Level Up Alone",
+     "Поднятие уровня в одиночку",
+     "Na Honjaman Level-Up",
+     "Only I Level Up",
+     "Ore Dake Level Up na Ken",
+     "Поднятие уровня в одиночку",
+     "Тільки я візьму новий рівень",
+     "تکرو",
+     "我独自升级"
+    ],
+    "averageRating": "84.52",
+    "ratingFrequencies": {
+     "2": "1414",
+     "3": "19",
+     "4": "81",
+     "5": "17",
+     "6": "82",
+     "7": "18",
+     "8": "1233",
+     "9": "21",
+     "10": "244",
+     "11": "61",
+     "12": "407",
+     "13": "91",
+     "14": "3375",
+     "15": "290",
+     "16": "2156",
+     "17": "639",
+     "18": "2890",
+     "19": "625",
+     "20": "15651"
+    },
+    "userCount": 57391,
+    "favoritesCount": 1906,
+    "startDate": "2018-03-04",
+    "endDate": "2023-05-31",
+    "nextRelease": null,
+    "popularityRank": 18,
+    "ratingRank": 18,
+    "ageRating": "PG",
+    "ageRatingGuide": null,
+    "subtype": "manhwa",
+    "status": "finished",
+    "tba": null,
+    "posterImage": {
+     "tiny": "https://media.kitsu.app/manga/poster_images/54114/tiny.jpg",
+     "large": "https://media.kitsu.app/manga/poster_images/54114/large.jpg",
+     "small": "https://media.kitsu.app/manga/poster_images/54114/small.jpg",
+     "medium": "https://media.kitsu.app/manga/poster_images/54114/medium.jpg",
+     "original": "https://media.kitsu.app/manga/poster_images/54114/original.jpg",
+     "meta": {
+      "dimensions": {
+       "tiny": {
+        "width": 110,
+        "height": 156
+       },
+       "large": {
+        "width": 550,
+        "height": 780
+       },
+       "small": {
+        "width": 284,
+        "height": 402
+       },
+       "medium": {
+        "width": 390,
+        "height": 554
+       }
+      }
+     }
+    },
+    "coverImage": {
+     "tiny": "https://media.kitsu.app/manga/54114/cover_image/tiny-8d9f4b722a3050275ee0651f91d04f40.jpeg",
+     "large": "https://media.kitsu.app/manga/54114/cover_image/large-5ced5f4969b4e15202e7f08188ba093f.jpeg",
+     "small": "https://media.kitsu.app/manga/54114/cover_image/small-bd7baf08e81ec18b717616fbe55ef180.jpeg",
+     "original": "https://media.kitsu.app/manga/54114/cover_image/50f5b4b656a64e8fe560fad557830dcd.png",
+     "meta": {
+      "dimensions": {
+       "tiny": {
+        "width": 840,
+        "height": 200
+       },
+       "large": {
+        "width": 3360,
+        "height": 800
+       },
+       "small": {
+        "width": 1680,
+        "height": 400
+       }
+      }
+     }
+    },
+    "chapterCount": 201,
+    "volumeCount": null,
+    "serialization": "KakaoPage",
+    "mangaType": "manhwa"
+   },
+   "relationships": {
+    "genres": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/genres",
+      "related": "https://kitsu.app/api/edge/manga/54114/genres"
+     }
+    },
+    "categories": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/categories",
+      "related": "https://kitsu.app/api/edge/manga/54114/categories"
+     }
+    },
+    "castings": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/castings",
+      "related": "https://kitsu.app/api/edge/manga/54114/castings"
+     }
+    },
+    "installments": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/installments",
+      "related": "https://kitsu.app/api/edge/manga/54114/installments"
+     }
+    },
+    "mappings": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/mappings",
+      "related": "https://kitsu.app/api/edge/manga/54114/mappings"
+     },
+     "data": [
+      {
+       "type": "mappings",
+       "id": "254669"
+      },
+      {
+       "type": "mappings",
+       "id": "250536"
+      },
+      {
+       "type": "mappings",
+       "id": "252492"
+      }
+     ]
+    },
+    "reviews": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/reviews",
+      "related": "https://kitsu.app/api/edge/manga/54114/reviews"
+     }
+    },
+    "mediaRelationships": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/media-relationships",
+      "related": "https://kitsu.app/api/edge/manga/54114/media-relationships"
+     }
+    },
+    "characters": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/characters",
+      "related": "https://kitsu.app/api/edge/manga/54114/characters"
+     }
+    },
+    "staff": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/staff",
+      "related": "https://kitsu.app/api/edge/manga/54114/staff"
+     }
+    },
+    "productions": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/productions",
+      "related": "https://kitsu.app/api/edge/manga/54114/productions"
+     }
+    },
+    "quotes": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/quotes",
+      "related": "https://kitsu.app/api/edge/manga/54114/quotes"
+     }
+    },
+    "chapters": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/chapters",
+      "related": "https://kitsu.app/api/edge/manga/54114/chapters"
+     }
+    },
+    "mangaCharacters": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/manga-characters",
+      "related": "https://kitsu.app/api/edge/manga/54114/manga-characters"
+     }
+    },
+    "mangaStaff": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/manga/54114/relationships/manga-staff",
+      "related": "https://kitsu.app/api/edge/manga/54114/manga-staff"
+     }
+    }
+   }
+  }
+ ],
+ "included": [
+  {
+   "id": "254669",
+   "type": "mappings",
+   "links": {
+    "self": "https://kitsu.app/api/edge/mappings/254669"
+   },
+   "attributes": {
+    "createdAt": "2020-05-02T14:54:51.096Z",
+    "updatedAt": "2020-05-02T14:54:51.096Z",
+    "externalSite": "anilist/manga",
+    "externalId": "105398"
+   },
+   "relationships": {
+    "item": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/mappings/254669/relationships/item",
+      "related": "https://kitsu.app/api/edge/mappings/254669/item"
+     }
+    }
+   }
+  },
+  {
+   "id": "250536",
+   "type": "mappings",
+   "links": {
+    "self": "https://kitsu.app/api/edge/mappings/250536"
+   },
+   "attributes": {
+    "createdAt": "2018-11-11T17:14:42.094Z",
+    "updatedAt": "2022-12-11T03:51:01.026Z",
+    "externalSite": "mangaupdates",
+    "externalId": "6z1uqw7"
+   },
+   "relationships": {
+    "item": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/mappings/250536/relationships/item",
+      "related": "https://kitsu.app/api/edge/mappings/250536/item"
+     }
+    }
+   }
+  },
+  {
+   "id": "252492",
+   "type": "mappings",
+   "links": {
+    "self": "https://kitsu.app/api/edge/mappings/252492"
+   },
+   "attributes": {
+    "createdAt": "2019-10-13T11:26:48.787Z",
+    "updatedAt": "2022-07-03T22:00:15.859Z",
+    "externalSite": "myanimelist/manga",
+    "externalId": "121496"
+   },
+   "relationships": {
+    "item": {
+     "links": {
+      "self": "https://kitsu.app/api/edge/mappings/252492/relationships/item",
+      "related": "https://kitsu.app/api/edge/mappings/252492/item"
+     }
+    }
+   }
+  }
+ ],
+ "meta": {
+  "count": 8
+ },
+ "links": {
+  "first": "https://kitsu.app/api/edge/manga?filter%5Btext%5D=solo+leveling&include=mappings&page%5Blimit%5D=1&page%5Boffset%5D=0",
+  "next": "https://kitsu.app/api/edge/manga?filter%5Btext%5D=solo+leveling&include=mappings&page%5Blimit%5D=1&page%5Boffset%5D=1",
+  "last": "https://kitsu.app/api/edge/manga?filter%5Btext%5D=solo+leveling&include=mappings&page%5Blimit%5D=1&page%5Boffset%5D=7"
+ }
+}
