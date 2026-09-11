@@ -18,6 +18,16 @@ community.example.com.  A  203.0.113.10
 Open 80 and 443. Nothing else needs to be reachable: Postgres is on the compose network only, and
 Caddy's own admin API is disabled in `deploy/Caddyfile`.
 
+**If the zone is on Cloudflare, set the record to "DNS only" — the grey cloud, not the orange
+one.** Proxying it routes every request through Cloudflare, which terminates TLS (so it can read
+comments in plaintext) and logs the address of everyone who posts one. That is a claim
+[`legal/PRIVACY.md`](legal/PRIVACY.md) currently says is not true, so turning the orange cloud on
+means rewriting the notice. It also breaks Caddy's first certificate, because Let's Encrypt's HTTP-01
+challenge would be answered by Cloudflare rather than by the box.
+
+Cloudflare as a registrar and nameserver is fine and changes nothing: it answers name lookups and
+never sees a request.
+
 **Pick a host that will forward a complaint rather than null-route you on the first one.** This is a
 discussion service that never touches manga content, but you will still get notices, and the
 difference between a provider that emails you and one that pulls the plug is the difference between
@@ -199,7 +209,8 @@ reach them:
 docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
 ```
 
-The API is then plain HTTP on `8080`, because Caddy serves a self-signed certificate for `localhost`
-and a phone will refuse it. Point the app at `http://<your LAN ip>:8080` and try the whole loop: post
+The API is then plain HTTP on `8787` (`API_HOST_PORT` in `.env`), because Caddy serves a
+self-signed certificate for `localhost` and a phone will refuse it. Point the app at
+`http://<your LAN ip>:8787` and try the whole loop: post
 a comment, reply to it from a second device, vote, get the reply notification, trip the filter, press
 "this was wrong", and watch it arrive in the panel's **Blocked** queue.

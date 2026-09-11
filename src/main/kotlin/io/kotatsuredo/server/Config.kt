@@ -29,8 +29,18 @@ data class Config(
 
 	companion object {
 
+		/**
+		 * Not 8080. Nothing else on the box should be holding this, and on a VPS 8080 usually is:
+		 * it is the first port any other JVM, dev server or admin panel reaches for. The api is only
+		 * reachable over the compose network in a real deployment, so this mostly matters for the
+		 * local overlay that publishes it - but a default that collides is a default worth changing.
+		 *
+		 * Change `PORT` in `.env` to move it; `docker-compose.yml` and the Caddyfile both follow.
+		 */
+		const val DEFAULT_PORT = 8787
+
 		fun fromEnv(env: Map<String, String> = System.getenv()): Config = Config(
-			port = env.optional("PORT")?.toIntOrNull() ?: 8080,
+			port = env.optional("PORT")?.toIntOrNull() ?: DEFAULT_PORT,
 			host = env.optional("HOST") ?: "0.0.0.0",
 			environment = env.optional("APP_ENV") ?: "development",
 			devicePepper = env.required("DEVICE_PEPPER"),

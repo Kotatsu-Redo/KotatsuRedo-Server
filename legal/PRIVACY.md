@@ -243,6 +243,7 @@ change before you publish your own version:
   names the CNIL, which is the French authority. If you host in the US, DMCA safe harbour matters and
   you should register a designated agent instead.
 - **The backup retention**, if yours differs from seven days.
+- **Anything you put in front of the instance.** This notice describes traffic arriving directly at the server. A CDN or a tunnel in the path terminates TLS and logs addresses, and if you add one you have to say so.
 
 Everything describing **what the software collects and for how long** is a property of the code and
 is true for your instance too, provided you have not changed it and you have left access logging off

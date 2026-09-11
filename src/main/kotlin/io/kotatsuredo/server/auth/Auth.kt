@@ -50,9 +50,20 @@ fun ApplicationCall.requireCaller(identities: IdentityService): Caller {
  * A coarse network key for the per-/24 bucket. Hashed immediately and held only in memory: the raw
  * address is never persisted and never written to a log line (PLAN.md §6).
  */
-fun ApplicationCall.networkKey(): String {
-	val forwarded = request.header("X-Forwarded-For")?.substringBefore(',')?.trim()
-	val address = forwarded?.takeIf { it.isNotEmpty() } ?: request.local.remoteAddress
+fun ApplicationCall.networkKey(): String =
+	networkKey(request.header("X-Forwarded-For"), request.local.remoteAddress)
+
+/**
+ * The **last** entry of `X-Forwarded-For`, not the first.
+ *
+ * Caddy appends the address it saw to whatever arrived, so a client that sends its own
+ * `X-Forwarded-For: 1.2.3.4` produces `1.2.3.4, <real address>`. Reading the first entry would let
+ * anyone dodge the per-network bucket by rotating a header. Caddy is the only trusted hop and the
+ * entry it added is the last one; everything to the left of it is client input.
+ */
+internal fun networkKey(forwardedFor: String?, remoteAddress: String): String {
+	val address = forwardedFor?.substringAfterLast(',')?.trim()?.takeIf { it.isNotEmpty() }
+		?: remoteAddress
 	val prefix = if (address.count { it == '.' } == 3) address.substringBeforeLast('.') else address
 	return prefix.hashCode().toString()
 }

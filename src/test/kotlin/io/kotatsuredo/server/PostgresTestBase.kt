@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
  * differently. So these tests need a database, and take one from the environment rather than starting
  * it themselves:
  *
- *   docker compose up -d postgres
+ *   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d postgres
  *   export TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/kotatsuredo
  *
  * CI supplies it as a service container. When it is absent the tests skip loudly rather than failing,
