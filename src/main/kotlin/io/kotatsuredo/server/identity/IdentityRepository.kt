@@ -1,5 +1,6 @@
 package io.kotatsuredo.server.identity
 
+import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.ResultRow
 // `where { }` scopes SqlExpressionBuilder as a receiver, but `deleteWhere { }` passes it as a
 // parameter - so `eq` has to be imported explicitly for the delete below to resolve.
@@ -17,12 +18,44 @@ import org.jetbrains.exposed.sql.Database as ExposedDatabase
 class IdentityRepository(private val db: ExposedDatabase) {
 
 	fun findBySecretHash(secretHash: ByteArray): Identity? = transaction(db) {
-		AppUsers.selectAll()
-			.where { AppUsers.secretHash eq secretHash }
+		// Resolved against user_secret, not app_user.secret_sha256: an account can hold more than one
+		// key once a device restore has adopted a second.
+		(UserSecrets innerJoin AppUsers)
+			.selectAll()
+			.where { UserSecrets.secretHash eq secretHash }
 			.limit(1)
 			.firstOrNull()
 			?.toIdentity()
 	}
+
+	/**
+	 * The account this hardware most recently used, for a phone that lost its key.
+	 *
+	 * Most recent, deliberately: one phone can have created several accounts - clearing app data
+	 * makes a new one every time - and of those, the one the person was last using is the only
+	 * defensible guess. Banned accounts are excluded so a restore cannot be a way back in.
+	 */
+	fun lastUserForDevice(ssaidHash: ByteArray): String? = transaction(db) {
+		(AppDevices innerJoin AppUsers)
+			.select(AppUsers.id, AppUsers.lastSeenAt)
+			.where { (AppDevices.ssaidHash eq ssaidHash) and (AppUsers.isBanned eq false) }
+			.orderBy(AppUsers.lastSeenAt, SortOrder.DESC)
+			.limit(1)
+			.firstOrNull()
+			?.get(AppUsers.id)
+	}
+
+	/** Lets another key speak for an account. The keys it already had keep working. */
+	fun addSecret(userId: String, secretHash: ByteArray, origin: String, now: OffsetDateTime): Unit =
+		transaction(db) {
+			UserSecrets.insertIgnore {
+				it[UserSecrets.secretHash] = secretHash
+				it[UserSecrets.userId] = userId
+				it[UserSecrets.origin] = origin
+				it[createdAt] = now
+			}
+			Unit
+		}
 
 	fun findById(userId: String): Identity? = transaction(db) {
 		AppUsers.selectAll()
@@ -40,6 +73,12 @@ class IdentityRepository(private val db: ExposedDatabase) {
 			it[lastSeenAt] = now
 			it[isBanned] = false
 			it[isShadowbanned] = false
+		}
+		UserSecrets.insert {
+			it[UserSecrets.secretHash] = secretHash
+			it[UserSecrets.userId] = userId
+			it[origin] = SECRET_ORIGIN_SIGNUP
+			it[createdAt] = now
 		}
 		Identity(
 			id = userId,

@@ -45,6 +45,14 @@ data class IdentityResponse(
 	val nickname: String?,
 	@SerialName("display_name") val displayName: String,
 	val tier: Int,
+	/**
+	 * The key was unknown but the hardware was, so this account adopted it.
+	 *
+	 * Sent because the app has something true to tell the user, and because a restore that looks
+	 * exactly like a signup is how somebody ends up commenting from an account they did not know
+	 * they were in.
+	 */
+	val restored: Boolean = false,
 )
 
 fun Route.identityRoutes(
@@ -73,7 +81,7 @@ fun Route.identityRoutes(
 				val identity = identities.get(outcome.identity.id) ?: outcome.identity
 				call.respond(
 					status = if (outcome.created) HttpStatusCode.Created else HttpStatusCode.OK,
-					message = identity.toResponse(outcome.tier),
+					message = identity.toResponse(outcome.tier).copy(restored = outcome.restored),
 				)
 			}
 		}

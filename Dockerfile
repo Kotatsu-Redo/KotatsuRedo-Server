@@ -8,6 +8,10 @@ COPY gradlew settings.gradle.kts build.gradle.kts ./
 RUN chmod +x gradlew && ./gradlew --no-daemon --quiet dependencies || true
 
 COPY src src
+# The terms, privacy notice and content policy. processResources pulls them out of legal/ and into
+# the jar, so leaving them out of the build context does not fail the build - it produces a server
+# that answers /privacy with "this document is missing from this deployment", which is what it did.
+COPY legal legal
 RUN ./gradlew --no-daemon --quiet installDist
 
 # Runtime stage. JRE only, non-root, no build tooling.

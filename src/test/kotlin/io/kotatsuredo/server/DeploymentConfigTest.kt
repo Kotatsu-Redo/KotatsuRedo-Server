@@ -49,6 +49,35 @@ class DeploymentConfigTest {
 		)
 	}
 
+	@Test
+	fun `every directory the jar packages is in the docker build context`() {
+		// processResources reaches outside src/ for the legal documents. The Dockerfile has to copy
+		// those directories too, and nothing fails if it does not: the resource is simply absent and
+		// the route serves "this document is missing from this deployment" with a 200. That shipped,
+		// and a status-code check did not notice.
+		val packaged = Regex("""from\("([^"]+)"\)""")
+			.findAll(BUILD_GRADLE.readText())
+			.map { it.groupValues[1] }
+			.toSet()
+		val copied = DOCKERFILE.readText()
+		for (directory in packaged) {
+			assertTrue(
+				Regex("""^COPY\s+$directory""", RegexOption.MULTILINE).containsMatchIn(copied),
+				"the jar packages `$directory` but the Dockerfile never copies it, so it will be " +
+					"missing from the image while the build still succeeds",
+			)
+		}
+	}
+
+	@Test
+	fun `the legal documents are real, not the missing-document stub`() {
+		for (name in listOf("TERMS.md", "PRIVACY.md", "CONTENT-POLICY.md")) {
+			val file = File(ROOT, "legal/$name")
+			assertTrue(file.isFile, "legal/$name is missing")
+			assertTrue(file.length() > 2000, "legal/$name is too short to be the real document")
+		}
+	}
+
 	private fun configKeys(): Set<String> = Regex("""env\.(?:optional|required)\("([A-Z_0-9]+)"\)""")
 		.findAll(CONFIG.readText())
 		.map { it.groupValues[1] }
@@ -70,5 +99,7 @@ class DeploymentConfigTest {
 		val COMPOSE = File(ROOT, "docker-compose.yml")
 		val CADDYFILE = File(ROOT, "deploy/Caddyfile")
 		val ENV_EXAMPLE = File(ROOT, ".env.example")
+		val DOCKERFILE = File(ROOT, "Dockerfile")
+		val BUILD_GRADLE = File(ROOT, "build.gradle.kts")
 	}
 }

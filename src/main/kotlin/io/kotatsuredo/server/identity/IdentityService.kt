@@ -48,6 +48,25 @@ class IdentityService(
 			return HelloOutcome.Ok(existing, repository.trustTier(existing.id, now), created = false)
 		}
 
+		// The key is unknown. Before making a new account, ask whether this hardware already has one:
+		// a phone whose app data was cleared has lost its key and nothing else, and without this it
+		// collects a fresh account on every wipe.
+		val restoredId = repository.lastUserForDevice(ssaidHash)
+		if (restoredId != null) {
+			repository.addSecret(restoredId, secretHash, SECRET_ORIGIN_RESTORE, now)
+			repository.touch(restoredId, now)
+			val identity = repository.findById(restoredId)
+			if (identity != null) {
+				log.info("Device restore: {} adopted a new key", restoredId)
+				return HelloOutcome.Ok(
+					identity,
+					repository.trustTier(identity.id, now),
+					created = false,
+					restored = true,
+				)
+			}
+		}
+
 		val userId = userIdFrom(secretHash)
 		val identity = repository.create(userId, secretHash, now)
 		repository.touch(userId, now)

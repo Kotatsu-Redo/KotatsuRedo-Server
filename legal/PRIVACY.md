@@ -48,7 +48,7 @@ When your identity is first created, and **only** then, the app sends two values
 
 | Value | What it is | What it is for |
 |---|---|---|
-| `ANDROID_ID` | An identifier Android gives to each app install on each device | Enforcing a device ban |
+| `ANDROID_ID` | An identifier Android gives to each app install on each device | Enforcing a device ban, and giving your account back |
 | MediaDrm ID | A DRM identifier many Android devices have | Flagging suspected ban evasion |
 
 Both are **hashed with a secret held only by the server** before being stored, so the stored values
@@ -59,6 +59,29 @@ anybody: those identifiers are shared between devices of the same model, so a ma
 flag for a person to look at. Banning on one would ban a stranger who did nothing.
 
 These are sent at signup and never again. Ordinary requests do not carry them.
+
+### Getting your account back
+
+Your key is the only proof that an account is yours, and clearing the app's data destroys it. When
+that happens the app introduces itself with a new key, and the server checks whether that
+`ANDROID_ID` hash already belongs to an account. If it does, **the new key joins that account instead
+of starting another one** — your comments, ratings and nickname come back.
+
+This is worth being plain about, because it is the one place the server uses a device fingerprint for
+something other than a ban:
+
+- **The server can tell that two accounts came from the same phone.** It always could — that is what
+  a device ban needs — but until now it never acted on it except to block. It does now.
+- **It only ever restores the account that phone used most recently.** A phone that has made several
+  accounts does not get to pick.
+- **A banned device restores nothing.** The ban is checked first, and banned accounts are skipped.
+- **Your old key keeps working.** An account can hold more than one key, so restoring on one phone
+  does not lock out another that still has yours.
+
+If you would rather this never happened, there is nothing to switch off — but you can avoid it
+entirely by turning the community features off, which deletes nothing less than everything about you
+from this server (see below). There is no setting that keeps the account and refuses the link,
+because the link is how the account was found.
 
 ### What you write
 
@@ -176,7 +199,8 @@ What happens:
 - Your comments are **blanked**. The empty rows stay so that replies other people wrote underneath
   them still have a thread to hang from — they carry no text, no nickname and no id. Nothing of yours
   remains in them.
-- Your identity row, nickname and device hashes are **deleted**.
+- Your identity row, nickname, every key that spoke for it, and your device hashes are
+  **deleted** - so a later install on the same phone starts over rather than finding you again.
 - Moderation log entries about you, if any, remain — see above.
 
 Uninstalling the app does not do this. Uninstalling leaves your comments up; the button removes them.

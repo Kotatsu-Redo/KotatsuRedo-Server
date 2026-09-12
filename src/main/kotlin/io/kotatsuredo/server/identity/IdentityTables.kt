@@ -17,6 +17,23 @@ object AppUsers : Table("app_user") {
 	override val primaryKey = PrimaryKey(id)
 }
 
+/**
+ * Every secret that speaks for an account. An account starts with one and gains another when a phone
+ * that lost its key is recognised by its hardware; both keep working, because the same key is allowed
+ * to live on two phones and overwriting would lock the other one out.
+ */
+const val SECRET_ORIGIN_SIGNUP = "signup"
+const val SECRET_ORIGIN_RESTORE = "device_restore"
+
+object UserSecrets : Table("user_secret") {
+	val secretHash = binary("secret_sha256")
+	val userId = text("user_id").references(AppUsers.id)
+	val origin = text("origin")
+	val createdAt = timestampWithTimeZone("created_at")
+
+	override val primaryKey = PrimaryKey(secretHash)
+}
+
 object UserActiveDays : Table("user_active_day") {
 	val userId = text("user_id").references(AppUsers.id)
 	val day = date("day")

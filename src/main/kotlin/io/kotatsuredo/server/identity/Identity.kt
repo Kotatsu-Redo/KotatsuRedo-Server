@@ -37,7 +37,19 @@ data class DeviceIdentifiers(
 )
 
 sealed interface HelloOutcome {
-	data class Ok(val identity: Identity, val tier: TrustTier, val created: Boolean) : HelloOutcome
+	/**
+	 * @property created a new account was made for this key.
+	 * @property restored the key was unknown, but the hardware was, so an existing account adopted it.
+	 *  Distinct from [created] because the app has something true to say about it - and because a
+	 *  restore silently presented as an ordinary signup is how someone ends up commenting from an
+	 *  account they did not know they were in.
+	 */
+	data class Ok(
+		val identity: Identity,
+		val tier: TrustTier,
+		val created: Boolean,
+		val restored: Boolean = false,
+	) : HelloOutcome
 
 	/** The device is banned. No account is created; the caller gets `banned` and nothing else. */
 	data object DeviceBanned : HelloOutcome
