@@ -18,6 +18,12 @@ class CommentService(
 	private val filter: ContentFilter = ContentFilter.PermitAll,
 	private val detector: LanguageDetector = LanguageDetector.ClientHint,
 	private val clock: Clock = Clock.systemUTC(),
+	/**
+	 * Configurable, because it is a number that wants tuning once real comments exist and a compiled
+	 * constant costs a redeploy of the server *and* a release of the app to change. The app reads it
+	 * off the comment page rather than holding its own copy.
+	 */
+	val minLength: Int = CommentRules.MIN_BODY_LENGTH,
 ) {
 
 	fun post(
@@ -31,7 +37,7 @@ class CommentService(
 	): PostResult {
 		val body = rawBody.trim()
 		val length = CommentRules.length(body)
-		if (length < CommentRules.MIN_BODY_LENGTH) return PostResult.TooShort(CommentRules.MIN_BODY_LENGTH)
+		if (length < minLength) return PostResult.TooShort(minLength)
 		if (length > CommentRules.MAX_BODY_LENGTH) return PostResult.TooLong
 
 		// Detected before filtering, because the detected language is what chooses the word list.
@@ -118,7 +124,7 @@ class CommentService(
 
 		val body = rawBody.trim()
 		val length = CommentRules.length(body)
-		if (length < CommentRules.MIN_BODY_LENGTH) return EditResult.TooShort(CommentRules.MIN_BODY_LENGTH)
+		if (length < minLength) return EditResult.TooShort(minLength)
 		if (length > CommentRules.MAX_BODY_LENGTH) return EditResult.TooLong
 
 		val normalizedLang = detector.detect(body, normalizeLang(lang)) ?: existing.lang

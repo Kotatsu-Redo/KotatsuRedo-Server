@@ -103,6 +103,7 @@ fun main() {
 		repository = commentRepository,
 		filter = wordFilter,
 		detector = StopwordLanguageDetector(),
+		minLength = config.commentMinLength,
 	)
 	val moderation = ModerationService(
 		moderators = ModeratorRepository(database.source),

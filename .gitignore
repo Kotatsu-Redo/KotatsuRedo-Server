@@ -1,4 +1,8 @@
 .env
+
+# Deployment bundles from tools/make_bundle.py: a real .env with real secrets, plus a large image
+# tarball. Neither belongs in the repository.
+dist/
 build/
 .gradle/
 out/

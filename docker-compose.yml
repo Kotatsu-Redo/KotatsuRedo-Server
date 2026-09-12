@@ -36,6 +36,13 @@ services:
       # interchangeable, and changing this invalidates every existing device ban.
       DEVICE_PEPPER: ${DEVICE_PEPPER}
       RULES_URL: ${RULES_URL:-/rules}
+      # Tunable without a rebuild: the app reads the limit off every comment page rather than
+      # holding its own copy, so changing this and restarting is the whole procedure.
+      COMMENT_MIN_LENGTH: ${COMMENT_MIN_LENGTH:-10}
+      # The first-moderator bootstrap. Empty by default and empty is the same as unset, because
+      # Config trims blanks - so an unclaimed panel needs these set, and a claimed one does not care.
+      MOD_BOOTSTRAP_USERNAME: ${MOD_BOOTSTRAP_USERNAME:-}
+      MOD_BOOTSTRAP_PASSWORD: ${MOD_BOOTSTRAP_PASSWORD:-}
     expose:
       - "${PORT:-8787}"
 

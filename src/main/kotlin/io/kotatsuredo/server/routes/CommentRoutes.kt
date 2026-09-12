@@ -68,6 +68,21 @@ data class CommentPageResponse(
 	 * can say "also 12 in Spanish" instead of pretending the other languages are not there.
 	 */
 	@SerialName("by_language") val byLanguage: Map<String, Int> = emptyMap(),
+	/**
+	 * What the server will accept, sent with every page.
+	 *
+	 * The app used to hold its own copy of the minimum and grey the send button out below it, which
+	 * meant changing the rule needed a new release before anyone could use it - and in between, an
+	 * app that refused comments the server would have taken. Riding along with a request the sheet
+	 * already makes costs nothing and cannot go stale.
+	 */
+	val rules: CommentRulesDto = CommentRulesDto(),
+)
+
+@Serializable
+data class CommentRulesDto(
+	@SerialName("min_length") val minLength: Int = CommentRules.MIN_BODY_LENGTH,
+	@SerialName("max_length") val maxLength: Int = CommentRules.MAX_BODY_LENGTH,
 )
 
 @Serializable
@@ -198,6 +213,7 @@ fun Route.commentRoutes(
 					comments = page.map { it.toDto() },
 					total = comments.count(workId, chapterId),
 					byLanguage = comments.countsByLanguage(workId, chapterId),
+					rules = CommentRulesDto(minLength = comments.minLength),
 				),
 			)
 		}

@@ -1,6 +1,7 @@
 package io.kotatsuredo.server
 
 import io.kotatsuredo.server.auth.RateLimiter
+import io.kotatsuredo.server.comments.CommentRules
 import io.kotatsuredo.server.comments.CommentRepository
 import io.kotatsuredo.server.comments.CommentService
 import io.kotatsuredo.server.comments.ContentFilter
@@ -159,7 +160,9 @@ class CommentRoutesTest {
 		assertEquals(HttpStatusCode.UnprocessableEntity, response.status)
 		val body = response.bodyAsText()
 		assertTrue(body.contains("\"too_short\""), body)
-		assertTrue(body.contains("\"min\":20"), body)
+		// The number comes from the rule rather than a literal: the app renders whatever the server
+		// says the minimum is, so a change here must not need the test edited to match.
+		assertTrue(body.contains("\"min\":${CommentRules.MIN_BODY_LENGTH}"), body)
 	}
 
 	@Test

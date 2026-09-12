@@ -101,9 +101,9 @@ class CommentServiceTest {
 
 	@Test
 	fun `length is counted in characters a person would recognise`() {
-		// Twenty emoji: twenty characters to a reader, forty to `String.length`. Rejecting this as
-		// too short would be defensible; accepting a nineteen-emoji one as long enough would not.
-		val result = post(work(), user("a"), body = "😀".repeat(19))
+		// Nine emoji: nine characters to a reader, eighteen to `String.length`. Counting the code
+		// units would let this through as though it cleared a ten-character minimum.
+		val result = post(work(), user("a"), body = "😀".repeat(9))
 		assertIs<PostResult.TooShort>(result)
 	}
 

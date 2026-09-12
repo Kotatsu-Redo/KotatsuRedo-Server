@@ -1,0 +1,89 @@
+# nginx site for an instance sharing a box with something else.
+#
+# The stock deployment is Caddy in the compose stack, which owns 80 and 443. When the server already
+# runs nginx for another site, Caddy cannot bind those ports and there is no point in two terminators
+# anyway: nginx keeps the ports, the api publishes on loopback only, and this file joins them.
+#
+# Rendered by tools/make_bundle.py --proxy nginx. {{DOMAIN}} and {{PORT}} are substituted.
+#
+#   sudo certbot certonly --nginx -d {{DOMAIN}}
+#   sudo cp {{DOMAIN}}.conf /etc/nginx/sites-available/
+#   sudo ln -s /etc/nginx/sites-available/{{DOMAIN}}.conf /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+
+server {
+	listen 80;
+	listen [::]:80;
+	server_name {{DOMAIN}};
+
+	# Renewals are answered here, so this block has to stay reachable on 80.
+	location /.well-known/acme-challenge/ {
+		root /var/www/html;
+	}
+
+	location / {
+		return 301 https://$host$request_uri;
+	}
+
+	# See the note in the TLS block below. The redirect leg logs addresses too.
+	access_log off;
+	error_log /dev/null crit;
+}
+
+server {
+	# HTTP/2 as a listen parameter, not the `http2 on;` directive: that directive only exists from
+	# nginx 1.25.1 and this has to work on 1.22, which is what Debian 12 ships. Still accepted on
+	# newer nginx, where it logs a deprecation warning and nothing more.
+	listen 443 ssl http2;
+	listen [::]:443 ssl http2;
+	server_name {{DOMAIN}};
+
+	ssl_certificate     /etc/letsencrypt/live/{{DOMAIN}}/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/{{DOMAIN}}/privkey.pem;
+	ssl_protocols TLSv1.2 TLSv1.3;
+	ssl_prefer_server_ciphers off;
+	ssl_session_cache shared:SSL:10m;
+	ssl_session_timeout 1d;
+	ssl_session_tickets off;
+
+	# ---------------------------------------------------------------------------------------------
+	# OFF, on purpose and permanently. This is the whole mechanism behind the privacy notice's claim
+	# that an IP address is never stored - "not in a web-server log, not in the database, not
+	# anywhere". nginx's default access log records $remote_addr on every request, and the error log
+	# records it on every upstream hiccup, so both have to go.
+	#
+	# Do not replace either with a redacting log_format: a format can drift, an absent log cannot.
+	# If you turn these on, the notice stops being true and you have to rewrite it before you do.
+	access_log off;
+	error_log /dev/null crit;
+	# ---------------------------------------------------------------------------------------------
+
+	# Only what the app cannot set for itself. It already sends X-Content-Type-Options on every
+	# response and its own CSP on /admin, so repeating those here just duplicates the header.
+	add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+	add_header Referrer-Policy "no-referrer" always;
+	server_tokens off;
+
+	gzip on;
+	# text/html is always gzipped and listing it again is a warning at startup.
+	gzip_types application/json text/css application/javascript;
+	gzip_min_length 512;
+
+	# A comment is capped well below this server-side; the ceiling is only here to stop a large body
+	# being buffered to disk before the app ever sees it.
+	client_max_body_size 256k;
+
+	location / {
+		proxy_pass http://127.0.0.1:{{PORT}};
+		proxy_http_version 1.1;
+
+		proxy_set_header Host $host;
+		proxy_set_header X-Forwarded-Proto https;
+		# Appends the address nginx saw to whatever arrived, so the real client is the LAST entry -
+		# which is the one the app reads. Anything to the left of it is client-supplied and ignored.
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+		proxy_connect_timeout 5s;
+		proxy_read_timeout 60s;
+	}
+}

@@ -1,5 +1,7 @@
 package io.kotatsuredo.server
 
+import io.kotatsuredo.server.comments.CommentRules
+
 /**
  * All configuration comes from the environment. Nothing is read from a committed file, so a
  * misconfigured deployment fails loudly at startup rather than silently running on a default.
@@ -23,6 +25,8 @@ data class Config(
 	 * from then on. Leaving these set is harmless but pointless - the path disables itself (§6).
 	 */
 	val bootstrapModerator: Pair<String, String>?,
+	/** Shortest comment the server will take. Tunable without a rebuild; see CommentService. */
+	val commentMinLength: Int,
 ) {
 
 	val isProduction: Boolean get() = environment == "production"
@@ -45,6 +49,8 @@ data class Config(
 			environment = env.optional("APP_ENV") ?: "development",
 			devicePepper = env.required("DEVICE_PEPPER"),
 			rulesUrl = env.optional("RULES_URL") ?: "/rules",
+			commentMinLength = env.optional("COMMENT_MIN_LENGTH")?.toIntOrNull()
+				?: CommentRules.MIN_BODY_LENGTH,
 			bootstrapModerator = env.optional("MOD_BOOTSTRAP_USERNAME")
 				?.let { username -> env.optional("MOD_BOOTSTRAP_PASSWORD")?.let { username to it } },
 			database = DatabaseConfig(

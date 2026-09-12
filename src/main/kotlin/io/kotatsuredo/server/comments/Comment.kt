@@ -88,10 +88,18 @@ data class ReplyNotification(
 object CommentRules {
 
 	/**
-	 * Removes "first", "up", "lol" without making any judgement about content - and conveniently
-	 * sits right where n-gram language detection becomes reliable (PLAN.md §6).
+	 * Removes "first", "up", "lol" without making any judgement about content.
+	 *
+	 * Twenty was chosen to sit where n-gram language detection becomes reliable, which it no longer
+	 * does: [io.kotatsuredo.server.filter.StopwordLanguageDetector] needs 12 characters, so a comment
+	 * between 10 and 12 falls back to the work's language rather than being detected. That costs a
+	 * little filter precision on very short comments and buys back every legitimate one-line reply.
 	 */
-	const val MIN_BODY_LENGTH = 20
+	/**
+	 * The default. The running value comes from `COMMENT_MIN_LENGTH` - see [CommentService.minLength] -
+	 * so tuning it is an edit to `.env` and a restart rather than a new build and a new app release.
+	 */
+	const val MIN_BODY_LENGTH = 10
 
 	const val MAX_BODY_LENGTH = 4000
 
