@@ -15,21 +15,21 @@ class RatingService(private val repository: RatingRepository) {
 	 */
 	fun rate(workId: Long, userId: String, value: Int): RatingAggregate {
 		require(RatingScale.isValid(value)) { "rating out of range: $value" }
-		repository.set(workId, userId, value)
-		val aggregate = recompute(workId)
-		detectBrigade(workId)
+		val aggregate = repository.setAndAggregate(workId, userId, value)
+		if (aggregate.count >= MIN_RATINGS_TO_FLAG) detectBrigade(workId)
 		return aggregate
 	}
 
-	fun clear(workId: Long, userId: String): RatingAggregate {
-		repository.delete(workId, userId)
-		return recompute(workId)
-	}
+	fun clear(workId: Long, userId: String): RatingAggregate =
+		repository.deleteAndAggregate(workId, userId).second
 
 	/** The works this user has rated, so their aggregates can be rebuilt after an account erasure. */
 	fun workIdsRatedBy(userId: String): List<Long> = repository.workIdsRatedBy(userId)
 
 	fun allRatingsBy(userId: String): List<ExportedRating> = repository.allBy(userId)
+
+	fun allRatingsByPage(userId: String, afterWorkId: Long, limit: Int): List<ExportedRating> =
+		repository.allByPage(userId, afterWorkId, limit)
 
 	fun myRating(workId: Long, userId: String): Int? = repository.find(workId, userId)
 
@@ -62,29 +62,27 @@ class RatingService(private val repository: RatingRepository) {
 	 * decides, because being wrong here means deleting real people's opinions.
 	 */
 	fun detectBrigade(workId: Long): Boolean {
-		val recent = repository.recentRatings(workId, WINDOW_HOURS)
-		if (recent.size < MIN_RATINGS_TO_FLAG) return false
+		val stats = repository.brigadeStats(workId, WINDOW_HOURS, EXTREME_LOW, EXTREME_HIGH)
+		if (stats.recentCount < MIN_RATINGS_TO_FLAG) return false
 
-		val older = repository.ratingsBefore(workId, WINDOW_HOURS)
 		// A work with no history cannot be spiking. Without this guard the baseline is zero, every
 		// comparison against it succeeds, and a brand-new work collecting its first ratings looks
 		// exactly like an attack - which on a young instance is every work.
-		if (older < MIN_HISTORY_TO_COMPARE) return false
+		if (stats.olderCount < MIN_HISTORY_TO_COMPARE) return false
 
-		val baseline = older.toDouble() / BASELINE_DAYS
-		if (recent.size < baseline * SPIKE_MULTIPLE) return false
+		val baseline = stats.olderCount.toDouble() / BASELINE_DAYS
+		if (stats.recentCount < baseline * SPIKE_MULTIPLE) return false
 
-		val extremeShare = recent.count { (value, _) -> value <= EXTREME_LOW || value >= EXTREME_HIGH }
-			.toDouble() / recent.size
+		val extremeShare = stats.extremeShare
 		if (extremeShare < EXTREME_SHARE_THRESHOLD) return false
 
-		val newUserShare = recent.count { (_, tier) -> tier == 0 }.toDouble() / recent.size
+		val newUserShare = stats.newUserShare
 		if (newUserShare < NEW_USER_SHARE_THRESHOLD) return false
 
-		repository.flagBrigade(workId, recent.size, baseline, extremeShare, newUserShare)
+		repository.flagBrigade(workId, stats.recentCount, baseline, extremeShare, newUserShare)
 		log.info(
 			"Rating brigade flagged on work {}: {} recent vs baseline {}, {}% extreme, {}% new",
-			workId, recent.size, "%.2f".format(baseline),
+			workId, stats.recentCount, "%.2f".format(baseline),
 			(extremeShare * 100).toInt(), (newUserShare * 100).toInt(),
 		)
 		return true

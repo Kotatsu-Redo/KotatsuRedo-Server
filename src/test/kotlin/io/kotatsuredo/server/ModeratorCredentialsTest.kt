@@ -8,6 +8,7 @@ import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -119,4 +120,17 @@ class ModeratorCredentialsTest {
 		assertContains(uri, "secret=$secret")
 		assertContains(uri, "issuer=Kotatsu-Redo")
 	}
+
+	@Test
+	fun `totp seeds are authenticated and randomized at rest`() {
+		val cipher = testTotpCipher()
+		val first = cipher.encrypt("JBSWY3DPEHPK3PXP")
+		val second = cipher.encrypt("JBSWY3DPEHPK3PXP")
+		assertNotEquals(first, second)
+		assertFalse(first.contains("JBSWY3DPEHPK3PXP"))
+		assertEquals("JBSWY3DPEHPK3PXP", cipher.decrypt(first))
+	}
 }
+
+internal fun testTotpCipher(): io.kotatsuredo.server.moderation.TotpSecretCipher =
+	io.kotatsuredo.server.moderation.TotpSecretCipher.fromRawKey(ByteArray(32) { 0x42 })

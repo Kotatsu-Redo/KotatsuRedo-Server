@@ -173,7 +173,7 @@ fun Route.filterAdminRoutes(
 		// The token the user actually typed, not the rule's term: allowlisting `ass` would switch the
 		// rule off entirely, whereas allowlisting `assassin` fixes exactly the word that was wrong.
 		val term = call.receive<AllowRequest>().term.trim().let(FilterNormalizer::setA)
-		if (term.isEmpty()) throw ApiException(ApiError.BadRequest("term"))
+		if (term.isEmpty() || term.length > MAX_TERM_LENGTH) throw ApiException(ApiError.BadRequest("term"))
 
 		filters.allow(term, origin = "manual", note = block.term, moderatorId = session.moderator.id)
 		filters.resolveBlock(block.id, FilterRules.RESOLUTION_ALLOWLISTED)
@@ -216,11 +216,14 @@ fun Route.filterAdminRoutes(
 		val body = call.receive<AddRuleRequest>()
 		val tier = FilterTier.parse(body.tier) ?: throw ApiException(ApiError.BadRequest("tier"))
 		val raw = body.term.trim()
-		if (raw.isEmpty()) throw ApiException(ApiError.BadRequest("term"))
+		if (raw.isEmpty() || raw.length > MAX_TERM_LENGTH) throw ApiException(ApiError.BadRequest("term"))
 
 		// Normalised with the tier's own set and the rule's own language, because that is the space
 		// the matcher works in - and for Vietnamese, Turkish and Polish that includes the marks.
 		val lang = body.lang?.takeIf { it.isNotBlank() }
+		if (lang != null && (lang.length > MAX_LANGUAGE_LENGTH || !LANGUAGE_PATTERN.matches(lang))) {
+			throw ApiException(ApiError.BadRequest("lang"))
+		}
 		val term = if (tier == FilterTier.SEVERE) FilterNormalizer.setB(raw) else FilterNormalizer.setA(raw, lang)
 		// Length checked on the folded form, because folding can shorten it: `xxx` becomes `x`.
 		if (term.length < FilterRules.MIN_TERM_LENGTH) throw ApiException(ApiError.BadRequest("term"))
@@ -237,6 +240,9 @@ fun Route.filterAdminRoutes(
 
 private const val MAX_RULES = 2000
 private const val MIN_STATS_BLOCKS = 1
+private const val MAX_TERM_LENGTH = 128
+private const val MAX_LANGUAGE_LENGTH = 16
+private val LANGUAGE_PATTERN = Regex("[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?")
 
 private fun ApplicationCall.filterId(): Long =
 	parameters["id"]?.toLongOrNull() ?: throw ApiException(ApiError.BadRequest("id"))

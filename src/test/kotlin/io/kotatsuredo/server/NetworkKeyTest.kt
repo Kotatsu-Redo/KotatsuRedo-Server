@@ -26,13 +26,19 @@ class NetworkKeyTest {
 	}
 
 	@Test
-	fun `an IPv6 address is used whole`() {
+	fun `IPv6 addresses are grouped by slash 64`() {
 		assertEquals(networkKey("2001:db8::1", "?"), networkKey(" 2001:db8::1 ", "?"))
-		assertNotEquals(networkKey("2001:db8::1", "?"), networkKey("2001:db8::2", "?"))
+		assertEquals(networkKey("2001:db8::1", "?"), networkKey("2001:db8::ffff", "?"))
+		assertNotEquals(networkKey("2001:db8::1", "?"), networkKey("2001:db8:0:1::1", "?"))
 	}
 
 	@Test
 	fun `a missing or empty header falls back to the peer`() {
 		assertEquals(networkKey(null, "203.0.113.10"), networkKey("  ", "203.0.113.10"))
+	}
+
+	@Test
+	fun `hostname-shaped input is not interpreted as an address`() {
+		assertNotEquals(networkKey("bad.cafe", "?"), networkKey("127.0.0.1", "?"))
 	}
 }

@@ -18,12 +18,20 @@ class DeploymentConfigTest {
 
 	@Test
 	fun `every variable Config reads is passed to the api container`() {
-		val missing = configKeys() - composeApiEnvironment()
+		val missing = configKeys() - MIGRATION_KEYS - composeEnvironment("api", "caddy")
 		assertTrue(
 			missing.isEmpty(),
 			"docker-compose.yml never passes $missing to the api container, so setting it in .env " +
 				"does nothing. Add it to the api service's `environment:` block.",
 		)
+	}
+
+	@Test
+	fun `schema owner credentials are confined to the one shot migrator`() {
+		val api = composeEnvironment("api", "caddy")
+		val migrate = composeEnvironment("migrate", "api")
+		assertEquals(emptySet(), MIGRATION_KEYS intersect api, "the API must not retain schema-owner credentials")
+		assertEquals(emptySet(), MIGRATION_KEYS - migrate, "the migrator is missing an owner credential")
 	}
 
 	@Test
@@ -84,9 +92,9 @@ class DeploymentConfigTest {
 		.toSet()
 
 	/** The keys of the api service's `environment:` block, which is a flat `KEY: value` mapping. */
-	private fun composeApiEnvironment(): Set<String> = COMPOSE.readText()
-		.substringAfter("  api:")
-		.substringBefore("\n  caddy:")
+	private fun composeEnvironment(service: String, nextService: String): Set<String> = COMPOSE.readText()
+		.substringAfter("  $service:")
+		.substringBefore("\n  $nextService:")
 		.substringAfter("    environment:\n")
 		.lineSequence()
 		.takeWhile { it.startsWith("      ") }
@@ -101,5 +109,6 @@ class DeploymentConfigTest {
 		val ENV_EXAMPLE = File(ROOT, ".env.example")
 		val DOCKERFILE = File(ROOT, "Dockerfile")
 		val BUILD_GRADLE = File(ROOT, "build.gradle.kts")
+		val MIGRATION_KEYS = setOf("DATABASE_MIGRATION_USER", "DATABASE_MIGRATION_PASSWORD")
 	}
 }

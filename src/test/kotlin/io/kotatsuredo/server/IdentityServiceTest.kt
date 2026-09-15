@@ -22,7 +22,7 @@ class IdentityServiceTest {
 
 	// Lazy: field initialisers run before @BeforeTest, so eager construction would hit the database
 	// before the skip guard could fire.
-	private val repository by lazy { IdentityRepository(PostgresTestBase.database.exposed) }
+	private val repository by lazy { IdentityRepository(PostgresTestBase.database.exposed, PostgresTestBase.database.source) }
 	private val pepper = DevicePepper.of("test-pepper")
 	private val service by lazy { IdentityService(repository, pepper) }
 
@@ -156,6 +156,42 @@ class IdentityServiceTest {
 	}
 
 	@Test
+	fun `established trust requires ninety days and thirty active days`() {
+		val userId = (service.hello("secret-established", device()) as HelloOutcome.Ok).identity.id
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"UPDATE app_user SET created_at = now() - INTERVAL '91 days' WHERE id = ?",
+			).use {
+				it.setString(1, userId)
+				it.executeUpdate()
+			}
+			connection.prepareStatement(
+				"""
+				INSERT INTO user_active_day (user_id, day)
+				SELECT ?, CURRENT_DATE - n::int FROM generate_series(0, 28) AS n
+				ON CONFLICT DO NOTHING
+				""".trimIndent(),
+			).use {
+				it.setString(1, userId)
+				it.executeUpdate()
+			}
+		}
+		assertEquals(TrustTier.NORMAL, service.trustTier(userId))
+		assertEquals(TrustTier.NORMAL.level, trustViewTier(userId))
+
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"INSERT INTO user_active_day (user_id, day) VALUES (?, CURRENT_DATE - 29) ON CONFLICT DO NOTHING",
+			).use {
+				it.setString(1, userId)
+				it.executeUpdate()
+			}
+		}
+		assertEquals(TrustTier.ESTABLISHED, service.trustTier(userId))
+		assertEquals(TrustTier.ESTABLISHED.level, trustViewTier(userId))
+	}
+
+	@Test
 	fun `delete removes the user and their device record`() {
 		val outcome = service.hello("secret-delete", device()) as HelloOutcome.Ok
 
@@ -173,6 +209,14 @@ class IdentityServiceTest {
 				)
 				rows.next()
 				rows.getInt(1)
+			}
+		}
+
+	private fun trustViewTier(userId: String): Int =
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement("SELECT tier FROM user_trust WHERE user_id = ?").use {
+				it.setString(1, userId)
+				it.executeQuery().use { rows -> rows.next(); rows.getInt(1) }
 			}
 		}
 }

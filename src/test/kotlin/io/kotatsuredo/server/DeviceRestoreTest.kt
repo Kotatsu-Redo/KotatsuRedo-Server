@@ -6,6 +6,8 @@ import io.kotatsuredo.server.identity.HelloOutcome
 import io.kotatsuredo.server.identity.IdentityRepository
 import io.kotatsuredo.server.identity.IdentityService
 import java.time.OffsetDateTime
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -16,14 +18,11 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * A phone that loses its key gets its account back, and nothing else does.
- *
- * This is the one path where the server hands over an account to a caller who cannot prove it held
- * the key, so what it refuses matters at least as much as what it allows.
+ * Device identifiers are abuse-control signals, never account credentials.
  */
 class DeviceRestoreTest {
 
-	private val repository by lazy { IdentityRepository(PostgresTestBase.database.exposed) }
+	private val repository by lazy { IdentityRepository(PostgresTestBase.database.exposed, PostgresTestBase.database.source) }
 	private val pepper = DevicePepper.of("test-pepper")
 	private val service by lazy { IdentityService(repository, pepper) }
 
@@ -37,30 +36,51 @@ class DeviceRestoreTest {
 		assertIs<HelloOutcome.Ok>(service.hello(secret, DeviceIdentifiers(ssaid, null)))
 
 	@Test
-	fun `a phone that lost its key gets the same account back`() {
+	fun `a new key on the same phone creates a separate account`() {
 		val first = hello("secret-one", "phone-a")
 		service.setNickname(first.identity.id, "tsubame")
 
-		// App data cleared: the same hardware, carrying a key the server has never seen.
 		val second = hello("secret-two", "phone-a")
 
-		assertFalse(second.created, "an account already existed for this device")
-		assertTrue(second.restored)
-		assertEquals(first.identity.id, second.identity.id)
-		assertEquals("tsubame", second.identity.nickname)
+		assertTrue(second.created)
+		assertFalse(second.restored)
+		assertNotEquals(first.identity.id, second.identity.id)
+		assertNull(second.identity.nickname)
 	}
 
 	@Test
-	fun `the old key still works after a restore`() {
+	fun `the old key still resolves its own account`() {
 		val first = hello("secret-one", "phone-a")
 		hello("secret-two", "phone-a")
 
-		// Overwriting the stored hash would have been simpler, and would have locked out a second
-		// phone legitimately holding the same recovery key.
 		val again = hello("secret-one", "phone-a")
 		assertFalse(again.created)
 		assertFalse(again.restored)
 		assertEquals(first.identity.id, again.identity.id)
+	}
+
+	@Test
+	fun `concurrent first hello creates exactly one account`() {
+		val ready = CountDownLatch(2)
+		val start = CountDownLatch(1)
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			val calls = List(2) {
+				executor.submit<HelloOutcome.Ok> {
+					ready.countDown()
+					start.await()
+					hello("same-secret", "phone-a")
+				}
+			}
+			ready.await()
+			start.countDown()
+			val outcomes = calls.map { it.get() }
+
+			assertEquals(1, outcomes.count { it.created })
+			assertEquals(1, outcomes.map { it.identity.id }.distinct().size)
+		} finally {
+			executor.shutdownNow()
+		}
 	}
 
 	@Test
@@ -74,19 +94,18 @@ class DeviceRestoreTest {
 	}
 
 	@Test
-	fun `the most recently used account is the one restored`() {
+	fun `device history cannot select an account for a new key`() {
 		val older = hello("secret-one", "phone-a")
 
-		// A second account on the same device, as every pre-restore wipe produced. The newest is the
-		// defensible guess: it is the one the person was last using.
 		val newer = repository.create("zz-newer", "other-secret".toByteArray(), OffsetDateTime.now())
 		repository.recordDevice(newer.id, pepper.hash("phone-a"), null, OffsetDateTime.now())
 		repository.touch(newer.id, OffsetDateTime.now().plusDays(1))
 
-		val restored = hello("secret-three", "phone-a")
-		assertTrue(restored.restored)
-		assertEquals(newer.id, restored.identity.id)
-		assertNotEquals(older.identity.id, restored.identity.id)
+		val created = hello("secret-three", "phone-a")
+		assertTrue(created.created)
+		assertFalse(created.restored)
+		assertNotEquals(newer.id, created.identity.id)
+		assertNotEquals(older.identity.id, created.identity.id)
 	}
 
 	@Test
@@ -99,7 +118,7 @@ class DeviceRestoreTest {
 		// deleted account. That is only true while the delete takes the device rows and every key
 		// with it, which is the foreign key's job and therefore worth checking rather than assuming.
 		val after = hello("secret-two", "phone-a")
-		assertTrue(after.created, "the deleted account must not be restorable")
+		assertTrue(after.created, "the deleted account must not be recoverable from a device id")
 		assertFalse(after.restored)
 		assertNotEquals(first.identity.id, after.identity.id)
 		assertNull(after.identity.nickname)

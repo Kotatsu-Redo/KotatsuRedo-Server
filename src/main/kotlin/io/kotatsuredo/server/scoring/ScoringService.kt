@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.OffsetDateTime
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 
@@ -17,6 +18,7 @@ class ScoringService(
 	private val repository: ScoringRepository,
 	private val clock: Clock = Clock.systemUTC(),
 ) {
+	private val snapshotCache = ConcurrentHashMap<String, ScoreSnapshot>()
 
 	/**
 	 * Recomputes every source's score from the decayed probe window.
@@ -27,7 +29,10 @@ class ScoringService(
 	 */
 	fun recompute(): Int {
 		val aggregates = repository.aggregate()
+		val now = OffsetDateTime.now(clock)
 		if (aggregates.isEmpty()) {
+			val pruned = repository.pruneStale(now)
+			if (pruned > 0) snapshotCache.clear()
 			log.debug("No probe data to score")
 			return 0
 		}
@@ -56,14 +61,25 @@ class ScoringService(
 				composite = Scoring.composite(stability, popularity),
 				sampleSize = aggregate.sampleSize,
 			)
+		}.groupBy { it.region }.values.flatMap { regionScores ->
+			// The public blob is deliberately bounded. Prefer well-corroborated sources, then the best
+			// score, so one-reporter names cannot crowd established sources out of the response.
+			regionScores.sortedWith(
+				compareByDescending<SourceScore> { it.sampleSize }
+					.thenByDescending { it.composite }
+					.thenBy { it.source },
+			).take(MAX_SCORES_PER_REGION)
 		}
 
-		val written = repository.upsert(scores, OffsetDateTime.now(clock))
+		val written = repository.replace(scores, now)
+		snapshotCache.clear()
 		log.info("Recomputed {} source score(s) across {} region(s)", written, maxReporterWeightByRegion.size)
 		return written
 	}
 
-	fun scores(region: String): ScoreSnapshot {
+	fun scores(region: String): ScoreSnapshot = snapshotCache.computeIfAbsent(region, ::loadScores)
+
+	private fun loadScores(region: String): ScoreSnapshot {
 		val scores = repository.scoresFor(region)
 		return ScoreSnapshot(
 			region = region,
@@ -86,6 +102,10 @@ class ScoringService(
 		val sorted = sorted()
 		val middle = sorted.size / 2
 		return if (sorted.size % 2 == 0) (sorted[middle - 1] + sorted[middle]) / 2.0 else sorted[middle]
+	}
+
+	private companion object {
+		const val MAX_SCORES_PER_REGION = 1_200
 	}
 }
 

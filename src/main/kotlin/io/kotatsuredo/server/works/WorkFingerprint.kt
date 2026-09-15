@@ -21,16 +21,24 @@ data class WorkFingerprint(
 	val allTitles: List<String> get() = (listOf(title) + altTitles).filter { it.isNotBlank() }
 }
 
+object WorkLimits {
+	const val MIN_YEAR = 1_000
+	const val MAX_YEAR = 3_000
+
+	fun isValidYear(year: Int?): Boolean = year == null || year in MIN_YEAR..MAX_YEAR
+}
+
 /** How a work was arrived at. Recorded on the alias so a bad rule can be found and undone later. */
 enum class ResolutionMethod(val confidence: Double) {
 	ALIAS(1.0),
+	OBSERVATION(0.5),
 	EXTERNAL_ID(1.0),
 	EXACT_TITLE(0.95),
 	CATALOGUE(0.95),
 	TITLE_AND_COVER(0.90),
 	/** Linked, but flagged: a title match with nothing corroborating it. */
 	FUZZY_TITLE(0.70),
-	CREATED(1.0),
+	CREATED(0.25),
 }
 
 data class Resolution(

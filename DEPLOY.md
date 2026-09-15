@@ -80,14 +80,18 @@ docker compose up -d --build
 curl https://community.example.com/v1/health
 ```
 
-Migrations run at startup and abort the process on failure — a server on an unexpected schema is
-worse than a server that is plainly down, so a crash loop here means read the logs, not restart it.
+The one-shot `migrate` service runs first and the API starts only after it succeeds. The migration
+container receives the schema-owner credential; the long-lived API receives only the restricted
+runtime credential. A failed migration therefore leaves the API stopped rather than serving an
+unexpected schema.
 
 ```sh
+docker compose logs migrate
 docker compose logs -f api
 ```
 
-You should see Flyway apply V1–V10, then `Filter loaded: … rules across … languages`.
+You should see Flyway complete in the migration log, then `Filter loaded: … rules across … languages`
+in the API log.
 
 ## 4. Claim the moderation panel
 
@@ -196,7 +200,8 @@ Do not "temporarily" turn access logs on to debug something. Use the application
 git pull && docker compose up -d --build
 ```
 
-Migrations are forward-only and run at startup. Take a dump first.
+Migrations are forward-only and run in the one-shot `migrate` service before the replacement API
+starts. Take a dump first.
 
 ---
 

@@ -30,7 +30,7 @@ class FilterService(
 	 * after the next deploy.
 	 */
 	fun seed(): Int {
-		var added = 0
+		val rules = mutableListOf<FilterRepository.RuleSeed>()
 		var skipped = 0
 		SEED_FILES.forEach { (resource, spec) ->
 			val stream = javaClass.getResourceAsStream("/filter/seed/$resource") ?: return@forEach
@@ -51,10 +51,11 @@ class FilterService(
 						skipped++
 						return@forEach
 					}
-					if (repository.addRule(normalized, raw, spec.tier, spec.lang, "seed")) added++
+					rules += FilterRepository.RuleSeed(normalized, raw, spec.tier, spec.lang, "seed")
 				}
 			}
 		}
+		val added = repository.addRules(rules)
 		if (added > 0) log.info("Seeded {} filter rules from the starter lists", added)
 		if (skipped > 0) log.info("Skipped {} seed terms that normalise too short to be safe", skipped)
 		return added
@@ -71,12 +72,15 @@ class FilterService(
 	 * nobody has read end to end, is the difference between "strict" and "broken" (PLAN.md §6).
 	 */
 	fun demoteMisfiringRules(): List<Long> {
-		val demoted = repository.ruleStats(FilterRules.AUTO_DEMOTE_MIN_BLOCKS)
-			.filter { it.ruleId != null && it.falsePositiveRate >= FilterRules.AUTO_DEMOTE_RATE }
+		val demoted = repository.autoDemotionStats(FilterRules.AUTO_DEMOTE_MIN_REPORTERS)
+			.filter {
+				it.ruleId != null && it.tier != FilterTier.SEVERE &&
+					it.falsePositiveRate >= FilterRules.AUTO_DEMOTE_RATE
+			}
 			.mapNotNull { stats ->
 				stats.ruleId?.takeIf { repository.demoteRule(it) }?.also {
 					log.info(
-						"Auto-demoted filter rule {} ('{}', {}): {} of {} blocks were disputed",
+						"Auto-demoted filter rule {} ('{}', {}): {} of {} trusted reporters disputed it",
 						it, stats.term, stats.lang ?: "global", stats.disputed, stats.blocks,
 					)
 				}

@@ -60,11 +60,14 @@ class ScoringRepository(private val dataSource: DataSource) {
 			}
 		}
 
-	fun upsert(scores: List<SourceScore>, now: OffsetDateTime): Int {
-		if (scores.isEmpty()) return 0
-		return dataSource.connection.use { connection ->
-			connection.autoCommit = false
-			connection.prepareStatement(UPSERT).use { statement ->
+	/**
+	 * Replaces every region represented by [scores] in one transaction. Rows for sources no longer
+	 * present in the aggregation are removed instead of accumulating forever.
+	 */
+	fun replace(scores: List<SourceScore>, now: OffsetDateTime): Int = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			val applied = if (scores.isEmpty()) 0 else connection.prepareStatement(UPSERT).use { statement ->
 				scores.forEach { score ->
 					statement.setString(1, score.source)
 					statement.setString(2, score.region)
@@ -75,10 +78,36 @@ class ScoringRepository(private val dataSource: DataSource) {
 					statement.setObject(7, now, Types.TIMESTAMP_WITH_TIMEZONE)
 					statement.addBatch()
 				}
-				val applied = statement.executeBatch().sum()
-				connection.commit()
-				applied
+				statement.executeBatch().sum()
 			}
+
+			scores.groupBy { it.region }.forEach { (region, current) ->
+				connection.prepareStatement(
+					"DELETE FROM source_score WHERE region = ? AND source <> ALL (?)",
+				).use { statement ->
+					statement.setString(1, region)
+					statement.setArray(2, connection.createArrayOf("text", current.map { it.source }.toTypedArray()))
+					statement.executeUpdate()
+				}
+			}
+			connection.prepareStatement("DELETE FROM source_score WHERE updated_at < ?").use { statement ->
+				statement.setObject(1, now.minusDays(MAX_STALE_SCORE_DAYS), Types.TIMESTAMP_WITH_TIMEZONE)
+				statement.executeUpdate()
+			}
+			connection.commit()
+			applied
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
+
+	fun pruneStale(now: OffsetDateTime): Int = dataSource.connection.use { connection ->
+		connection.prepareStatement("DELETE FROM source_score WHERE updated_at < ?").use { statement ->
+			statement.setObject(1, now.minusDays(MAX_STALE_SCORE_DAYS), Types.TIMESTAMP_WITH_TIMEZONE)
+			statement.executeUpdate()
 		}
 	}
 
@@ -88,9 +117,11 @@ class ScoringRepository(private val dataSource: DataSource) {
 				"""
 				SELECT source, region, stability, popularity, composite, sample_size
 				FROM source_score WHERE region = ? ORDER BY composite DESC, source
+				LIMIT ?
 				""".trimIndent(),
 			).use { statement ->
 				statement.setString(1, region)
+				statement.setInt(2, MAX_SCORES_PER_REGION)
 				statement.executeQuery().use { rows ->
 					buildList {
 						while (rows.next()) {
@@ -125,10 +156,12 @@ class ScoringRepository(private val dataSource: DataSource) {
 
 	private companion object {
 		const val WINDOW_DAYS = 30
+		const val MAX_STALE_SCORE_DAYS = 30L
+		const val MAX_SCORES_PER_REGION = 1_200
 
 		/**
-		 * Trust weighting: tier 0 contributes half a reporter, tier 2 a whole one. A fresh identity
-		 * should not be able to move a source's popularity, but it should still count for something.
+			 * Only established identities contribute to public scores. Device identifiers are self-declared,
+			 * so three-day accounts remain cheap to manufacture in bulk even when each reporter-day is capped.
 		 */
 		val AGGREGATE = """
 			WITH decayed AS (
@@ -136,27 +169,36 @@ class ScoringRepository(private val dataSource: DataSource) {
 				       ok, fail, empty, cf_blocked, latency_p50_ms,
 				       power(0.5, (CURRENT_DATE - day)::numeric / ?::numeric) AS w
 				FROM source_probe_raw
-				WHERE day >= CURRENT_DATE - ?::int
+				WHERE day >= CURRENT_DATE - ?::int AND tier >= 2
+			),
+			reporter_samples AS (
+				SELECT source, region, day, reporter_day, MAX(tier) AS tier, MAX(w) AS w,
+				       SUM(ok)::numeric AS ok,
+				       SUM(fail)::numeric AS fail,
+				       SUM(empty)::numeric AS empty,
+				       SUM(cf_blocked)::numeric AS cf_blocked,
+				       COALESCE(
+				         SUM(latency_p50_ms::numeric * (ok + fail)) / NULLIF(SUM(ok + fail), 0),
+				         0
+				       ) AS latency
+				FROM decayed
+				GROUP BY source, region, day, reporter_day
 			),
 			counts AS (
 				SELECT source, region,
-				       SUM(ok * w)         AS ok_w,
-				       SUM(fail * w)       AS fail_w,
-				       SUM(empty * w)      AS empty_w,
-				       SUM(cf_blocked * w) AS cf_w,
-				       SUM(latency_p50_ms::numeric * w * (ok + fail)) AS lat_num,
-				       SUM(w * (ok + fail))                           AS lat_den
-				FROM decayed GROUP BY source, region
-			),
-			reporter_days AS (
-				SELECT source, region, day, reporter_day, MAX(tier) AS tier, MAX(w) AS w
-				FROM decayed GROUP BY source, region, day, reporter_day
+				       SUM((ok / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS ok_w,
+				       SUM((fail / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS fail_w,
+				       SUM((empty / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS empty_w,
+				       SUM((cf_blocked / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS cf_w,
+				       SUM(latency * w * (0.5 + tier * 0.25)) AS lat_num,
+				       SUM(w * (0.5 + tier * 0.25)) AS lat_den
+				FROM reporter_samples GROUP BY source, region
 			),
 			reporters AS (
 				SELECT source, region,
 				       SUM(w * (0.5 + tier * 0.25)) AS reporter_w,
 				       COUNT(*)                     AS sample_size
-				FROM reporter_days GROUP BY source, region
+				FROM reporter_samples GROUP BY source, region
 			)
 			SELECT c.source, c.region,
 			       c.ok_w::float8    AS ok_w,

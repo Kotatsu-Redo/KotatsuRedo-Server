@@ -1,9 +1,5 @@
 package io.kotatsuredo.server.routes
 
-import io.kotatsuredo.server.auth.RateLimiter
-import io.kotatsuredo.server.auth.enforceLimit
-import io.kotatsuredo.server.auth.requireCaller
-import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.scoring.ScoringService
 import io.kotatsuredo.server.telemetry.Region
 import io.ktor.http.HttpHeaders
@@ -46,15 +42,10 @@ data class ScoresResponse(
  * gets a 304 and transfers nothing.
  */
 fun Route.scoreRoutes(
-	identities: IdentityService,
 	scoring: ScoringService,
-	limiter: RateLimiter,
 ) = route("/sources") {
 
 	get("/scores") {
-		val caller = call.requireCaller(identities)
-		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
-
 		val region = Region.parse(call.request.queryParameters["region"])
 		val snapshot = scoring.scores(region.name)
 

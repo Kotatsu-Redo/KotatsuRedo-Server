@@ -2,7 +2,13 @@ package io.kotatsuredo.server.plugins
 
 import io.kotatsuredo.server.ApiError
 import io.kotatsuredo.server.ApiException
+import io.kotatsuredo.server.auth.RateLimiter
+import io.kotatsuredo.server.auth.networkKey
+import io.kotatsuredo.server.identity.TrustTier
+import io.kotatsuredo.server.routes.ADMIN_CSRF_HEADER
+import io.kotatsuredo.server.routes.ADMIN_CSRF_VALUE
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.serialization.kotlinx.json.json
@@ -15,10 +21,14 @@ import io.ktor.server.plugins.callid.callIdMdc
 import io.ktor.server.plugins.calllogging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.defaultheaders.DefaultHeaders
+import io.ktor.server.plugins.bodylimit.RequestBodyLimit
 import io.ktor.server.plugins.statuspages.StatusPages
+import kotlinx.coroutines.CancellationException
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
 import io.ktor.server.response.header
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import io.ktor.server.response.respond
 import io.ktor.util.logging.KtorSimpleLogger
 import kotlinx.serialization.json.Json
@@ -36,10 +46,27 @@ val ApiJson = Json {
 }
 
 fun Application.configureSerialization() {
+	install(RequestBodyLimit) {
+		bodyLimit { MAX_REQUEST_BODY_BYTES }
+	}
 	install(ContentNegotiation) {
 		json(ApiJson)
 	}
 }
+
+/**
+ * JDBC is synchronous. Moving the downstream call pipeline onto a bounded blocking dispatcher keeps
+ * a slow query or a saturated Hikari pool from occupying Netty's event-loop threads.
+ */
+fun Application.configureBlockingCalls(parallelism: Int) {
+	require(parallelism > 0)
+	val dispatcher = Dispatchers.IO.limitedParallelism(parallelism)
+	intercept(ApplicationCallPipeline.Setup) {
+		withContext(dispatcher) { proceed() }
+	}
+}
+
+private const val MAX_REQUEST_BODY_BYTES = 256L * 1024L
 
 /**
  * Request logging that cannot leak a credential.
@@ -81,10 +108,40 @@ fun Application.configureStatusPages() {
 		exception<BadRequestException> { call, _ ->
 			call.respond(HttpStatusCode.BadRequest, ApiError.BadRequest() as ApiError)
 		}
-		exception<Throwable> { call, cause ->
+		exception<CancellationException> { _, cause -> throw cause }
+		exception<Exception> { call, cause ->
 			// Log the class and message, never the request that caused it.
-			log.error("Unhandled ${cause::class.simpleName} at ${call.request.path()}", cause)
+			log.error("Unhandled {} at {}", cause::class.qualifiedName, call.request.path(), cause)
 			call.respond(ApiError.InternalError.status, ApiError.InternalError as ApiError)
+		}
+	}
+}
+
+/**
+ * Rejects abusive traffic before bearer authentication reaches PostgreSQL.
+ *
+ * Identity-specific limits necessarily run after authentication; this coarse network ceiling is the
+ * perimeter that also covers random or malformed credentials. It intentionally covers health too:
+ * that endpoint checks out a connection and otherwise provides an unauthenticated pool-exhaustion
+ * path of its own.
+ */
+fun Application.configurePreAuthRateLimit(limiter: RateLimiter) {
+	intercept(ApplicationCallPipeline.Plugins) {
+		val path = call.request.path()
+		val protectedApi = path == "/v1" || path.startsWith("/v1/") ||
+			path == "/admin/api" || path.startsWith("/admin/api/")
+		if (!protectedApi) return@intercept
+		when (
+			val decision = limiter.checkNetwork(
+				RateLimiter.Bucket.PRE_AUTH,
+				call.networkKey(),
+				TrustTier.NEW,
+			)
+		) {
+			is RateLimiter.Decision.Limited ->
+				throw ApiException(ApiError.RateLimited(decision.retryAfterSeconds, decision.bucket))
+
+			RateLimiter.Decision.Allowed -> Unit
 		}
 	}
 }
@@ -110,6 +167,19 @@ fun Application.configurePanelHeaders() {
 		call.response.header("X-Robots-Tag", "noindex, nofollow")
 		// Queue contents are moderation data and have no business in a shared cache or a back button.
 		call.response.header(HttpHeaders.CacheControl, "no-store")
+	}
+}
+
+/** Require a non-simple request header on every admin mutation, including login. */
+fun Application.configureAdminCsrf() {
+	intercept(ApplicationCallPipeline.Plugins) {
+		if (!call.request.path().startsWith("/admin/api/")) return@intercept
+		if (call.request.httpMethod == HttpMethod.Get) return@intercept
+		// An HTML form cannot set this. Cross-origin scripts require a CORS preflight, which the
+		// server does not grant, so a sibling origin cannot ride the SameSite session cookie.
+		if (call.request.headers[ADMIN_CSRF_HEADER] != ADMIN_CSRF_VALUE) {
+			throw ApiException(ApiError.Forbidden("csrf"))
+		}
 	}
 }
 

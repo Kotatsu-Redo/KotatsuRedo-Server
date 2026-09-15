@@ -25,6 +25,9 @@ class TelemetryService(
 		val day = LocalDate.now(clock)
 		val reporter = dailyReporterId(secret, day.format(DAY_FORMAT))
 		val sanitized = probes.mapNotNull(::sanitize)
+			.associateBy { it.source to it.op }
+			.values
+			.toList()
 		if (sanitized.isEmpty()) return 0
 
 		val written = repository.record(sanitized, day, region, reporter, tier.level)
@@ -37,8 +40,10 @@ class TelemetryService(
 	 * whole upload, and every value here is a count whose only failure mode is being implausible.
 	 */
 	private fun sanitize(probe: Probe): Probe? {
-		val source = probe.source.trim().take(ProbeLimits.MAX_SOURCE_NAME)
-		if (source.isEmpty()) return null
+		val source = probe.source.trim()
+		// Reject instead of truncating: truncation aliases distinct attacker-controlled names onto the
+		// same database key and arbitrary Unicode/control characters are not valid parser identifiers.
+		if (!ProbeLimits.isValidSource(source)) return null
 		val ok = probe.ok.clampCount()
 		val fail = probe.fail.clampCount()
 		val empty = probe.empty.clampCount()

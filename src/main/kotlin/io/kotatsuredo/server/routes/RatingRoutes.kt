@@ -59,6 +59,7 @@ fun Route.ratingRoutes(
 
 	get {
 		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 		val workId = call.resolveWorkId(works)
 		call.respond(ratings.aggregate(workId).toResponse(ratings.myRating(workId, caller.identity.id)))
 	}
@@ -77,6 +78,7 @@ fun Route.ratingRoutes(
 
 	delete {
 		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.RATINGS, caller.tier, caller.identity.id)
 		val workId = call.resolveWorkId(works)
 		call.respond(ratings.clear(workId, caller.identity.id).toResponse(null))
 	}

@@ -16,3 +16,4 @@ out/
 # src/main/resources/filter/ is what is committed.
 tools/.cache/
 tools/.corpus/
+.deploy-sync/

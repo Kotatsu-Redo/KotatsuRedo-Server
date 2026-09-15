@@ -4,15 +4,18 @@ const API = '/admin/api';
 const $ = (id) => document.getElementById(id);
 
 let session = null;
-let current = 'disliked';
+let current = 'overview';
 
 // -- transport ---------------------------------------------------------------------------------
 
 async function api(path, options = {}) {
+	const headers = new Headers(options.headers || {});
+	headers.set('X-KotatsuRedo-CSRF', '1');
+	if (options.body) headers.set('Content-Type', 'application/json');
 	const response = await fetch(API + path, {
 		credentials: 'same-origin',
-		headers: options.body ? { 'Content-Type': 'application/json' } : {},
 		...options,
+		headers,
 	});
 	if (response.status === 204) return null;
 	const text = await response.text();
@@ -50,6 +53,11 @@ function askReason(title, note, required) {
 // -- views -------------------------------------------------------------------------------------
 
 const VIEWS = {
+	overview: {
+		title: 'Overview',
+		hint: 'What the instance looks like right now, and what is waiting for you.',
+		load: () => api('/overview').then(overviewPage),
+	},
 	disliked: {
 		title: 'Most disliked',
 		hint: 'The report queue. There is no report button — dislikes are the signal.',
@@ -102,6 +110,11 @@ const VIEWS = {
 		hint: 'Invite, set a role, disable. An account cannot remove the last admin.',
 		admin: true,
 		load: () => api('/moderators').then(moderatorList),
+	},
+	account: {
+		title: 'Account',
+		hint: 'Changing your password verifies both factors and signs out every open session.',
+		load: () => Promise.resolve(accountPage()),
 	},
 	actions: {
 		title: 'Audit log',
@@ -549,6 +562,54 @@ function moderatorList(moderators) {
 	return wrapper;
 }
 
+function accountPage() {
+	const card = element(
+		'<div class="card"><h3 style="margin-top:0">Change password</h3>' +
+		'<label>Current password</label><input class="current" type="password" autocomplete="current-password">' +
+		'<label>New password</label><input class="next" type="password" autocomplete="new-password">' +
+		'<label>Confirm new password</label><input class="confirm" type="password" autocomplete="new-password">' +
+		'<label>Authenticator code</label><input class="code" inputmode="numeric" autocomplete="one-time-code">' +
+		'<div class="row"><button class="primary change">Change password</button></div>' +
+		'<div class="error local-error"></div></div>',
+	);
+	const button = card.querySelector('.change');
+	button.onclick = async () => {
+		const errorBox = card.querySelector('.local-error');
+		errorBox.textContent = '';
+		const newPassword = card.querySelector('.next').value;
+		if (newPassword !== card.querySelector('.confirm').value) {
+			errorBox.textContent = 'The new passwords do not match.';
+			return;
+		}
+		button.disabled = true;
+		try {
+			await api('/password', {
+				method: 'POST',
+				body: JSON.stringify({
+					current_password: card.querySelector('.current').value,
+					new_password: newPassword,
+					code: card.querySelector('.code').value,
+				}),
+			});
+			session = null;
+			$('u').value = '';
+			$('p').value = '';
+			$('c').value = '';
+			screen('login');
+			$('login-error').textContent = 'Password changed. Sign in again.';
+			$('u').focus();
+		} catch (error) {
+			errorBox.textContent = {
+				invalid_current_password: 'The current password was wrong.',
+				bad_code: 'That authenticator code was wrong or already used.',
+				weak_password: 'Use at least 12 characters for the new password.',
+			}[error.code] || error.message;
+			button.disabled = false;
+		}
+	};
+	return card;
+}
+
 function actionList(actions) {
 	if (!actions.length) return empty('Nothing yet.');
 	const table = element(
@@ -611,8 +672,8 @@ async function refreshCounts() {
 }
 
 function buildNav() {
-	const queueKeys = ['disliked', 'recent', 'flagged', 'blocked', 'ban-evasion', 'brigades', 'disputes'];
-	const adminKeys = ['filter-stats', 'actions', 'devices', 'moderators'];
+	const queueKeys = ['overview', 'disliked', 'recent', 'flagged', 'blocked', 'ban-evasion', 'brigades', 'disputes'];
+	const adminKeys = ['filter-stats', 'actions', 'account', 'devices', 'moderators'];
 	const countKeys = {
 		disliked: 'disliked',
 		flagged: 'flagged',
@@ -726,3 +787,323 @@ $('signout').onclick = signOut;
 $('enrol-cancel').onclick = signOut;
 
 start();
+
+/* ---------------------------------------------------------------------------------------------
+ * Home.
+ *
+ * A console, not a document. A moderator opens this to answer one question - is anything wrong -
+ * so the page leads with a gauge that can be read from across a desk, then the queues that fill
+ * it, then the shape of the last fortnight. Every figure that can be drawn is drawn: a count you
+ * have to compare against yesterday in your head is a count doing half its job.
+ *
+ * All the drawing is hand-rolled SVG. The panel's own CSP is `default-src 'none'`, so there is no
+ * charting library to reach for and never will be - which is fine, because a bar chart is thirty
+ * lines and a dependency is forever.
+ * ------------------------------------------------------------------------------------------- */
+
+const QUEUE_META = {
+	disliked: {
+		label: 'Most disliked',
+		view: 'disliked',
+		icon: 'M7 14l5-9 5 9M4 19h16',
+	},
+	flagged: {
+		label: 'Flagged',
+		view: 'flagged',
+		icon: 'M6 20V4h11l-2 4 2 4H6',
+	},
+	blocked: {
+		label: 'Filter blocks',
+		view: 'blocked',
+		icon: 'M5 5l14 14M12 4a8 8 0 100 16 8 8 0 000-16z',
+	},
+	ban_evasion: {
+		label: 'Ban evasion',
+		view: 'ban-evasion',
+		icon: 'M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z',
+	},
+	brigades: {
+		label: 'Rating brigades',
+		view: 'brigades',
+		icon: 'M4 18l4-6 4 3 4-8 4 5',
+	},
+	disputes: {
+		label: 'Work disputes',
+		view: 'disputes',
+		icon: 'M8 7h8M8 12h8M8 17h5M4 4v16',
+	},
+};
+
+function svg(inner, attrs) {
+	return '<svg xmlns="http://www.w3.org/2000/svg" ' + attrs + '>' + inner + '</svg>';
+}
+
+function icon(path) {
+	return svg(
+		'<path d="' + path + '" fill="none" stroke="currentColor" stroke-width="1.7" ' +
+		'stroke-linecap="round" stroke-linejoin="round"/>',
+		'viewBox="0 0 24 24" class="ico" aria-hidden="true"',
+	);
+}
+
+function overviewPage(data) {
+	const page = element('<div class="overview"></div>');
+	const waiting = Object.entries(data.queues).filter(([, count]) => count > 0);
+	const total = waiting.reduce((sum, [, count]) => sum + count, 0);
+
+	page.appendChild(hero(data, waiting, total));
+	if (waiting.length) page.appendChild(queueGrid(waiting));
+	page.appendChild(activityPanel(data.series));
+
+	const lower = element('<section class="split"></section>');
+	lower.appendChild(filterPanel(data.top_rules));
+	lower.appendChild(languagePanel(data.languages));
+	page.appendChild(lower);
+
+	page.appendChild(totalsStrip(data.totals));
+	return page;
+}
+
+/**
+ * The gauge is the page's thesis: one arc, one number, readable without reading.
+ *
+ * Its scale is deliberately soft - twenty items fills it - because the question is "a little or a
+ * lot", and a gauge that needs its own axis explained has stopped being a gauge.
+ */
+function hero(data, waiting, total) {
+	const node = element('<section class="hero"></section>');
+	const ceiling = 20;
+	const fraction = Math.min(1, total / ceiling);
+	const radius = 52;
+	const circumference = 2 * Math.PI * radius;
+	const state = total === 0 ? 'calm' : (total >= 10 ? 'busy' : 'some');
+
+	const ring = element(
+		'<div class="gauge ' + state + '">' +
+		svg(
+			'<circle cx="60" cy="60" r="' + radius + '" class="track"/>' +
+			'<circle cx="60" cy="60" r="' + radius + '" class="fill" ' +
+			'stroke-dasharray="' + circumference.toFixed(1) + '" ' +
+			'stroke-dashoffset="' + (circumference * (1 - fraction)).toFixed(1) + '"/>',
+			'viewBox="0 0 120 120" class="gauge-svg" role="img" aria-label="' + total + ' waiting"',
+		) +
+		'<div class="gauge-mid"><span class="g-n">' + total + '</span>' +
+		'<span class="g-l">waiting</span></div>' +
+		'</div>',
+	);
+	node.appendChild(ring);
+
+	const copy = element('<div class="hero-copy"></div>');
+	if (total === 0) {
+		copy.appendChild(element('<h2 class="say">All clear</h2>'));
+		copy.appendChild(element(
+			'<p class="because">Nothing is queued. ' + data.today.comments + ' comment' +
+			plural(data.today.comments) + ' arrived in the last day.</p>',
+		));
+	} else {
+		const biggest = waiting.slice().sort((a, b) => b[1] - a[1])[0];
+		copy.appendChild(element(
+			'<h2 class="say">' + total + ' item' + plural(total) + ' to review</h2>',
+		));
+		copy.appendChild(element(
+			'<p class="because">Mostly <strong>' + escapeHtml(labelFor(biggest[0]).toLowerCase()) +
+			'</strong>, at ' + biggest[1] + '.</p>',
+		));
+	}
+
+	const pills = element('<div class="hero-stats"></div>');
+	[
+		['Comments', data.today.comments],
+		['New readers', data.today.users],
+		['Ratings', data.today.ratings],
+		['Blocked', data.today.blocked],
+		['Actions', data.today.actions],
+	].forEach(([name, value]) => {
+		pills.appendChild(element(
+			'<div class="pill"><span class="p-n">' + value + '</span><span class="p-l">' +
+			escapeHtml(name) + '</span></div>',
+		));
+	});
+	copy.appendChild(pills);
+	copy.appendChild(element('<p class="stamp">last 24 hours</p>'));
+	node.appendChild(copy);
+	return node;
+}
+
+function labelFor(key) {
+	return QUEUE_META[key] ? QUEUE_META[key].label : key.replace(/_/g, ' ');
+}
+
+function plural(n) {
+	return n === 1 ? '' : 's';
+}
+
+function goTo(key) {
+	current = key;
+	document.querySelectorAll('nav button[data-view]').forEach((other) => {
+		other.setAttribute('aria-current', String(other.dataset.view === key));
+	});
+	render();
+}
+
+function queueGrid(waiting) {
+	const grid = element('<section class="queue-grid"></section>');
+	waiting.sort((a, b) => b[1] - a[1]).forEach(([key, count]) => {
+		const meta = QUEUE_META[key];
+		const tile = element(
+			'<button class="q-card">' +
+			'<span class="q-ico">' + icon(meta ? meta.icon : 'M5 12h14') + '</span>' +
+			'<span class="q-n">' + count + '</span>' +
+			'<span class="q-l">' + escapeHtml(labelFor(key)) + '</span>' +
+			'</button>',
+		);
+		if (meta && VIEWS[meta.view]) {
+			tile.onclick = () => goTo(meta.view);
+		} else {
+			tile.disabled = true;
+		}
+		grid.appendChild(tile);
+	});
+	return grid;
+}
+
+/**
+ * Fourteen days, two series, one panel.
+ *
+ * Two areas on a shared canvas but each scaled to its own peak, with both peaks labelled - signups
+ * and comments differ by an order of magnitude, and a shared axis would flatten the smaller one to
+ * a flat line while implying the two are comparable.
+ */
+function activityPanel(series) {
+	const node = element('<section class="panel chart-panel"></section>');
+	node.appendChild(element(
+		'<div class="panel-head"><h3>Activity</h3>' +
+		'<div class="legend"><span class="k comments">Comments</span>' +
+		'<span class="k readers">New readers</span></div></div>',
+	));
+
+	const width = 560;
+	const height = 150;
+	const pad = 10;
+	const comments = series.map((d) => d.comments);
+	const readers = series.map((d) => d.users);
+	const peakC = Math.max(1, ...comments);
+	const peakR = Math.max(1, ...readers);
+
+	const path = (values, peak) => {
+		const step = (width - pad * 2) / Math.max(1, values.length - 1);
+		return values.map((value, i) => {
+			const x = pad + i * step;
+			const y = height - pad - (value / peak) * (height - pad * 2);
+			return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1);
+		}).join(' ');
+	};
+	const area = (values, peak) => path(values, peak) +
+		' L' + (width - pad) + ' ' + (height - pad) + ' L' + pad + ' ' + (height - pad) + ' Z';
+
+	const gridLines = [0.25, 0.5, 0.75].map((f) => {
+		const y = (pad + f * (height - pad * 2)).toFixed(1);
+		return '<line x1="' + pad + '" x2="' + (width - pad) + '" y1="' + y + '" y2="' + y + '" class="grid"/>';
+	}).join('');
+
+	node.appendChild(element(
+		svg(
+			'<defs>' +
+			'<linearGradient id="gc" x1="0" y1="0" x2="0" y2="1">' +
+			'<stop offset="0%" class="gc-0"/><stop offset="100%" class="gc-1"/></linearGradient>' +
+			'<linearGradient id="gr" x1="0" y1="0" x2="0" y2="1">' +
+			'<stop offset="0%" class="gr-0"/><stop offset="100%" class="gr-1"/></linearGradient>' +
+			'</defs>' +
+			gridLines +
+			'<path d="' + area(comments, peakC) + '" class="area-c"/>' +
+			'<path d="' + path(comments, peakC) + '" class="line-c"/>' +
+			'<path d="' + area(readers, peakR) + '" class="area-r"/>' +
+			'<path d="' + path(readers, peakR) + '" class="line-r"/>',
+			'viewBox="0 0 ' + width + ' ' + height + '" class="chart" preserveAspectRatio="none" ' +
+			'role="img" aria-label="Comments and new readers over fourteen days"',
+		),
+	));
+	node.appendChild(element(
+		'<div class="chart-foot"><span>' + escapeHtml(series[0].day.slice(5)) + '</span>' +
+		'<span class="peaks">peak ' + peakC + ' comments · ' + peakR + ' readers</span>' +
+		'<span>today</span></div>',
+	));
+	return node;
+}
+
+function filterPanel(rules) {
+	const node = element('<section class="panel"></section>');
+	node.appendChild(element('<div class="panel-head"><h3>Filter load</h3><span class="sub">7 days</span></div>'));
+	if (!rules.length) {
+		node.appendChild(element('<p class="empty-soft">The filter has not stopped anything this week.</p>'));
+		return node;
+	}
+	const peak = Math.max(...rules.map((r) => r.blocks));
+	const list = element('<div class="rows"></div>');
+	rules.forEach((rule) => {
+		const rate = rule.blocks === 0 ? 0 : Math.round((rule.disputed / rule.blocks) * 100);
+		list.appendChild(element(
+			'<div class="rowline">' +
+			'<span class="rl-k mono">' + escapeHtml(rule.term) + '</span>' +
+			'<span class="tier ' + escapeHtml(rule.tier) + '">' + escapeHtml(rule.tier) + '</span>' +
+			'<span class="track"><i class="' + (rate >= 30 ? 'hot' : '') + '" style="width:' +
+			Math.round((rule.blocks / peak) * 100) + '%"></i></span>' +
+			'<span class="rl-v mono">' + rule.blocks + '</span>' +
+			'<span class="rl-d mono' + (rate >= 30 ? ' hot' : '') + '">' + rate + '%</span>' +
+			'</div>',
+		));
+	});
+	node.appendChild(list);
+	node.appendChild(element(
+		'<p class="note">Blocks are the bar, disputes the percentage. A rule demotes itself once a ' +
+		'third of its blocks are disputed.</p>',
+	));
+	return node;
+}
+
+function languagePanel(languages) {
+	const node = element('<section class="panel"></section>');
+	node.appendChild(element('<div class="panel-head"><h3>Languages</h3><span class="sub">all time</span></div>'));
+	if (!languages.length) {
+		node.appendChild(element('<p class="empty-soft">No comments yet.</p>'));
+		return node;
+	}
+	const peak = Math.max(...languages.map((l) => l.comments));
+	const list = element('<div class="rows"></div>');
+	languages.forEach((row) => {
+		const denominator = row.comments + row.blocked;
+		const rate = denominator === 0 ? 0 : Math.round((row.blocked / denominator) * 100);
+		list.appendChild(element(
+			'<div class="rowline">' +
+			'<span class="rl-k mono">' + escapeHtml(row.lang) + '</span>' +
+			'<span class="track"><i style="width:' + Math.round((row.comments / peak) * 100) + '%"></i></span>' +
+			'<span class="rl-v mono">' + row.comments + '</span>' +
+			'<span class="rl-d mono' + (rate >= 20 ? ' hot' : '') + '">' + rate + '%</span>' +
+			'</div>',
+		));
+	});
+	node.appendChild(list);
+	node.appendChild(element(
+		'<p class="note">The percentage is how much of that language the filter stopped. An outlier ' +
+		'means a bad word list, not a rude userbase.</p>',
+	));
+	return node;
+}
+
+function totalsStrip(totals) {
+	const strip = element('<section class="totals"></section>');
+	[
+		['Readers', totals.users],
+		['Comments', totals.comments],
+		['Removed', totals.removed],
+		['Ratings', totals.ratings],
+		['Works', totals.works],
+		['Moderators', totals.moderators],
+	].forEach(([name, value]) => {
+		strip.appendChild(element(
+			'<div class="t-cell"><span class="t-n">' + value + '</span><span class="t-l">' +
+			escapeHtml(name) + '</span></div>',
+		));
+	});
+	return strip;
+}

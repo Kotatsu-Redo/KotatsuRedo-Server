@@ -124,6 +124,9 @@ object CommentRules {
 
 	const val MAX_PAGE_SIZE = 50
 	const val DEFAULT_PAGE_SIZE = 25
+	const val MAX_OFFSET = 5_000
+	/** Hard response bound even when one root has an unusually large reply tree. */
+	const val MAX_THREAD_COMMENTS = 500
 
 	/**
 	 * Counts what a person would call characters, so an emoji or an accented letter is one, and a

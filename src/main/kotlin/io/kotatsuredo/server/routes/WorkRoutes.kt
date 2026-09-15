@@ -6,11 +6,14 @@ import io.kotatsuredo.server.auth.RateLimiter
 import io.kotatsuredo.server.auth.enforceLimit
 import io.kotatsuredo.server.auth.requireCaller
 import io.kotatsuredo.server.identity.IdentityService
+import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.works.LinkOutcome
 import io.kotatsuredo.server.works.WorkFingerprint
 import io.kotatsuredo.server.works.WorkLinker
+import io.kotatsuredo.server.works.WorkLimits
 import io.kotatsuredo.server.works.WorkResolver
+import io.kotatsuredo.server.works.WorkResolutionOverloaded
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
@@ -19,6 +22,9 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 @Serializable
 data class FingerprintDto(
@@ -75,34 +81,51 @@ fun Route.workRoutes(
 	 */
 	post("/resolve") {
 		val caller = call.requireCaller(identities)
-		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 
 		val body = call.receive<ResolveRequest>()
 		if (body.works.isEmpty()) throw ApiException(ApiError.BadRequest("works"))
 		if (body.works.size > MAX_BATCH) throw ApiException(ApiError.BadRequest("too_many_works"))
+		val titleInputs = body.works.sumOf { 1 + it.altTitles.size }
+		if (titleInputs > MAX_TITLE_INPUTS_PER_BATCH) {
+			throw ApiException(ApiError.BadRequest("too_many_titles"))
+		}
+		call.enforceLimit(
+			limiter,
+			RateLimiter.Bucket.WORK_MUTATION,
+			caller.tier,
+			caller.identity.id,
+			cost = titleInputs,
+		)
 
-		val resolved = body.works.mapNotNull { dto ->
-			if (dto.source.isBlank() || dto.key.isBlank() || dto.title.isBlank()) return@mapNotNull null
-			val resolution = resolver.resolve(
-				WorkFingerprint(
-					source = dto.source,
-					sourceKey = dto.key,
-					title = dto.title,
-					altTitles = dto.altTitles,
-					year = dto.year,
-					contentType = dto.contentType,
-					nsfw = dto.nsfw,
-					coverPHash = dto.coverPHash,
-					externalIds = dto.externalIds,
-				),
-			)
-			ResolvedDto(
-				source = dto.source,
-				key = dto.key,
-				workId = resolution.workId.toString(),
-				method = resolution.method.name.lowercase(),
-				created = resolution.created,
-			)
+		val resolved = try {
+			coroutineScope { body.works.map { dto ->
+				if (!dto.isValid()) throw ApiException(ApiError.BadRequest("work_fingerprint"))
+				async {
+					val resolution = resolver.resolve(
+						WorkFingerprint(
+							source = dto.source,
+							sourceKey = dto.key,
+							title = dto.title,
+							altTitles = dto.altTitles,
+							year = dto.year,
+							contentType = dto.contentType,
+							nsfw = dto.nsfw,
+							coverPHash = dto.coverPHash,
+							externalIds = emptyMap(),
+						),
+						reporterId = caller.identity.id,
+					)
+					ResolvedDto(
+						source = dto.source,
+						key = dto.key,
+						workId = resolution.workId.toString(),
+						method = resolution.method.name.lowercase(),
+						created = resolution.created,
+					)
+				}
+			}.awaitAll() }
+		} catch (_: WorkResolutionOverloaded) {
+			throw ApiException(ApiError.RateLimited(1, "work_resolution_capacity"))
 		}
 		call.respond(ResolveResponse(resolved))
 	}
@@ -113,13 +136,20 @@ fun Route.workRoutes(
 	 */
 	post("/link") {
 		val caller = call.requireCaller(identities)
-		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
+		if (caller.tier != TrustTier.ESTABLISHED) {
+			throw ApiException(ApiError.Forbidden("established_account_required"))
+		}
+		call.enforceLimit(limiter, RateLimiter.Bucket.WORK_MUTATION, caller.tier, caller.identity.id)
 
 		val body = call.receive<LinkRequest>()
+		if (!body.from.isValid() || !body.to.isValid() || body.evidence.length > MAX_EVIDENCE) {
+			throw ApiException(ApiError.BadRequest("link"))
+		}
 		val outcome = linker.link(
 			a = body.from.source to body.from.key,
 			b = body.to.source to body.to.key,
-			evidence = body.evidence,
+			evidence = body.evidence.sanitizedEvidence(),
+			allowMerge = false,
 		)
 
 		val response = when (outcome) {
@@ -174,4 +204,38 @@ data class DisputeRequest(
 private val DISPUTE_KINDS = setOf("same_work", "different_works")
 private const val MAX_DISPUTE_NOTE = 500
 
-private const val MAX_BATCH = 100
+private const val MAX_BATCH = 25
+private const val MAX_SOURCE = 64
+private const val MAX_SOURCE_KEY = 512
+private const val MAX_TITLE = 500
+private const val MAX_ALT_TITLES = 32
+private const val MAX_TITLE_INPUTS_PER_BATCH = 100
+private const val MAX_EXTERNAL_IDS = 10
+private const val MAX_EXTERNAL_PROVIDER = 32
+private const val MAX_EXTERNAL_ID = 128
+private const val MAX_CONTENT_TYPE = 32
+private const val MAX_EVIDENCE = 200
+private val SOURCE_PATTERN = Regex("[A-Za-z0-9_.-]+")
+
+private fun FingerprintRef.isValid(): Boolean =
+	source.length in 1..MAX_SOURCE &&
+		SOURCE_PATTERN.matches(source) &&
+		key.length in 1..MAX_SOURCE_KEY &&
+		key.none(Char::isISOControl)
+
+private fun FingerprintDto.isValid(): Boolean =
+	FingerprintRef(source, key).isValid() &&
+		title.length in 1..MAX_TITLE &&
+		title.none(Char::isISOControl) &&
+		altTitles.size <= MAX_ALT_TITLES &&
+		altTitles.all { it.length in 1..MAX_TITLE && it.none(Char::isISOControl) } &&
+		WorkLimits.isValidYear(year) &&
+		(contentType == null || contentType.length <= MAX_CONTENT_TYPE) &&
+		externalIds.size <= MAX_EXTERNAL_IDS &&
+		externalIds.all { (provider, id) ->
+			provider.length in 1..MAX_EXTERNAL_PROVIDER && id.length in 1..MAX_EXTERNAL_ID
+		}
+
+private fun String.sanitizedEvidence(): String = map { if (it.isISOControl()) ' ' else it }
+	.joinToString("")
+	.trim()

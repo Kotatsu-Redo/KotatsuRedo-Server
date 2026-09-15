@@ -84,10 +84,10 @@ object FilterRules {
 
 	/**
 	 * A rule that misfires this often stops blocking on its own rather than waiting for someone to
-	 * notice. Paired with a minimum sample, because one dispute out of one block is noise.
+	 * notice. Paired with a minimum independent settled-account sample, because one reporter is noise.
 	 */
 	const val AUTO_DEMOTE_RATE = 0.30
-	const val AUTO_DEMOTE_MIN_BLOCKS = 5
+	const val AUTO_DEMOTE_MIN_REPORTERS = 5
 
 	/**
 	 * How long the blocked text itself is kept.

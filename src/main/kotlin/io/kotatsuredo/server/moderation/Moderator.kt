@@ -41,8 +41,9 @@ data class Moderator(
 data class ModSession(
 	val moderator: Moderator,
 	val expiresAt: OffsetDateTime,
+	val mfaVerified: Boolean,
 ) {
-	val needsTotpEnrolment: Boolean get() = !moderator.totpConfirmed
+	val needsTotpEnrolment: Boolean get() = !moderator.totpConfirmed || !mfaVerified
 }
 
 sealed interface LoginResult {
@@ -62,6 +63,16 @@ sealed interface EnrolResult {
 
 	/** Already enrolled. Re-enrolling is an admin action on someone else's account, not a self-serve one. */
 	data object AlreadyEnrolled : EnrolResult
+
+	/** Another live password-only session owns the pending seed; never disclose that seed here. */
+	data object InProgress : EnrolResult
+}
+
+enum class PasswordChangeResult {
+	CHANGED,
+	INVALID_CURRENT_PASSWORD,
+	INVALID_TOTP,
+	INVALID_NEW_PASSWORD,
 }
 
 /**
@@ -100,6 +111,7 @@ object ModActions {
 	const val INVITE_MODERATOR = "invite_moderator"
 	const val UPDATE_MODERATOR = "update_moderator"
 	const val RESET_TOTP = "reset_totp"
+	const val CHANGE_PASSWORD = "change_password"
 
 	const val TARGET_COMMENT = "comment"
 	const val TARGET_USER = "user"

@@ -106,7 +106,7 @@ The same secret on two phones is fine — they are the same user. Ratings are la
 ### Abuse resistance
 
 - **Rate limits** per `user_id` and per `/24` IP bucket. The IP bucket is an **in-memory counter keyed by a hash, never persisted and never logged** — so "we don't store IPs" stays literally true.
-- **Trust tiers** (one SQL view): tier 0 = under 24h old or under 3 active days; tier 1 = normal; tier 2 = long-lived and never actioned. Tiers affect **rate limits and telemetry weight only** — they never gate publication. Comments post instantly for everyone (§6).
+- **Trust tiers** (one SQL view): tier 0 = under 24h old or under 3 active days; tier 1 = normal; tier 2 = at least 90 days old, active on 30 days, and never actioned. Tiers affect rate limits and the eligibility/weight of global crowd-derived signals — they never gate publication. Comments post instantly for everyone (§6).
 - **Bans** by `user_id`, plus a device ban (below). **A ban removes read access too** — identity is all-or-nothing (§1), a banned device cannot create one, so the community features simply cease to exist for it. That is a harder sanction than most platforms apply, and it is deliberate.
 - **A ban deletes the user's comments.** Their rows survive as tombstones with the body cleared and `state = removed`, rather than being dropped outright — hard-deleting would orphan every reply underneath and tear holes in threads other people were part of. The audit log records the sweep as one `mod_action`.
 - **Shadowban** — `state = shadowed`: the comment renders normally for its author and is invisible to everyone else, and their votes stop counting. Settable per user (`is_shadowbanned`), so everything they post afterwards is shadowed on arrival. This is the right tool against someone who would otherwise just generate a new identity, because nothing signals that it happened.
@@ -476,7 +476,7 @@ The blocked *term* is passed through untranslated, which is correct — it's the
 
 ### Rate limits
 
-Per identity, sliding window. Tier 0 is under 24h old or under 3 active days; tier 2 is long-lived and never actioned.
+Per identity, sliding window. Tier 0 is under 24h old or under 3 active days; tier 2 is at least 90 days old, active on 30 days, and never actioned.
 
 | | tier 0 | tier 1 | tier 2 |
 |---|---|---|---|

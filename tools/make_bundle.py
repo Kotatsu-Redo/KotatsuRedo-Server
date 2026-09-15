@@ -69,6 +69,7 @@ def build_env(domain: str, image: str) -> str:
         "DATABASE_PASSWORD": password,
         # No default anywhere on purpose - see Config.kt. Changing it invalidates every device ban.
         "DEVICE_PEPPER": secrets.token_urlsafe(32),
+        "MOD_TOTP_ENCRYPTION_KEY": secrets.token_urlsafe(32),
         "MOD_BOOTSTRAP_USERNAME": "admin",
         "MOD_BOOTSTRAP_PASSWORD": secrets.token_urlsafe(18),
     }
@@ -117,7 +118,8 @@ def build_compose(image: str, proxy: str, port: int) -> str:
         assert "caddy" not in text, "the nginx bundle must not carry a Caddy service"
     else:
         text = text.replace("./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "./Caddyfile:/etc/caddy/Caddyfile:ro", 1)
-    assert "build:" not in text, "the bundle must not need a build context"
+    # A line, not a substring: the word "rebuild:" inside a comment is not a build directive.
+    assert not re.search(r"^\s*build:", text, re.M), "the bundle must not need a build context"
     return text
 
 

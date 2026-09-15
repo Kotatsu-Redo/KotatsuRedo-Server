@@ -54,8 +54,8 @@ class ModerationService(
 	 */
 	fun bootstrapFirstAdmin(username: String, password: String): Moderator? {
 		if (moderators.count() > 0) return null
-		require(password.length >= Passwords.MIN_LENGTH) {
-			"bootstrap password must be at least ${Passwords.MIN_LENGTH} characters"
+		require(password.length in Passwords.MIN_LENGTH..Passwords.MAX_LENGTH) {
+			"bootstrap password must be between ${Passwords.MIN_LENGTH} and ${Passwords.MAX_LENGTH} characters"
 		}
 		val created = moderators.create(
 			id = newId(),
@@ -77,7 +77,7 @@ class ModerationService(
 	fun login(username: String, password: String, code: String?): LoginResult {
 		val moderator = moderators.findByUsername(username)
 		val storedHash = moderator?.let { moderators.passwordHashOf(it.id) }
-		if (moderator == null || storedHash == null || !Passwords.verify(password, storedHash)) {
+		if (!Passwords.verifyOrDummy(password, storedHash) || moderator == null) {
 			// Same answer for an unknown username and a wrong password, so the endpoint cannot be
 			// used to enumerate who has an account.
 			return LoginResult.InvalidCredentials
@@ -94,9 +94,14 @@ class ModerationService(
 
 		val token = newToken()
 		val expiresAt = now().plusHours(ModerationRules.SESSION_HOURS)
-		moderators.openSession(sha256(token.toByteArray(Charsets.UTF_8)), moderator.id, expiresAt)
+		moderators.openSession(
+			sha256(token.toByteArray(Charsets.UTF_8)),
+			moderator.id,
+			expiresAt,
+			mfaVerified = moderator.totpConfirmed,
+		)
 		moderators.touchLogin(moderator.id, now())
-		return LoginResult.Ok(token, ModSession(moderator, expiresAt))
+		return LoginResult.Ok(token, ModSession(moderator, expiresAt, mfaVerified = moderator.totpConfirmed))
 	}
 
 	fun authenticate(token: String): ModSession? =
@@ -108,20 +113,26 @@ class ModerationService(
 	 * Starts TOTP enrolment. The secret is stored unconfirmed, so an interrupted enrolment leaves the
 	 * account exactly where it was rather than locked out.
 	 */
-	fun startEnrolment(moderator: Moderator): EnrolResult {
+	fun startEnrolment(moderator: Moderator, token: String): EnrolResult {
 		if (moderator.totpConfirmed) return EnrolResult.AlreadyEnrolled
-		val secret = Totp.generateSecret()
-		moderators.setTotpSecret(moderator.id, secret, confirmed = false)
+		val secret = moderators.startTotpEnrolment(
+			moderator.id,
+			sha256(token.toByteArray(Charsets.UTF_8)),
+			Totp.generateSecret(),
+		) ?: return EnrolResult.InProgress
 		return EnrolResult.Started(secret, Totp.provisioningUri(secret, moderator.username, issuer))
 	}
 
-	fun confirmEnrolment(moderator: Moderator, code: String): Boolean {
+	fun confirmEnrolment(moderator: Moderator, token: String, code: String): Boolean {
 		if (moderator.totpConfirmed) return false
 		val secret = moderators.totpSecretOf(moderator.id) ?: return false
 		val step = Totp.verify(secret, code, clock.instant().epochSecond) ?: return false
-		if (!moderators.burnTotpStep(moderator.id, step)) return false
-		moderators.setTotpSecret(moderator.id, secret, confirmed = true)
-		return true
+		return moderators.confirmTotpAndPromoteSession(
+			moderator.id,
+			sha256(token.toByteArray(Charsets.UTF_8)),
+			secret,
+			step,
+		)
 	}
 
 	fun invite(actor: Moderator, username: String, password: String, role: ModeratorRole): Moderator? {
@@ -129,7 +140,7 @@ class ModerationService(
 		if (trimmed.length !in ModerationRules.MIN_USERNAME_LENGTH..ModerationRules.MAX_USERNAME_LENGTH) {
 			return null
 		}
-		if (password.length < Passwords.MIN_LENGTH) return null
+		if (password.length !in Passwords.MIN_LENGTH..Passwords.MAX_LENGTH) return null
 
 		val created = moderators.create(newId(), trimmed, Passwords.hash(password), role, actor.id)
 			?: return null
@@ -146,16 +157,7 @@ class ModerationService(
 	 */
 	fun updateModerator(actor: Moderator, id: String, role: ModeratorRole?, disabled: Boolean?): Boolean {
 		val target = moderators.find(id) ?: return false
-		val losesAdmin = (role != null && target.role.isAdmin && !role.isAdmin) ||
-			(disabled == true && target.role.isAdmin)
-		if (losesAdmin && moderators.countAdmins(excluding = id) == 0) return false
-
-		role?.let { moderators.setRole(id, it) }
-		disabled?.let {
-			moderators.setDisabled(id, it)
-			// A disabled account must stop working now, not when its session happens to expire.
-			if (it) moderators.closeAllSessions(id)
-		}
+		if (!moderators.updateAccountSafely(id, role, disabled)) return false
 		record(actor, ModActions.UPDATE_MODERATOR, ModActions.TARGET_MODERATOR, id, null) {
 			put("username", target.username)
 			role?.let { put("role", it.name) }
@@ -164,16 +166,35 @@ class ModerationService(
 		return true
 	}
 
-	/** For a moderator who lost their authenticator. Clears the secret so they enrol again. */
-	fun resetTotp(actor: Moderator, id: String): Boolean {
-		val target = moderators.find(id) ?: return false
-		moderators.setTotpSecret(id, null, confirmed = false)
-		moderators.closeAllSessions(id)
-		record(actor, ModActions.RESET_TOTP, ModActions.TARGET_MODERATOR, id, null) {
-			put("username", target.username)
+	/** Rotates a moderator credential after proving both factors, and invalidates every session. */
+	fun changePassword(
+		actor: Moderator,
+		currentPassword: String,
+		newPassword: String,
+		code: String,
+	): PasswordChangeResult {
+		if (newPassword.length !in Passwords.MIN_LENGTH..Passwords.MAX_LENGTH) {
+			return PasswordChangeResult.INVALID_NEW_PASSWORD
 		}
-		return true
+		val storedHash = moderators.passwordHashOf(actor.id)
+		if (currentPassword.length > Passwords.MAX_LENGTH ||
+			storedHash == null || !Passwords.verify(currentPassword, storedHash)
+		) {
+			return PasswordChangeResult.INVALID_CURRENT_PASSWORD
+		}
+		val secret = moderators.totpSecretOf(actor.id) ?: return PasswordChangeResult.INVALID_TOTP
+		val step = Totp.verify(secret, code, clock.instant().epochSecond)
+			?: return PasswordChangeResult.INVALID_TOTP
+		if (!moderators.burnTotpStep(actor.id, step)) return PasswordChangeResult.INVALID_TOTP
+		if (!moderators.changePasswordAndCloseSessions(actor.id, Passwords.hash(newPassword))) {
+			return PasswordChangeResult.INVALID_CURRENT_PASSWORD
+		}
+		record(actor, ModActions.CHANGE_PASSWORD, ModActions.TARGET_MODERATOR, actor.id, null) {}
+		return PasswordChangeResult.CHANGED
 	}
+
+	/** For a moderator who lost their authenticator. Clears the secret so they enrol again. */
+	fun resetTotp(actor: Moderator, id: String): Boolean = moderators.resetTotpWithAudit(actor.id, id)
 
 	fun listModerators(): List<Moderator> = moderators.all()
 
@@ -190,15 +211,14 @@ class ModerationService(
 		val existing = comments.find(commentId) ?: return false
 		if (existing.state == CommentState.REMOVED) return false
 
-		record(actor, ModActions.REMOVE_COMMENT, ModActions.TARGET_COMMENT, commentId.toString(), reason) {
+		val detail = buildJsonObject {
 			put("body", existing.body)
 			put("author", existing.userId)
 			put("work_id", existing.workId)
 			put("lang", existing.lang)
 			put("previous_state", existing.state.name)
-		}
-		comments.setState(commentId, CommentState.REMOVED)
-		return true
+		}.toString()
+		return moderators.removeCommentWithAudit(actor.id, commentId, reason, detail)
 	}
 
 	/**
@@ -218,11 +238,10 @@ class ModerationService(
 			?.let { name -> CommentState.entries.firstOrNull { it.name == name } }
 			?: CommentState.VISIBLE
 
-		comments.restore(commentId, body, previous)
-		record(actor, ModActions.RESTORE_COMMENT, ModActions.TARGET_COMMENT, commentId.toString(), reason) {
-			put("restored_state", previous.name)
-		}
-		return true
+		val detail = buildJsonObject { put("restored_state", previous.name) }.toString()
+		return moderators.restoreCommentWithAudit(
+			actor.id, commentId, body, previous.code, reason, detail,
+		)
 	}
 
 	// -- users -----------------------------------------------------------------------------------
@@ -235,39 +254,34 @@ class ModerationService(
 	 * needs a reason and shows up in the log with a name against it.
 	 */
 	fun banUser(actor: Moderator, userId: String, reason: String): Boolean {
-		val user = identities.findById(userId) ?: return false
-		if (!identities.setBanned(userId, banned = true, reason = reason)) return false
-		val cleared = comments.tombstoneAllBy(userId)
-		record(actor, ModActions.BAN_USER, ModActions.TARGET_USER, userId, reason) {
-			put("nickname", user.nickname)
-			put("comments_cleared", cleared)
-		}
-		return true
+		return moderators.banUserWithAudit(actor.id, userId, reason)
 	}
 
 	/** Comments are not restored: the ban deleted them, and a reversal does not un-delete words. */
 	fun unbanUser(actor: Moderator, userId: String, reason: String?): Boolean {
-		if (identities.findById(userId) == null) return false
-		identities.setBanned(userId, banned = false, reason = null)
-		record(actor, ModActions.UNBAN_USER, ModActions.TARGET_USER, userId, reason) {}
-		return true
+		return moderators.unbanUserWithAudit(actor.id, userId, reason)
 	}
 
 	fun setShadowban(actor: Moderator, userId: String, shadowbanned: Boolean, reason: String?): Boolean {
-		if (identities.findById(userId) == null) return false
-		identities.setShadowbanned(userId, shadowbanned)
 		val action = if (shadowbanned) ModActions.SHADOWBAN_USER else ModActions.UNSHADOWBAN_USER
-		record(actor, action, ModActions.TARGET_USER, userId, reason) {}
-		return true
+		return moderators.mutateWithAudit(
+			actor.id,
+			action,
+			ModActions.TARGET_USER,
+			userId,
+			reason,
+			detail = { rebuilt -> buildJsonObject { put("comment_scores_rebuilt", rebuilt) }.toString() },
+		) { connection ->
+			if (!identities.setShadowbanned(connection, userId, shadowbanned)) return@mutateWithAudit null
+			val affectedVotes = comments.votedCommentIds(connection, userId)
+			comments.recountVotes(connection, affectedVotes)
+			affectedVotes.size
+		} != null
 	}
 
 	fun resetNickname(actor: Moderator, userId: String, reason: String?): Boolean {
 		val user = identities.findById(userId) ?: return false
-		identities.clearNickname(userId)
-		record(actor, ModActions.RESET_NICKNAME, ModActions.TARGET_USER, userId, reason) {
-			put("previous", user.nickname)
-		}
-		return true
+		return moderators.resetNicknameWithAudit(actor.id, userId, reason, user.nickname)
 	}
 
 	// -- devices ---------------------------------------------------------------------------------
@@ -281,21 +295,37 @@ class ModerationService(
 	 */
 	fun banDevice(actor: Moderator, userId: String, reason: String?): Boolean {
 		val (ssaid, drm) = identities.deviceOf(userId) ?: return false
-		identities.banDevice(ssaid, drm, actor.id, reason, now())
-		record(actor, ModActions.BAN_DEVICE, ModActions.TARGET_DEVICE, fingerprint(ssaid), reason) {
-			put("user_id", userId)
-			put("has_drm_id", drm != null)
-		}
-		return true
+		return moderators.mutateWithAudit(
+			actor.id,
+			ModActions.BAN_DEVICE,
+			ModActions.TARGET_DEVICE,
+			fingerprint(ssaid),
+			reason,
+			detail = {
+				buildJsonObject {
+					put("user_id", userId)
+					put("has_drm_id", drm != null)
+				}.toString()
+			},
+		) { connection ->
+			if (identities.banDevice(connection, ssaid, drm, actor.id, reason, now())) true else null
+		} != null
 	}
 
 	/** Admin only. There is no in-app appeal surface by design, so reversal lives here and only here. */
 	fun unbanDevice(actor: Moderator, fingerprint: String): Boolean {
 		val match = identities.bannedDevices(MAX_DEVICE_BANS).firstOrNull { it.fingerprint == fingerprint }
 			?: return false
-		if (!identities.unbanDevice(match.ssaidHash)) return false
-		record(actor, ModActions.UNBAN_DEVICE, ModActions.TARGET_DEVICE, fingerprint, null) {}
-		return true
+		return moderators.mutateWithAudit(
+			actor.id,
+			ModActions.UNBAN_DEVICE,
+			ModActions.TARGET_DEVICE,
+			fingerprint,
+			null,
+			detail = { "{}" },
+		) { connection ->
+			if (identities.unbanDevice(connection, match.ssaidHash)) true else null
+		} != null
 	}
 
 	fun bannedDevices(): List<io.kotatsuredo.server.identity.BannedDevice> =
@@ -331,21 +361,42 @@ class ModerationService(
 	// -- flags -----------------------------------------------------------------------------------
 
 	fun reviewBanEvasion(actor: Moderator, flagId: Long, note: String?): Boolean {
-		if (!identities.reviewBanEvasionFlag(flagId, now())) return false
-		record(actor, ModActions.REVIEW_FLAG, ModActions.TARGET_FLAG, "ban_evasion:$flagId", note) {}
-		return true
+		return moderators.mutateWithAudit(
+			actor.id,
+			ModActions.REVIEW_FLAG,
+			ModActions.TARGET_FLAG,
+			"ban_evasion:$flagId",
+			note,
+			detail = { "{}" },
+		) { connection ->
+			if (identities.reviewBanEvasionFlag(connection, flagId, now())) true else null
+		} != null
 	}
 
 	fun reviewBrigade(actor: Moderator, flagId: Long, note: String?): Boolean {
-		if (!queues.reviewBrigadeFlag(flagId)) return false
-		record(actor, ModActions.REVIEW_FLAG, ModActions.TARGET_FLAG, "brigade:$flagId", note) {}
-		return true
+		return moderators.mutateWithAudit(
+			actor.id,
+			ModActions.REVIEW_FLAG,
+			ModActions.TARGET_FLAG,
+			"brigade:$flagId",
+			note,
+			detail = { "{}" },
+		) { connection ->
+			if (queues.reviewBrigadeFlag(connection, flagId)) true else null
+		} != null
 	}
 
 	fun resolveDispute(actor: Moderator, disputeId: Long, note: String?): Boolean {
-		if (!queues.resolveDispute(disputeId, actor.id)) return false
-		record(actor, ModActions.RESOLVE_DISPUTE, ModActions.TARGET_DISPUTE, disputeId.toString(), note) {}
-		return true
+		return moderators.mutateWithAudit(
+			actor.id,
+			ModActions.RESOLVE_DISPUTE,
+			ModActions.TARGET_DISPUTE,
+			disputeId.toString(),
+			note,
+			detail = { "{}" },
+		) { connection ->
+			if (queues.resolveDispute(connection, disputeId, actor.id)) true else null
+		} != null
 	}
 
 	/**

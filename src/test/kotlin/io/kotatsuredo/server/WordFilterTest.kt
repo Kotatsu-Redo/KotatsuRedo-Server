@@ -40,7 +40,7 @@ class WordFilterTest {
 	private val service by lazy { FilterService(repository, filter) }
 	private val identities by lazy {
 		IdentityService(
-			IdentityRepository(PostgresTestBase.database.exposed),
+			IdentityRepository(PostgresTestBase.database.exposed, PostgresTestBase.database.source),
 			DevicePepper.of("test"),
 		)
 	}
@@ -48,6 +48,48 @@ class WordFilterTest {
 	/** `filter_block.user_id` is a real foreign key, so a block has to belong to a real account. */
 	private fun user(seed: String): String =
 		(identities.hello(seed, DeviceIdentifiers("dev-$seed", null)) as HelloOutcome.Ok).identity.id
+
+	private fun makeEstablished(userId: String) {
+		source.connection.use { connection ->
+			connection.autoCommit = false
+			try {
+				connection.prepareStatement(
+					"UPDATE app_user SET created_at = now() - INTERVAL '91 days' WHERE id = ?",
+				).use {
+					it.setString(1, userId)
+					it.executeUpdate()
+				}
+				connection.prepareStatement(
+					"""
+					INSERT INTO user_active_day (user_id, day)
+					SELECT ?, CURRENT_DATE - n::int FROM generate_series(0, 29) AS n
+					ON CONFLICT DO NOTHING
+					""".trimIndent(),
+				).use {
+					it.setString(1, userId)
+					it.executeUpdate()
+				}
+				connection.commit()
+			} catch (error: Exception) {
+				connection.rollback()
+				throw error
+			} finally {
+				connection.autoCommit = true
+			}
+		}
+	}
+
+	private fun makeNormal(userId: String) {
+		makeEstablished(userId)
+		source.connection.use { connection ->
+			connection.prepareStatement(
+				"UPDATE app_user SET created_at = now() - INTERVAL '30 days' WHERE id = ?",
+			).use {
+				it.setString(1, userId)
+				it.executeUpdate()
+			}
+		}
+	}
 
 	@BeforeTest
 	fun clean() {
@@ -210,11 +252,12 @@ class WordFilterTest {
 	}
 
 	@Test
-	fun `a rule that keeps being wrong demotes itself`() {
+	fun `a rule disputed by distinct settled users demotes itself`() {
 		val rule = repository.activeRules().first { it.term == "shit" }
 
-		repeat(FilterRules.AUTO_DEMOTE_MIN_BLOCKS) { index ->
+		repeat(FilterRules.AUTO_DEMOTE_MIN_REPORTERS) { index ->
 			val userId = user("u$index")
+			makeEstablished(userId)
 			val verdict = filter.check(
 				"This chapter was absolute shit number $index",
 				"en",
@@ -230,6 +273,41 @@ class WordFilterTest {
 	}
 
 	@Test
+	fun `normal accounts cannot auto-demote a rule`() {
+		val rule = repository.activeRules().first { it.term == "shit" }
+		repeat(FilterRules.AUTO_DEMOTE_MIN_REPORTERS) { index ->
+			val userId = user("new-$index")
+			makeNormal(userId)
+			val verdict = filter.check(
+				"This chapter was absolute shit number $index",
+				"en",
+				ContentFilter.Context(userId, "comment"),
+			)
+			val blockId = assertNotNull(assertIs<ContentFilter.Verdict.Blocked>(verdict).blockId)
+			assertTrue(repository.dispute(blockId, userId))
+		}
+
+		assertTrue(service.demoteMisfiringRules().isEmpty())
+		assertNull(repository.rule(rule.id)?.demotedAt)
+	}
+
+	@Test
+	fun `severe rules are never auto-demoted`() {
+		val rule = repository.activeRules().first { it.tier == FilterTier.SEVERE }
+		repeat(FilterRules.AUTO_DEMOTE_MIN_REPORTERS) { index ->
+			val userId = user("severe-$index")
+			makeEstablished(userId)
+			val blockId = repository.recordBlock(
+				rule.id, rule.term, rule.tier, rule.lang, "comment", userId, rule.termRaw,
+			)
+			assertTrue(repository.dispute(blockId, userId))
+		}
+
+		assertTrue(service.demoteMisfiringRules().isEmpty())
+		assertNull(repository.rule(rule.id)?.demotedAt)
+	}
+
+	@Test
 	fun `a user can dispute their own block once and nobody else's`() {
 		val mine = user("mine")
 		val verdict = filter.check("absolute shit chapter", "en", ContentFilter.Context(mine, "comment"))
@@ -239,6 +317,18 @@ class WordFilterTest {
 		// Twice would let one person demote a rule on their own.
 		assertFalse(repository.dispute(blockId, mine))
 		assertFalse(repository.dispute(blockId, user("someone-else")))
+	}
+
+	@Test
+	fun `one user gets only one dispute signal per rule`() {
+		val mine = user("repeat")
+		val first = filter.check("absolute shit chapter one", "en", ContentFilter.Context(mine, "comment"))
+		val second = filter.check("absolute shit chapter two", "en", ContentFilter.Context(mine, "comment"))
+		val firstId = assertNotNull(assertIs<ContentFilter.Verdict.Blocked>(first).blockId)
+		val secondId = assertNotNull(assertIs<ContentFilter.Verdict.Blocked>(second).blockId)
+
+		assertTrue(repository.dispute(firstId, mine))
+		assertFalse(repository.dispute(secondId, mine))
 	}
 
 	@Test
@@ -292,6 +382,18 @@ class WordFilterTest {
 		val terms = automaton.findAll("ushers").map { it.term }.toSet()
 		// `she` and `he` both end inside `ushers`; missing the suffix link would lose `he`.
 		assertEquals(setOf("she", "he", "hers"), terms)
+	}
+
+	@Test
+	fun `a short severe match cannot mask a later eligible severe match`() {
+		repository.addRule("ab", "ab", FilterTier.SEVERE, null, "test")
+		repository.addRule("cdefg", "cdefg", FilterTier.SEVERE, null, "test")
+		filter.reload()
+
+		val hit = filter.match("abcdefgh", "en")
+
+		assertEquals("cdefg", hit?.term)
+		assertEquals(FilterTier.SEVERE, hit?.tier)
 	}
 
 	@Test

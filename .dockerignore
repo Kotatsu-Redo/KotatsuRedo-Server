@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.git
+.github
+.gradle
+.idea
+build
+dist
+out
+tmp
+*.log
+KotatsuRedo-Server

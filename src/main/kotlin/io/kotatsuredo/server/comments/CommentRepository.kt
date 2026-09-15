@@ -87,7 +87,9 @@ class CommentRepository(private val dataSource: DataSource) {
 			    state <> ${CommentState.REMOVED.code}
 			    OR EXISTS (
 			      SELECT 1 FROM comment child
-			      WHERE child.parent_id = comment.id AND child.state <> ${CommentState.REMOVED.code}
+			      WHERE child.parent_id = comment.id
+			        AND child.state <> ${CommentState.REMOVED.code}
+			        AND (child.state <> ${CommentState.SHADOWED.code} OR child.user_id = ?)
 			    )
 			  )
 			  AND (state <> ${CommentState.SHADOWED.code} OR user_id = ?)
@@ -99,6 +101,7 @@ class CommentRepository(private val dataSource: DataSource) {
 			statement.setLong(index++, workId)
 			chapterId?.let { statement.setLong(index++, it) }
 			lang?.let { statement.setString(index++, it) }
+			statement.setString(index++, viewerId)
 			statement.setString(index++, viewerId)
 			statement.setInt(index++, limit)
 			statement.setInt(index, offset)
@@ -115,25 +118,28 @@ class CommentRepository(private val dataSource: DataSource) {
 	 * would take every reply underneath with it and silently delete other people's words. The service
 	 * blanks its body before it reaches anyone.
 	 */
-	fun descendantsOf(rootIds: Collection<Long>, viewerId: String): List<Comment> {
-		if (rootIds.isEmpty()) return emptyList()
+	fun descendantsOf(rootIds: Collection<Long>, viewerId: String, limit: Int): List<Comment> {
+		if (rootIds.isEmpty() || limit <= 0) return emptyList()
 		return dataSource.connection.use { connection ->
 			connection.prepareStatement(
 				"""
 				WITH RECURSIVE thread AS (
 					SELECT ${COLUMNS.joinToString(", ") { "c.$it" }} FROM comment c
 					WHERE c.parent_id = ANY (?)
+					  AND (c.state <> ${CommentState.SHADOWED.code} OR c.user_id = ?)
 					UNION ALL
 					SELECT ${COLUMNS.joinToString(", ") { "child.$it" }} FROM comment child
 					JOIN thread ON child.parent_id = thread.id
+					WHERE child.state <> ${CommentState.SHADOWED.code} OR child.user_id = ?
 				)
 				SELECT ${COLUMNS.joinToString(", ")} FROM thread
-				WHERE state <> ${CommentState.SHADOWED.code} OR user_id = ?
-				ORDER BY created_at
+				LIMIT ?
 				""".trimIndent(),
 			).use { statement ->
 				statement.setArray(1, connection.createArrayOf("bigint", rootIds.toTypedArray()))
 				statement.setString(2, viewerId)
+				statement.setString(3, viewerId)
+				statement.setInt(4, limit)
 				statement.executeQuery().use { rows ->
 					buildList { while (rows.next()) add(rows.toComment()) }
 				}
@@ -171,18 +177,26 @@ class CommentRepository(private val dataSource: DataSource) {
 		}
 	}
 
-	fun countPerLanguage(workId: Long, chapterId: Long?): Map<String, Int> =
+	fun countPerLanguage(workId: Long, chapterId: Long?, viewerId: String? = null): Map<String, Int> =
 		dataSource.connection.use { connection ->
 			val chapterClause = if (chapterId == null) "AND work_chapter_id IS NULL" else "AND work_chapter_id = ?"
+			val visibilityClause = if (viewerId == null) {
+				"state = ${CommentState.VISIBLE.code}"
+			} else {
+				"(state = ${CommentState.VISIBLE.code} OR " +
+					"(state = ${CommentState.SHADOWED.code} AND user_id = ?))"
+			}
 			connection.prepareStatement(
 				"""
 				SELECT COALESCE(lang, 'und') AS lang, count(*) FROM comment
-				WHERE work_id = ? $chapterClause AND state = ${CommentState.VISIBLE.code}
+				WHERE work_id = ? $chapterClause AND $visibilityClause
 				GROUP BY 1
 				""".trimIndent(),
 			).use { statement ->
-				statement.setLong(1, workId)
-				chapterId?.let { statement.setLong(2, it) }
+				var index = 1
+				statement.setLong(index++, workId)
+				chapterId?.let { statement.setLong(index++, it) }
+				viewerId?.let { statement.setString(index, it) }
 				statement.executeQuery().use { rows ->
 					buildMap { while (rows.next()) put(rows.getString(1), rows.getInt(2)) }
 				}
@@ -195,15 +209,28 @@ class CommentRepository(private val dataSource: DataSource) {
 	 * Chains are short by construction (the round cap sees to that), so a walk up `parent_id` beats a
 	 * recursive CTE for both clarity and cost.
 	 */
-	fun ancestors(commentId: Long, limit: Int = 16): List<Comment> {
-		val chain = mutableListOf<Comment>()
-		var current = find(commentId)
-		while (current != null && chain.size < limit) {
-			chain.add(current)
-			current = current.parentId?.let(::find)
+	fun ancestors(commentId: Long, limit: Int = 16): List<Comment> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				WITH RECURSIVE ancestors AS (
+					SELECT ${COLUMNS.joinToString(", ")}, 0 AS level FROM comment WHERE id = ?
+					UNION ALL
+					SELECT ${COLUMNS.joinToString(", ") { "parent.$it" }}, child.level + 1
+					FROM comment parent
+					JOIN ancestors child ON parent.id = child.parent_id
+					WHERE child.level + 1 < ?
+				)
+				SELECT ${COLUMNS.joinToString(", ")} FROM ancestors ORDER BY level
+				""".trimIndent(),
+			).use { statement ->
+				statement.setLong(1, commentId)
+				statement.setInt(2, limit)
+				statement.executeQuery().use { rows ->
+					buildList { while (rows.next()) add(rows.toComment()) }
+				}
+			}
 		}
-		return chain
-	}
 
 	fun update(id: Long, body: String, lang: String?): Boolean = dataSource.connection.use { connection ->
 		connection.prepareStatement(
@@ -212,6 +239,29 @@ class CommentRepository(private val dataSource: DataSource) {
 			statement.setString(1, body)
 			statement.setString(2, lang)
 			statement.setLong(3, id)
+			statement.executeUpdate() > 0
+		}
+	}
+
+	fun updateIfEditable(
+		id: Long,
+		userId: String,
+		cutoff: OffsetDateTime,
+		body: String,
+		lang: String?,
+	): Boolean = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			UPDATE comment SET body = ?, lang = ?, edited_at = now()
+			WHERE id = ? AND user_id = ? AND state <> ? AND created_at >= ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setString(1, body)
+			statement.setString(2, lang)
+			statement.setLong(3, id)
+			statement.setString(4, userId)
+			statement.setShort(5, CommentState.REMOVED.code)
+			statement.setObject(6, cutoff)
 			statement.executeUpdate() > 0
 		}
 	}
@@ -255,6 +305,21 @@ class CommentRepository(private val dataSource: DataSource) {
 			statement.setBoolean(2, removed)
 			statement.setBoolean(3, removed)
 			statement.setLong(4, id)
+			statement.executeUpdate() > 0
+		}
+	}
+
+	fun tombstoneByOwner(id: Long, userId: String): Boolean = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			UPDATE comment SET state = ?, body = '', deleted_at = now()
+			WHERE id = ? AND user_id = ? AND state <> ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setShort(1, CommentState.REMOVED.code)
+			statement.setLong(2, id)
+			statement.setString(3, userId)
+			statement.setShort(4, CommentState.REMOVED.code)
 			statement.executeUpdate() > 0
 		}
 	}
@@ -321,6 +386,98 @@ class CommentRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	/**
+	 * Serializes vote changes per comment and refreshes its counters in the same transaction, so two
+	 * concurrent recounts cannot overwrite a newer result with an older snapshot.
+	 */
+	fun setVoteAndRecount(commentId: Long, userId: String, value: Int): Triple<Int, Int, Double> =
+		dataSource.connection.use { connection ->
+			connection.autoCommit = false
+			try {
+				// Match account-deletion/shadowban lock order: user first, then comment. FOR SHARE is
+				// intentional: FOR KEY SHARE would allow an update of the non-key shadowban flag to race
+				// this vote and make the stored delta disagree with the user's new visibility.
+				val counts = connection.prepareStatement(
+					"SELECT NOT is_shadowbanned FROM app_user WHERE id = ? FOR SHARE",
+				).use { statement ->
+					statement.setString(1, userId)
+					statement.executeQuery().use {
+						check(it.next()) { "voting user does not exist" }
+						it.getBoolean(1)
+					}
+				}
+				val (storedUp, storedDown) = connection.prepareStatement(
+					"SELECT up, down FROM comment WHERE id = ? FOR UPDATE",
+				).use { statement ->
+					statement.setLong(1, commentId)
+					statement.executeQuery().use {
+						check(it.next()) { "comment disappeared during vote" }
+						it.getInt(1) to it.getInt(2)
+					}
+				}
+				val oldValue = connection.prepareStatement(
+					"SELECT value FROM comment_vote WHERE comment_id = ? AND user_id = ?",
+				).use { statement ->
+					statement.setLong(1, commentId)
+					statement.setString(2, userId)
+					statement.executeQuery().use {
+						if (it.next()) it.getInt(1) else null
+					}
+				}
+				if (value == 0) {
+					connection.prepareStatement(
+						"DELETE FROM comment_vote WHERE comment_id = ? AND user_id = ?",
+					).use { statement ->
+						statement.setLong(1, commentId)
+						statement.setString(2, userId)
+						statement.executeUpdate()
+					}
+				} else {
+					connection.prepareStatement(
+						"""
+						INSERT INTO comment_vote (comment_id, user_id, value) VALUES (?, ?, ?)
+						ON CONFLICT (comment_id, user_id) DO UPDATE SET value = EXCLUDED.value
+						""".trimIndent(),
+					).use { statement ->
+						statement.setLong(1, commentId)
+						statement.setString(2, userId)
+						statement.setInt(3, value)
+						statement.executeUpdate()
+					}
+				}
+				var up = storedUp
+				var down = storedDown
+				if (counts) {
+					when (oldValue) {
+						1 -> up--
+						-1 -> down--
+					}
+					when (value) {
+						1 -> up++
+						-1 -> down++
+					}
+				}
+				check(up >= 0 && down >= 0) { "comment vote aggregate drifted below zero" }
+				val score = io.kotatsuredo.server.scoring.Scoring.wilsonLowerBound(
+					successes = up.toDouble(),
+					total = (up + down).toDouble(),
+				)
+				connection.prepareStatement("UPDATE comment SET up = ?, down = ?, score = ? WHERE id = ?")
+					.use { statement ->
+						statement.setInt(1, up)
+						statement.setInt(2, down)
+						statement.setFloat(3, score.toFloat())
+						statement.setLong(4, commentId)
+						statement.executeUpdate()
+					}
+				connection.commit()
+				Triple(up, down, score)
+			} catch (e: Exception) {
+				connection.rollback()
+				throw e
+			}
+		}
+
 	fun myVote(commentId: Long, userId: String): Int = dataSource.connection.use { connection ->
 		connection.prepareStatement(
 			"SELECT value FROM comment_vote WHERE comment_id = ? AND user_id = ?",
@@ -329,6 +486,91 @@ class CommentRepository(private val dataSource: DataSource) {
 			statement.setString(2, userId)
 			statement.executeQuery().use { if (it.next()) it.getInt(1) else 0 }
 		}
+	}
+
+	/** Comment aggregates affected when this user's votes stop or start counting. */
+	fun votedCommentIds(userId: String): List<Long> =
+		dataSource.connection.use { connection -> votedCommentIds(connection, userId) }
+
+	fun votedCommentIds(connection: java.sql.Connection, userId: String): List<Long> =
+		connection.prepareStatement("SELECT comment_id FROM comment_vote WHERE user_id = ?").use { statement ->
+			statement.setString(1, userId)
+			statement.executeQuery().use { rows ->
+				buildList { while (rows.next()) add(rows.getLong(1)) }
+			}
+		}
+
+	/**
+	 * Rebuilds several denormalised vote aggregates in one transaction and one pool checkout.
+	 *
+	 * Lock ordering matches [setVoteAndRecount], preventing a moderator action or account deletion
+	 * from racing a newer per-comment recount and restoring stale totals.
+	 */
+	fun recountVotes(commentIds: Collection<Long>): Int {
+		val ids = commentIds.distinct().sorted()
+		if (ids.isEmpty()) return 0
+		return dataSource.connection.use { connection ->
+			connection.autoCommit = false
+			try {
+				val changed = recountVotes(connection, ids)
+				connection.commit()
+				changed
+			} catch (e: Exception) {
+				connection.rollback()
+				throw e
+			}
+		}
+	}
+
+	/** Same repair, participating in a caller-owned moderation transaction. */
+	fun recountVotes(connection: java.sql.Connection, commentIds: Collection<Long>): Int {
+		val ids = commentIds.distinct().sorted()
+		if (ids.isEmpty()) return 0
+		val sqlIds = connection.createArrayOf("bigint", ids.toTypedArray())
+				connection.prepareStatement(
+					"SELECT id FROM comment WHERE id = ANY (?) ORDER BY id FOR UPDATE",
+				).use { statement ->
+					statement.setArray(1, sqlIds)
+					statement.executeQuery().use { rows -> while (rows.next()) Unit }
+				}
+
+				val counts = connection.prepareStatement(
+					"""
+					SELECT c.id,
+					       count(*) FILTER (WHERE v.value = 1 AND u.id IS NOT NULL),
+					       count(*) FILTER (WHERE v.value = -1 AND u.id IS NOT NULL)
+					FROM comment c
+					LEFT JOIN comment_vote v ON v.comment_id = c.id
+					LEFT JOIN app_user u ON u.id = v.user_id AND NOT u.is_shadowbanned
+					WHERE c.id = ANY (?)
+					GROUP BY c.id
+					""".trimIndent(),
+				).use { statement ->
+					statement.setArray(1, sqlIds)
+					statement.executeQuery().use { rows ->
+						buildList {
+							while (rows.next()) add(Triple(rows.getLong(1), rows.getInt(2), rows.getInt(3)))
+						}
+					}
+				}
+
+				connection.prepareStatement(
+					"UPDATE comment SET up = ?, down = ?, score = ? WHERE id = ?",
+				).use { statement ->
+					counts.forEach { (commentId, up, down) ->
+						val score = io.kotatsuredo.server.scoring.Scoring.wilsonLowerBound(
+							successes = up.toDouble(),
+							total = (up + down).toDouble(),
+						)
+						statement.setInt(1, up)
+						statement.setInt(2, down)
+						statement.setFloat(3, score.toFloat())
+						statement.setLong(4, commentId)
+						statement.addBatch()
+					}
+					statement.executeBatch()
+				}
+		return counts.size
 	}
 
 	/**
@@ -385,6 +627,18 @@ class CommentRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	fun allByPage(userId: String, afterId: Long, limit: Int): List<Comment> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"$SELECT_COLUMNS WHERE user_id = ? AND id > ? ORDER BY id LIMIT ?",
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setLong(2, afterId)
+				statement.setInt(3, limit)
+				statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.toComment()) } }
+			}
+		}
+
 	/** @return (comment id, value, cast at) for every vote this user has cast. */
 	fun votesBy(userId: String): List<Triple<Long, Int, OffsetDateTime>> =
 		dataSource.connection.use { connection ->
@@ -403,6 +657,25 @@ class CommentRepository(private val dataSource: DataSource) {
 								),
 							)
 						}
+					}
+				}
+			}
+		}
+
+	fun votesByPage(userId: String, afterCommentId: Long, limit: Int): List<Triple<Long, Int, OffsetDateTime>> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"SELECT comment_id, value, created_at FROM comment_vote " +
+					"WHERE user_id = ? AND comment_id > ? ORDER BY comment_id LIMIT ?",
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setLong(2, afterCommentId)
+				statement.setInt(3, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) add(
+							Triple(rows.getLong(1), rows.getInt(2), rows.getObject(3, OffsetDateTime::class.java)),
+						)
 					}
 				}
 			}
@@ -443,13 +716,22 @@ class CommentRepository(private val dataSource: DataSource) {
 			}
 		}
 
-	fun countForWork(workId: Long, chapterId: Long?): Int = dataSource.connection.use { connection ->
+	fun countForWork(workId: Long, chapterId: Long?, viewerId: String? = null): Int =
+		dataSource.connection.use { connection ->
 		val chapterClause = if (chapterId == null) "AND work_chapter_id IS NULL" else "AND work_chapter_id = ?"
+		val visibilityClause = if (viewerId == null) {
+			"state = ${CommentState.VISIBLE.code}"
+		} else {
+			"(state = ${CommentState.VISIBLE.code} OR " +
+				"(state = ${CommentState.SHADOWED.code} AND user_id = ?))"
+		}
 		connection.prepareStatement(
-			"SELECT count(*) FROM comment WHERE work_id = ? $chapterClause AND state = ${CommentState.VISIBLE.code}",
+			"SELECT count(*) FROM comment WHERE work_id = ? $chapterClause AND $visibilityClause",
 		).use { statement ->
-			statement.setLong(1, workId)
-			chapterId?.let { statement.setLong(2, it) }
+			var index = 1
+			statement.setLong(index++, workId)
+			chapterId?.let { statement.setLong(index++, it) }
+			viewerId?.let { statement.setString(index, it) }
 			statement.executeQuery().use { it.next(); it.getInt(1) }
 		}
 	}

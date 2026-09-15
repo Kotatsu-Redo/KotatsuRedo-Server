@@ -1,8 +1,12 @@
 package io.kotatsuredo.server.works
 
 import io.kotatsuredo.server.catalogue.CatalogueLookup
+import io.kotatsuredo.server.catalogue.CatalogueLookupOverloaded
 import io.kotatsuredo.server.catalogue.CatalogueRecord
 import org.slf4j.LoggerFactory
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withPermit
 
 private val log = LoggerFactory.getLogger("WorkResolver")
 
@@ -21,54 +25,139 @@ class WorkResolver(
 	private val repository: WorkRepository,
 	private val catalogue: CatalogueLookup?,
 	private val candidateThreshold: Double = CANDIDATE_THRESHOLD,
+	maxConcurrent: Int = MAX_CONCURRENT_RESOLUTIONS,
+	maxQueued: Int = MAX_QUEUED_RESOLUTIONS,
 ) {
 
-	suspend fun resolve(fingerprint: WorkFingerprint): Resolution {
+	private val gate = Semaphore(maxConcurrent)
+	private val admission = Semaphore(maxConcurrent + maxQueued)
+	private val aliasLocks = Array(ALIAS_LOCK_STRIPES) { Mutex() }
+	private val aliasAdmission = Array(ALIAS_LOCK_STRIPES) {
+		Semaphore(MAX_QUEUED_PER_ALIAS_STRIPE + 1)
+	}
+
+	/**
+	 * Bounds JDBC work globally and coalesces concurrent creation attempts for the same source key.
+	 * External catalogue waits have their own capacity pool and never retain a JDBC admission slot.
+	 */
+	suspend fun resolve(fingerprint: WorkFingerprint, reporterId: String? = null): Resolution {
+		val lockIndex = Math.floorMod(31 * fingerprint.source.hashCode() + fingerprint.sourceKey.hashCode(), aliasLocks.size)
+		return try {
+			withAliasCapacity(lockIndex) {
+				withResolutionCapacity { resolveLocal(fingerprint, reporterId) }
+			} ?: run {
+				// The provider wait holds neither JDBC nor an alias-stripe permit. Recheck locally after
+				// reacquiring the lock because another source may have created the same work meanwhile.
+				val record = catalogue?.lookup(fingerprint.title, fingerprint.year)
+				withAliasCapacity(lockIndex) {
+					withResolutionCapacity {
+						resolveLocal(fingerprint, reporterId) ?: if (record == null) {
+							createFromFingerprint(fingerprint, reporterId)
+						} else {
+							createFromCatalogue(fingerprint, record, reporterId)
+						}
+					}
+				}
+			}
+		} catch (_: CatalogueLookupOverloaded) {
+			throw WorkResolutionOverloaded()
+		}
+	}
+
+	private suspend fun <T> withAliasCapacity(index: Int, block: suspend () -> T): T {
+		val queue = aliasAdmission[index]
+		if (!queue.tryAcquire()) throw WorkResolutionOverloaded()
+		val mutex = aliasLocks[index]
+		return try {
+			mutex.lock()
+			try {
+				block()
+			} finally {
+				mutex.unlock()
+			}
+		} finally {
+			queue.release()
+		}
+	}
+
+	private suspend fun <T> withResolutionCapacity(block: () -> T): T {
+		if (!admission.tryAcquire()) throw WorkResolutionOverloaded()
+		return try {
+			gate.withPermit { block() }
+		} finally {
+			admission.release()
+		}
+	}
+
+	/** The local rungs of the ladder. A null result is the only point that may call a catalogue. */
+	private fun resolveLocal(fingerprint: WorkFingerprint, reporterId: String?): Resolution? {
+		// Alternative titles are useful metadata, but are also client-controlled. Only the primary
+		// rendering may select or corroborate a cross-user mapping.
+		val keys = (if (reporterId == null) fingerprint.allTitles else listOf(fingerprint.title))
+			.flatMap(TitleNormalizer::keys)
+			.toSet()
 		// 1. Alias. O(1) and the overwhelming majority of traffic once a source is warm.
-		repository.findByAlias(fingerprint.source, fingerprint.sourceKey)?.let {
+		val alias = if (reporterId == null) {
+			repository.findByAlias(fingerprint.source, fingerprint.sourceKey)
+		} else {
+			repository.findVerifiedAlias(fingerprint.source, fingerprint.sourceKey)
+		}
+		alias?.let {
 			return Resolution(it, ResolutionMethod.ALIAS, created = false)
 		}
 
-		// 2. External id. A scrobbler link is as good as it gets.
-		repository.findByExternalIds(fingerprint.externalIds)?.let { workId ->
-			return link(fingerprint, workId, ResolutionMethod.EXTERNAL_ID)
+		if (reporterId != null) {
+			repository.observedAlias(fingerprint.source, fingerprint.sourceKey, reporterId, keys)?.let { observed ->
+				if (isCompatible(fingerprint, repository.metadataOf(observed))) {
+					return Resolution(observed, ResolutionMethod.OBSERVATION, created = false)
+				}
+			}
+			val pending = repository.matchingObservedAliases(fingerprint.source, fingerprint.sourceKey, keys)
+			val pendingMetadata = repository.metadataOf(pending)
+			pending.firstOrNull { isCompatible(fingerprint, pendingMetadata[it]) }?.let {
+				repository.observeAlias(
+					fingerprint.source, fingerprint.sourceKey, reporterId, it, keys,
+				)
+				return Resolution(it, ResolutionMethod.OBSERVATION, created = false)
+			}
 		}
 
-		val keys = fingerprint.allTitles.flatMap(TitleNormalizer::keys).toSet()
+		// Client-supplied external ids are hints, not authoritative catalogue data. Accepting them as
+		// anchors lets one account re-point a global identifier and poison every later resolution.
 
 		// 3. Exact normalized key. This is where a catalogue's renderings pay off: a source using a
 		//    different spelling is usually not a matching problem at all, because the work is already
 		//    indexed under that spelling.
-		repository.findByTitleKeys(keys)
-			.firstOrNull { candidate -> isCompatible(fingerprint, candidate) }
-			?.let { return link(fingerprint, it, ResolutionMethod.EXACT_TITLE) }
+		val minimumTitleWeight = if (reporterId == null) 0.0 else MIN_TRUSTED_TITLE_WEIGHT
+		val exactCandidates = repository.findByTitleKeys(keys, minimumTitleWeight)
+		val exactMetadata = repository.metadataOf(exactCandidates)
+		exactCandidates
+			.firstOrNull { candidate -> isCompatible(fingerprint, exactMetadata[candidate]) }
+			?.let { return link(fingerprint, it, ResolutionMethod.EXACT_TITLE, reporterId) }
 
 		// 4. Fuzzy, corroborated. Trigram narrows to a handful of candidates; the cover hash decides.
 		//    The cover is never searched globally - only compared against candidates the title already
 		//    produced, which is why no hash index is needed (PLAN.md §2.4).
-		val candidates = keys.flatMap { key -> repository.findSimilarTitles(key, candidateThreshold) }
-			.groupBy({ it.first }, { it.second })
-			.mapValues { (_, scores) -> scores.max() }
-			.filterKeys { candidate -> isCompatible(fingerprint, candidate) }
+		val candidatesByScore = repository.findSimilarTitles(
+			keys, candidateThreshold, minimumWeight = minimumTitleWeight,
+		).toMap()
+		val fuzzyMetadata = repository.metadataOf(candidatesByScore.keys)
+		val candidates = candidatesByScore
+			.filterKeys { candidate -> isCompatible(fingerprint, fuzzyMetadata[candidate]) }
 
 		if (candidates.isNotEmpty()) {
 			verifyByCover(fingerprint, candidates.keys)?.let {
-				return link(fingerprint, it, ResolutionMethod.TITLE_AND_COVER)
+				return link(fingerprint, it, ResolutionMethod.TITLE_AND_COVER, reporterId)
 			}
 			val best = candidates.maxByOrNull { it.value }
 			if (best != null && best.value >= TITLE_ONLY_THRESHOLD) {
 				// Linked but flagged: a title that merely looks similar, with nothing backing it up.
-				return link(fingerprint, best.key, ResolutionMethod.FUZZY_TITLE)
+				return link(fingerprint, best.key, ResolutionMethod.FUZZY_TITLE, reporterId)
 			}
 		}
 
-		// 5. Nothing local knows it. Ask a catalogue once, and store what it says.
-		catalogue?.lookup(fingerprint.title, fingerprint.year)?.let { record ->
-			return createFromCatalogue(fingerprint, record)
-		}
-
-		// 6. Create from what the client itself reported. The catalogue is an enrichment, never a gate.
-		return createFromFingerprint(fingerprint)
+		// Nothing local knows it. The caller releases JDBC capacity before asking the catalogue.
+		return null
 	}
 
 	/**
@@ -78,8 +167,11 @@ class WorkResolver(
 	 * normalize differently, but a fuzzy match would happily pair them, and merging a sequel into its
 	 * prequel leaks spoilers into a thread where nobody has read that far.
 	 */
-	private fun isCompatible(fingerprint: WorkFingerprint, workId: Long): Boolean {
-		val metadata = repository.metadataOf(workId) ?: return false
+	private fun isCompatible(
+		fingerprint: WorkFingerprint,
+		metadata: Triple<String, Int?, String?>?,
+	): Boolean {
+		metadata ?: return false
 		val (canonicalTitle, year, contentType) = metadata
 
 		if (TitleNormalizer.sequenceSignature(fingerprint.title) !=
@@ -112,17 +204,33 @@ class WorkResolver(
 		}
 	}
 
-	private fun link(fingerprint: WorkFingerprint, workId: Long, method: ResolutionMethod): Resolution {
-		repository.linkAlias(
-			source = fingerprint.source,
-			sourceKey = fingerprint.sourceKey,
-			workId = workId,
-			confidence = method.confidence,
-			evidence = method.name.lowercase(),
-		)
-		observeTitles(workId, fingerprint)
-		fingerprint.coverPHash?.let { repository.storeCoverHash(workId, fingerprint.source, it) }
-		return Resolution(workId, method, created = false)
+	private fun link(
+		fingerprint: WorkFingerprint,
+		workId: Long,
+		method: ResolutionMethod,
+		reporterId: String?,
+	): Resolution {
+		val linkedWorkId = if (reporterId == null) {
+			repository.linkAlias(
+				source = fingerprint.source,
+				sourceKey = fingerprint.sourceKey,
+				workId = workId,
+				confidence = method.confidence,
+				evidence = method.name.lowercase(),
+			)
+		} else {
+			repository.observeAlias(
+				fingerprint.source,
+				fingerprint.sourceKey,
+				reporterId,
+				workId,
+				listOf(fingerprint.title).flatMap(TitleNormalizer::keys),
+			)
+			workId
+		}
+		observeTitles(linkedWorkId, fingerprint)
+		fingerprint.coverPHash?.let { repository.storeCoverHash(linkedWorkId, fingerprint.source, it) }
+		return Resolution(linkedWorkId, method, created = false)
 	}
 
 	/**
@@ -142,49 +250,118 @@ class WorkResolver(
 		}
 	}
 
-	private fun createFromCatalogue(fingerprint: WorkFingerprint, record: CatalogueRecord): Resolution {
-		val workId = repository.createWork(
+	private fun createFromCatalogue(
+		fingerprint: WorkFingerprint,
+		record: CatalogueRecord,
+		reporterId: String?,
+	): Resolution {
+		// Catalogue payloads are external input too. Keep the repository strict so no caller can
+		// overflow PostgreSQL SMALLINT, but do not turn one provider''s malformed year into a 500.
+		val year = record.year?.takeIf(WorkLimits::isValidYear) ?: fingerprint.year
+		if (reporterId != null) {
+			return createObserved(
+				fingerprint,
+				reporterId,
+				record.canonicalTitle,
+				year,
+				record.contentType ?: fingerprint.contentType,
+				record.nsfw || fingerprint.nsfw,
+				record.titles.map { TitleToStore(it, kind = "catalogue", weight = 1.0) } +
+					fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed", weight = 0.3) },
+				record.externalIds,
+				ResolutionMethod.CATALOGUE,
+			)
+		}
+		val result = repository.createAndLinkWork(
 			canonicalTitle = record.canonicalTitle,
-			year = record.year ?: fingerprint.year,
+			year = year,
 			contentType = record.contentType ?: fingerprint.contentType,
 			nsfw = record.nsfw || fingerprint.nsfw,
-		)
-		repository.addTitles(
-			workId,
-			record.titles.map { TitleToStore(it, kind = "catalogue", weight = 1.0) } +
+			titles = record.titles.map { TitleToStore(it, kind = "catalogue", weight = 1.0) } +
 				fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed", weight = 0.3) },
+			externalIds = record.externalIds,
+			source = fingerprint.source,
+			sourceKey = fingerprint.sourceKey,
+			confidence = ResolutionMethod.CATALOGUE.confidence,
+			evidence = record.provider,
+			coverPHash = fingerprint.coverPHash,
 		)
-		repository.addExternalIds(workId, record.externalIds + fingerprint.externalIds)
-		repository.linkAlias(
-			fingerprint.source, fingerprint.sourceKey, workId,
-			ResolutionMethod.CATALOGUE.confidence, record.provider,
-		)
-		fingerprint.coverPHash?.let { repository.storeCoverHash(workId, fingerprint.source, it) }
-		log.debug("Created work {} from {} with {} titles", workId, record.provider, record.titles.size)
-		return Resolution(workId, ResolutionMethod.CATALOGUE, created = true)
+		val method = when {
+			result.aliasAlreadyExisted -> ResolutionMethod.ALIAS
+			else -> ResolutionMethod.CATALOGUE
+		}
+		if (result.created) {
+			log.debug("Created work {} from {} with {} titles", result.workId, record.provider, record.titles.size)
+		}
+		return Resolution(result.workId, method, result.created)
 	}
 
-	private fun createFromFingerprint(fingerprint: WorkFingerprint): Resolution {
-		val workId = repository.createWork(
+	private fun createFromFingerprint(fingerprint: WorkFingerprint, reporterId: String?): Resolution {
+		if (reporterId != null) {
+			return createObserved(
+				fingerprint,
+				reporterId,
+				fingerprint.title,
+				fingerprint.year,
+				fingerprint.contentType,
+				fingerprint.nsfw,
+				fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed", weight = 0.3) },
+				emptyMap(),
+				ResolutionMethod.CREATED,
+			)
+		}
+		val result = repository.createAndLinkWork(
 			canonicalTitle = fingerprint.title,
 			year = fingerprint.year,
 			contentType = fingerprint.contentType,
 			nsfw = fingerprint.nsfw,
+			titles = fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed") },
+			externalIds = emptyMap(),
+			source = fingerprint.source,
+			sourceKey = fingerprint.sourceKey,
+			confidence = ResolutionMethod.CREATED.confidence,
+			evidence = "fingerprint",
+			coverPHash = fingerprint.coverPHash,
 		)
-		repository.addTitles(workId, fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed") })
-		repository.addExternalIds(workId, fingerprint.externalIds)
-		repository.linkAlias(
-			fingerprint.source, fingerprint.sourceKey, workId,
-			ResolutionMethod.CREATED.confidence, "fingerprint",
+		return Resolution(
+			result.workId,
+			if (result.aliasAlreadyExisted) ResolutionMethod.ALIAS else ResolutionMethod.CREATED,
+			result.created,
 		)
-		fingerprint.coverPHash?.let { repository.storeCoverHash(workId, fingerprint.source, it) }
-		return Resolution(workId, ResolutionMethod.CREATED, created = true)
+	}
+
+	private fun createObserved(
+		fingerprint: WorkFingerprint,
+		reporterId: String,
+		canonicalTitle: String,
+		year: Int?,
+		contentType: String?,
+		nsfw: Boolean,
+		titles: List<TitleToStore>,
+		externalIds: Map<String, String>,
+		method: ResolutionMethod,
+	): Resolution {
+		val workId = repository.createObservedWork(
+			canonicalTitle = canonicalTitle,
+			year = year,
+			contentType = contentType,
+			nsfw = nsfw,
+			titles = titles,
+			externalIds = externalIds,
+			source = fingerprint.source,
+			sourceKey = fingerprint.sourceKey,
+			reporterId = reporterId,
+			titleKeys = listOf(fingerprint.title).flatMap(TitleNormalizer::keys),
+			coverPHash = fingerprint.coverPHash,
+		)
+		return Resolution(workId, method, created = true)
 	}
 
 	companion object {
 
 		/** Matches the app's `CoverHash`: below this, two covers are the same artwork. */
 		const val MAX_COVER_DISTANCE = 12
+		const val MIN_TRUSTED_TITLE_WEIGHT = 0.5
 
 		/**
 		 * Candidate **generation**, deliberately loose.
@@ -204,9 +381,15 @@ class WorkResolver(
 		const val TITLE_ONLY_THRESHOLD = 0.85
 
 		const val YEAR_TOLERANCE = 2
+		const val MAX_CONCURRENT_RESOLUTIONS = 8
+		const val MAX_QUEUED_RESOLUTIONS = 32
+		const val ALIAS_LOCK_STRIPES = 256
+		const val MAX_QUEUED_PER_ALIAS_STRIPE = 8
 
 		private val KNOWN_TYPES = setOf("manga", "manhwa", "manhua", "novel", "oneshot", "doujinshi")
 
 		fun hammingDistance(a: Long, b: Long): Int = java.lang.Long.bitCount(a xor b)
 	}
 }
+
+class WorkResolutionOverloaded : RuntimeException("work resolution capacity exhausted")

@@ -35,7 +35,7 @@ class ScoringPipelineTest {
 	private fun report(secret: String, source: String, ok: Int, fail: Int, empty: Int = 0, p50: Int = 700) {
 		telemetry.record(
 			secret,
-			TrustTier.NORMAL,
+			TrustTier.ESTABLISHED,
 			Region.EU,
 			listOf(Probe(source, ProbeOp.SEARCH, ok, fail, empty, 0, p50, p50 * 2)),
 		)
@@ -115,13 +115,32 @@ class ScoringPipelineTest {
 	}
 
 	@Test
+	fun `fresh and normal account telemetry is retained but excluded from public aggregation`() {
+		telemetry.record(
+			"fresh-attacker", TrustTier.NEW, Region.EU,
+			listOf(Probe("SOURCE", ProbeOp.SEARCH, 0, 100_000, 0, 0, 100_000, 100_000)),
+		)
+		telemetry.record(
+			"normal-attacker", TrustTier.NORMAL, Region.EU,
+			listOf(Probe("SOURCE", ProbeOp.SEARCH, 0, 100_000, 0, 0, 100_000, 100_000)),
+		)
+		report("settled-reporter", "SOURCE", ok = 100, fail = 0)
+
+		assertEquals(3L, telemetryRepository.countRows(), "raw privacy-limited snapshots are still accepted")
+		val aggregate = scoringRepository.aggregate().single()
+		assertEquals(1, aggregate.sampleSize)
+		assertEquals(0.0, aggregate.failWeighted)
+		assertTrue(aggregate.okWeighted > 0.0)
+	}
+
+	@Test
 	fun `regions are scored independently`() {
 		telemetry.record(
-			"reporter-1", TrustTier.NORMAL, Region.EU,
+			"reporter-1", TrustTier.ESTABLISHED, Region.EU,
 			listOf(Probe("GEO", ProbeOp.SEARCH, 200, 0, 0, 0, 600, 1200)),
 		)
 		telemetry.record(
-			"reporter-1", TrustTier.NORMAL, Region.APAC,
+			"reporter-1", TrustTier.ESTABLISHED, Region.APAC,
 			listOf(Probe("GEO", ProbeOp.SEARCH, 2, 200, 0, 190, 9000, 12000)),
 		)
 
@@ -156,6 +175,44 @@ class ScoringPipelineTest {
 		assertNotNull(scoring.scores(Region.EU.name))
 	}
 
+	@Test
+	fun `recompute removes scores that are no longer in an active region`() {
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.createStatement().use {
+				it.execute(
+					"INSERT INTO source_score " +
+						"(source, region, stability, popularity, composite, sample_size) " +
+						"VALUES ('STALE', 'EU', 1, 1, 1, 1)",
+				)
+			}
+		}
+		report("reporter", "ACTIVE", ok = 10, fail = 0)
+
+		scoring.recompute()
+
+		assertEquals(listOf("ACTIVE"), scoring.scores(Region.EU.name).scores.map { it.source })
+	}
+
+	@Test
+	fun `score snapshots stay within the documented twelve hundred source budget`() {
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				INSERT INTO source_probe_raw
+					(source, day, region, op, reporter_day, tier, ok, fail, empty, cf_blocked,
+					 latency_p50_ms, latency_p90_ms)
+				SELECT 'SOURCE_' || n, CURRENT_DATE, 'EU', 0, 'reporter_' || n, 2,
+				       10, 0, 0, 0, 100, 200
+				FROM generate_series(1, 1201) AS n
+				""".trimIndent(),
+			).use { it.executeUpdate() }
+		}
+
+		scoring.recompute()
+
+		assertEquals(1_200, scoring.scores(Region.EU.name).scores.size)
+	}
+
 	private fun insertProbeOn(day: LocalDate, source: String, ok: Int, fail: Int) {
 		PostgresTestBase.database.source.connection.use { connection ->
 			connection.prepareStatement(
@@ -163,7 +220,7 @@ class ScoringPipelineTest {
 				INSERT INTO source_probe_raw
 					(source, day, region, op, reporter_day, tier, ok, fail, empty, cf_blocked,
 					 latency_p50_ms, latency_p90_ms)
-				VALUES (?, ?, 'EU', 0, ?, 1, ?, ?, 0, 0, 700, 1400)
+				VALUES (?, ?, 'EU', 0, ?, 2, ?, ?, 0, 0, 700, 1400)
 				""".trimIndent(),
 			).use { statement ->
 				statement.setString(1, source)

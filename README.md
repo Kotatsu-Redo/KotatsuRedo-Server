@@ -134,8 +134,8 @@ this is the index.
 - **`plugins/Plugins.kt` builds its log line from an allow-list of four fields.** The bearer secret is
   the identity, so a logged `Authorization` header hands out accounts. `LoggingRedactionTest` fails the
   build if this regresses.
-- **Migrations run at startup and abort the process on failure.** A server on an unexpected schema is
-  worse than a server that is plainly down.
+- **Migrations run in a one-shot Compose service and the API waits for it to succeed.** The schema
+  owner password is never passed to the long-lived API container.
 - **Errors are codes, never prose.** The app localizes; the server never holds translations.
 - **`is_shadowbanned` never crosses the wire.** A shadowban works only while nothing signals it
   happened, so it is absent from every response — including the user's own `identity/me`.

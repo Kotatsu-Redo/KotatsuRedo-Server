@@ -35,7 +35,43 @@ data class RatingAggregate(
 	val histogram: List<Int>,
 )
 
+data class BrigadeStats(
+	val recentCount: Int,
+	val olderCount: Int,
+	val extremeShare: Double,
+	val newUserShare: Double,
+)
+
 class RatingRepository(private val dataSource: DataSource) {
+	/** Writes a rating and its denormalised aggregate with one checkout and transaction. */
+	fun setAndAggregate(workId: Long, userId: String, value: Int): RatingAggregate =
+		aggregateTransaction(workId, userId, value) { connection ->
+			connection.prepareStatement(
+				"""
+				INSERT INTO rating (work_id, origin_work_id, user_id, value) VALUES (?, ?, ?, ?)
+				ON CONFLICT (work_id, user_id) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+				""".trimIndent(),
+			).use {
+				it.setLong(1, workId)
+				it.setLong(2, workId)
+				it.setString(3, userId)
+				it.setInt(4, value)
+				it.executeUpdate()
+			}
+		}
+
+	/** Deletes one rating and repairs the aggregate in the same per-work transaction. */
+	fun deleteAndAggregate(workId: Long, userId: String): Pair<Boolean, RatingAggregate> {
+		var deleted = false
+		val aggregate = aggregateTransaction(workId, userId, null) { connection ->
+			deleted = connection.prepareStatement("DELETE FROM rating WHERE work_id = ? AND user_id = ?").use {
+				it.setLong(1, workId)
+				it.setString(2, userId)
+				it.executeUpdate() > 0
+			}
+		}
+		return deleted to aggregate
+	}
 
 	fun set(workId: Long, userId: String, value: Int) {
 		dataSource.connection.use { connection ->
@@ -103,6 +139,29 @@ class RatingRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	fun allByPage(userId: String, afterWorkId: Long, limit: Int): List<ExportedRating> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"SELECT work_id, value, created_at, updated_at FROM rating " +
+					"WHERE user_id = ? AND work_id > ? ORDER BY work_id LIMIT ?",
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setLong(2, afterWorkId)
+				statement.setInt(3, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) add(
+							ExportedRating(
+								rows.getLong(1), rows.getInt(2),
+								rows.getObject(3, java.time.OffsetDateTime::class.java),
+								rows.getObject(4, java.time.OffsetDateTime::class.java),
+							),
+						)
+					}
+				}
+			}
+		}
+
 	fun find(workId: Long, userId: String): Int? = dataSource.connection.use { connection ->
 		connection.prepareStatement("SELECT value FROM rating WHERE work_id = ? AND user_id = ?")
 			.use { statement ->
@@ -115,7 +174,10 @@ class RatingRepository(private val dataSource: DataSource) {
 	/** The global mean across every rating, which is the prior a Bayesian average pulls toward. */
 	fun globalMean(): Double = dataSource.connection.use { connection ->
 		connection.createStatement().use { statement ->
-			statement.executeQuery("SELECT COALESCE(AVG(value), 0) FROM rating").use {
+			statement.executeQuery(
+				"SELECT CASE WHEN sum(count) = 0 THEN 0 ELSE sum(value_sum)::float8 / sum(count) END " +
+					"FROM rating_global_shard",
+			).use {
 				it.next()
 				it.getDouble(1)
 			}
@@ -123,20 +185,21 @@ class RatingRepository(private val dataSource: DataSource) {
 	}
 
 	fun rawStats(workId: Long): Triple<Int, Double, List<Int>> = dataSource.connection.use { connection ->
-		connection.prepareStatement("SELECT value FROM rating WHERE work_id = ?").use { statement ->
+		connection.prepareStatement(
+			"""
+			SELECT count(*), COALESCE(avg(value), 0),
+			       count(*) FILTER (WHERE value BETWEEN 1 AND 2),
+			       count(*) FILTER (WHERE value BETWEEN 3 AND 4),
+			       count(*) FILTER (WHERE value BETWEEN 5 AND 6),
+			       count(*) FILTER (WHERE value BETWEEN 7 AND 8),
+			       count(*) FILTER (WHERE value BETWEEN 9 AND 10)
+			FROM rating WHERE work_id = ?
+			""".trimIndent(),
+		).use { statement ->
 			statement.setLong(1, workId)
 			statement.executeQuery().use { rows ->
-				val histogram = MutableList(RatingScale.BUCKETS) { 0 }
-				var total = 0
-				var count = 0
-				while (rows.next()) {
-					val value = rows.getInt(1)
-					total += value
-					count++
-					val bucket = RatingScale.histogramBucket(value) - 1
-					histogram[bucket] = histogram[bucket] + 1
-				}
-				Triple(count, if (count == 0) 0.0 else total.toDouble() / count, histogram)
+				rows.next()
+				Triple(rows.getInt(1), rows.getDouble(2), (3..7).map(rows::getInt))
 			}
 		}
 	}
@@ -145,18 +208,20 @@ class RatingRepository(private val dataSource: DataSource) {
 		dataSource.connection.use { connection ->
 			connection.prepareStatement(
 				"""
-				INSERT INTO work_rating_agg (work_id, count, mean, bayesian, histogram, updated_at)
-				VALUES (?, ?, ?, ?, ?, now())
+				INSERT INTO work_rating_agg (work_id, count, value_sum, mean, bayesian, histogram, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, now())
 				ON CONFLICT (work_id) DO UPDATE SET
-					count = EXCLUDED.count, mean = EXCLUDED.mean, bayesian = EXCLUDED.bayesian,
+					count = EXCLUDED.count, value_sum = EXCLUDED.value_sum,
+					mean = EXCLUDED.mean, bayesian = EXCLUDED.bayesian,
 					histogram = EXCLUDED.histogram, updated_at = now()
 				""".trimIndent(),
 			).use { statement ->
 				statement.setLong(1, aggregate.workId)
 				statement.setInt(2, aggregate.count)
-				statement.setFloat(3, aggregate.mean.toFloat())
-				statement.setFloat(4, aggregate.bayesian.toFloat())
-				statement.setArray(5, connection.createArrayOf("integer", aggregate.histogram.toTypedArray()))
+				statement.setLong(3, kotlin.math.round(aggregate.mean * aggregate.count).toLong())
+				statement.setFloat(4, aggregate.mean.toFloat())
+				statement.setFloat(5, aggregate.bayesian.toFloat())
+				statement.setArray(6, connection.createArrayOf("integer", aggregate.histogram.toTypedArray()))
 				statement.executeUpdate()
 			}
 		}
@@ -176,6 +241,97 @@ class RatingRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	private fun aggregateTransaction(
+		workId: Long,
+		userId: String,
+		newValue: Int?,
+		mutation: (java.sql.Connection) -> Unit,
+	): RatingAggregate = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			// Account erasure takes FOR UPDATE on this row before taking work locks. Matching that
+			// order prevents a rating write and deletion from deadlocking or publishing a stale total.
+			connection.prepareStatement("SELECT 1 FROM app_user WHERE id = ? FOR KEY SHARE").use {
+				it.setString(1, userId)
+				it.executeQuery().use { rows ->
+					if (!rows.next()) throw IllegalStateException("rating user does not exist")
+				}
+			}
+			connection.prepareStatement("SELECT pg_advisory_xact_lock(?)").use {
+				it.setLong(1, workId)
+				it.execute()
+			}
+			val oldValue = connection.prepareStatement(
+				"SELECT value FROM rating WHERE work_id = ? AND user_id = ?",
+			).use {
+				it.setLong(1, workId)
+				it.setString(2, userId)
+				it.executeQuery().use { rows -> if (rows.next()) rows.getInt(1) else null }
+			}
+			val stored = connection.prepareStatement(
+				"SELECT count, value_sum, histogram FROM work_rating_agg WHERE work_id = ? FOR UPDATE",
+			).use {
+				it.setLong(1, workId)
+				it.executeQuery().use { rows ->
+					if (!rows.next()) {
+						Triple(0, 0L, MutableList(RatingScale.BUCKETS) { 0 })
+					} else {
+						@Suppress("UNCHECKED_CAST")
+						val histogram = (rows.getArray(3).array as Array<Integer>).map { value -> value.toInt() }
+						Triple(rows.getInt(1), rows.getLong(2), histogram.toMutableList())
+					}
+				}
+			}
+			mutation(connection)
+			val count = stored.first + when {
+				oldValue == null && newValue != null -> 1
+				oldValue != null && newValue == null -> -1
+				else -> 0
+			}
+			val valueSum = stored.second + (newValue ?: 0) - (oldValue ?: 0)
+			val histogram = stored.third
+			oldValue?.let { histogram[RatingScale.histogramBucket(it) - 1]-- }
+			newValue?.let { histogram[RatingScale.histogramBucket(it) - 1]++ }
+			check(count >= 0 && valueSum >= 0 && histogram.all { it >= 0 }) {
+				"rating aggregate drifted below zero"
+			}
+			val mean = if (count == 0) 0.0 else valueSum.toDouble() / count
+			val globalMean = connection.createStatement().use { statement ->
+				statement.executeQuery(
+					"SELECT CASE WHEN sum(count) = 0 THEN 0 ELSE sum(value_sum)::float8 / sum(count) END " +
+						"FROM rating_global_shard",
+				).use { rows -> rows.next(); rows.getDouble(1) }
+			}
+			val aggregate = RatingAggregate(
+				workId, count, mean, RatingService.bayesianAverage(count, mean, globalMean), histogram,
+			)
+			connection.prepareStatement(
+				"""
+				INSERT INTO work_rating_agg (work_id, count, value_sum, mean, bayesian, histogram, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, now())
+				ON CONFLICT (work_id) DO UPDATE SET count = EXCLUDED.count, value_sum = EXCLUDED.value_sum,
+					mean = EXCLUDED.mean,
+					bayesian = EXCLUDED.bayesian, histogram = EXCLUDED.histogram, updated_at = now()
+				""".trimIndent(),
+			).use {
+				it.setLong(1, aggregate.workId)
+				it.setInt(2, aggregate.count)
+				it.setLong(3, valueSum)
+				it.setDouble(4, aggregate.mean)
+				it.setDouble(5, aggregate.bayesian)
+				it.setArray(6, connection.createArrayOf("integer", aggregate.histogram.toTypedArray()))
+				it.executeUpdate()
+			}
+			connection.commit()
+			aggregate
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
+
 	/**
 	 * Recent ratings with the rater's trust tier, for brigade detection. A spike alone is a manga
 	 * getting popular; a spike that is all extremes and all new accounts is coordination.
@@ -187,7 +343,7 @@ class RatingRepository(private val dataSource: DataSource) {
 				SELECT r.value, t.tier
 				FROM rating r
 				JOIN user_trust t ON t.user_id = r.user_id
-				WHERE r.work_id = ? AND r.created_at > now() - make_interval(hours => ?)
+				WHERE r.work_id = ? AND r.updated_at > now() - make_interval(hours => ?)
 				""".trimIndent(),
 			).use { statement ->
 				statement.setLong(1, workId)
@@ -200,13 +356,38 @@ class RatingRepository(private val dataSource: DataSource) {
 
 	fun ratingsBefore(workId: Long, hours: Int): Int = dataSource.connection.use { connection ->
 		connection.prepareStatement(
-			"SELECT count(*) FROM rating WHERE work_id = ? AND created_at <= now() - make_interval(hours => ?)",
+			"SELECT count(*) FROM rating WHERE work_id = ? AND updated_at <= now() - make_interval(hours => ?)",
 		).use { statement ->
 			statement.setLong(1, workId)
 			statement.setInt(2, hours)
 			statement.executeQuery().use { it.next(); it.getInt(1) }
 		}
 	}
+
+	fun brigadeStats(workId: Long, hours: Int, extremeLow: Int, extremeHigh: Int): BrigadeStats =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT count(*),
+					GREATEST(COALESCE((SELECT count FROM work_rating_agg WHERE work_id = ?), 0) - count(*), 0),
+					COALESCE(avg(CASE WHEN r.value <= ? OR r.value >= ? THEN 1.0 ELSE 0.0 END), 0),
+					COALESCE(avg(CASE WHEN t.tier = 0 THEN 1.0 ELSE 0.0 END), 0)
+				FROM rating r
+				JOIN user_trust t ON t.user_id = r.user_id
+				WHERE r.work_id = ? AND r.updated_at > now() - make_interval(hours => ?)
+				""".trimIndent(),
+			).use { statement ->
+				statement.setLong(1, workId)
+				statement.setInt(2, extremeLow)
+				statement.setInt(3, extremeHigh)
+				statement.setLong(4, workId)
+				statement.setInt(5, hours)
+				statement.executeQuery().use { rows ->
+					rows.next()
+					BrigadeStats(rows.getInt(1), rows.getInt(2), rows.getDouble(3), rows.getDouble(4))
+				}
+			}
+		}
 
 	fun flagBrigade(
 		workId: Long,
@@ -221,6 +402,12 @@ class RatingRepository(private val dataSource: DataSource) {
 				INSERT INTO rating_brigade_flag
 					(work_id, recent_count, baseline, extreme_share, new_user_share)
 				VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT (work_id) WHERE reviewed_at IS NULL DO UPDATE SET
+					detected_at = now(),
+					recent_count = EXCLUDED.recent_count,
+					baseline = EXCLUDED.baseline,
+					extreme_share = EXCLUDED.extreme_share,
+					new_user_share = EXCLUDED.new_user_share
 				""".trimIndent(),
 			).use { statement ->
 				statement.setLong(1, workId)

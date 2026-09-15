@@ -7,13 +7,16 @@ import io.kotatsuredo.server.comments.CommentRepository
 import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.ratings.RatingScale
 import io.kotatsuredo.server.ratings.RatingService
+import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.server.response.header
-import io.ktor.server.response.respond
+import io.ktor.server.response.respondTextWriter
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 
@@ -96,47 +99,84 @@ fun Route.exportRoutes(
 ) {
 	get("/identity/export") {
 		val caller = call.requireCaller(identities)
-		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
+		call.enforceLimit(limiter, RateLimiter.Bucket.EXPORT, caller.tier, caller.identity.id)
 		val identity = caller.identity
-
-		val export = ExportDto(
-			exportedAt = OffsetDateTime.now().iso(),
-			userId = identity.id,
-			nickname = identity.nickname,
-			createdAt = identity.createdAt.iso(),
-			comments = comments.allBy(identity.id).map { comment ->
-				ExportedCommentDto(
-					id = comment.id.toString(),
-					workId = comment.workId.toString(),
-					chapterId = comment.chapterId?.toString(),
-					parentId = comment.parentId?.toString(),
-					body = comment.body,
-					lang = comment.lang,
-					createdAt = comment.createdAt.iso(),
-					editedAt = comment.editedAt?.iso(),
-					state = comment.state.name.lowercase(),
-					up = comment.up,
-					down = comment.down,
-				)
-			},
-			ratings = ratings.allRatingsBy(identity.id).map {
-				ExportedRatingDto(
-					workId = it.workId.toString(),
-					stars = RatingScale.stars(it.value),
-					createdAt = it.createdAt.iso(),
-					updatedAt = it.updatedAt.iso(),
-				)
-			},
-			votes = comments.votesBy(identity.id).map { (commentId, value, castAt) ->
-				ExportedVoteDto(commentId.toString(), value, castAt.iso())
-			},
-		)
 
 		// Named so a browser or the app saves it as a file rather than rendering it.
 		call.response.header(
 			HttpHeaders.ContentDisposition,
 			"attachment; filename=\"kotatsu-community-${identity.id}.json\"",
 		)
-		call.respond(export)
+		call.respondTextWriter(ContentType.Application.Json) {
+			write("{\"exported_at\":${exportJson.encodeToString(OffsetDateTime.now().iso())}")
+			write(",\"user_id\":${exportJson.encodeToString(identity.id)}")
+			write(",\"nickname\":${exportJson.encodeToString(identity.nickname)}")
+			write(",\"created_at\":${exportJson.encodeToString(identity.createdAt.iso())}")
+
+			write(",\"comments\":[")
+			var first = true
+			var commentCursor = 0L
+			do {
+				val page = comments.allByPage(identity.id, commentCursor, EXPORT_PAGE_SIZE)
+				page.forEach { comment ->
+					if (!first) write(",")
+					first = false
+					write(exportJson.encodeToString(comment.toExportDto()))
+				}
+				commentCursor = page.lastOrNull()?.id ?: commentCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
+			write("],\"ratings\":[")
+			first = true
+			var ratingCursor = 0L
+			do {
+				val page = ratings.allRatingsByPage(identity.id, ratingCursor, EXPORT_PAGE_SIZE)
+				page.forEach { rating ->
+					if (!first) write(",")
+					first = false
+					write(exportJson.encodeToString(rating.toExportDto()))
+				}
+				ratingCursor = page.lastOrNull()?.workId ?: ratingCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
+			write("],\"votes\":[")
+			first = true
+			var voteCursor = 0L
+			do {
+				val page = comments.votesByPage(identity.id, voteCursor, EXPORT_PAGE_SIZE)
+				page.forEach { (commentId, value, castAt) ->
+					if (!first) write(",")
+					first = false
+					write(exportJson.encodeToString(ExportedVoteDto(commentId.toString(), value, castAt.iso())))
+				}
+				voteCursor = page.lastOrNull()?.first ?: voteCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
+			write("],\"notes\":${exportJson.encodeToString(NOTES)}}")
+		}
 	}
 }
+
+private val exportJson = Json { encodeDefaults = true }
+private const val EXPORT_PAGE_SIZE = 250
+
+private fun io.kotatsuredo.server.comments.Comment.toExportDto() = ExportedCommentDto(
+	id = id.toString(),
+	workId = workId.toString(),
+	chapterId = chapterId?.toString(),
+	parentId = parentId?.toString(),
+	body = body,
+	lang = lang,
+	createdAt = createdAt.iso(),
+	editedAt = editedAt?.iso(),
+	state = state.name.lowercase(),
+	up = up,
+	down = down,
+)
+
+private fun io.kotatsuredo.server.ratings.ExportedRating.toExportDto() = ExportedRatingDto(
+	workId = workId.toString(),
+	stars = RatingScale.stars(value),
+	createdAt = createdAt.iso(),
+	updatedAt = updatedAt.iso(),
+)

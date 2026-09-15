@@ -1,11 +1,19 @@
 package io.kotatsuredo.server.filter
 
 import io.kotatsuredo.server.identity.Nicknames
+import io.kotatsuredo.server.identity.TrustTier
 import java.sql.ResultSet
 import java.time.OffsetDateTime
 import javax.sql.DataSource
 
 class FilterRepository(private val dataSource: DataSource) {
+	data class RuleSeed(
+		val term: String,
+		val termRaw: String,
+		val tier: FilterTier,
+		val lang: String?,
+		val source: String,
+	)
 
 	// -- rules -----------------------------------------------------------------------------------
 
@@ -36,6 +44,39 @@ class FilterRepository(private val dataSource: DataSource) {
 				statement.executeUpdate() > 0
 			}
 		}
+
+	/** Inserts an idempotent seed corpus with one checkout, one transaction, and JDBC batches. */
+	fun addRules(rules: Collection<RuleSeed>): Int {
+		if (rules.isEmpty()) return 0
+		return dataSource.connection.use { connection ->
+			connection.autoCommit = false
+			try {
+				val inserted = connection.prepareStatement(
+					"""
+					INSERT INTO filter_rule (term, term_raw, tier, lang, source) VALUES (?, ?, ?, ?, ?)
+					ON CONFLICT (term, tier, COALESCE(lang, '*')) DO NOTHING
+					""".trimIndent(),
+				).use { statement ->
+					rules.forEach { rule ->
+						statement.setString(1, rule.term)
+						statement.setString(2, rule.termRaw)
+						statement.setShort(3, rule.tier.code)
+						statement.setString(4, rule.lang)
+						statement.setString(5, rule.source)
+						statement.addBatch()
+					}
+					statement.executeBatch().sumOf { count -> if (count > 0) count else 0 }
+				}
+				connection.commit()
+				inserted
+			} catch (error: Exception) {
+				connection.rollback()
+				throw error
+			} finally {
+				connection.autoCommit = true
+			}
+		}
+	}
 
 	fun setRuleEnabled(id: Long, enabled: Boolean): Boolean = update(
 		"UPDATE filter_rule SET is_enabled = ?, updated_at = now() WHERE id = ?",
@@ -136,14 +177,43 @@ class FilterRepository(private val dataSource: DataSource) {
 	/**
 	 * The user pressed "this was wrong" in the rejection dialog.
 	 *
-	 * Only their own block, and only once: this is a signal that auto-demotes rules, so letting one
-	 * person press it repeatedly would hand them a way to switch the filter off.
+	 * One account gets one signal per rule, not one signal per generated block row. Locking the user
+	 * serialises concurrent disputes for different rows of the same rule, so two simultaneous requests
+	 * cannot both pass the NOT EXISTS check.
 	 */
-	fun dispute(blockId: Long, userId: String): Boolean = update(
-		"UPDATE filter_block SET disputed_at = now() WHERE id = ? AND user_id = ? AND disputed_at IS NULL",
-	) {
-		it.setLong(1, blockId)
-		it.setString(2, userId)
+	fun dispute(blockId: Long, userId: String): Boolean = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			val ownerExists = connection.prepareStatement(
+				"SELECT id FROM app_user WHERE id = ? FOR UPDATE",
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.executeQuery().use { it.next() }
+			}
+			val updated = if (!ownerExists) 0 else connection.prepareStatement(
+				"""
+				UPDATE filter_block AS target SET disputed_at = now()
+				WHERE target.id = ? AND target.user_id = ? AND target.disputed_at IS NULL
+				  AND NOT EXISTS (
+				      SELECT 1 FROM filter_block AS prior
+				      WHERE prior.user_id = target.user_id
+				        AND prior.rule_id IS NOT DISTINCT FROM target.rule_id
+				        AND prior.disputed_at IS NOT NULL
+				  )
+				""".trimIndent(),
+			).use { statement ->
+				statement.setLong(1, blockId)
+				statement.setString(2, userId)
+				statement.executeUpdate()
+			}
+			connection.commit()
+			updated > 0
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
 	}
 
 	fun resolveBlock(blockId: Long, resolution: String): Boolean = update(
@@ -183,6 +253,46 @@ class FilterRepository(private val dataSource: DataSource) {
 						add(
 							RuleStats(
 								ruleId = rows.getLong(1).takeUnless { rows.wasNull() },
+								term = rows.getString(2),
+								tier = FilterTier.of(rows.getShort(3)),
+								lang = rows.getString(4),
+								blocks = rows.getInt(5),
+								disputed = rows.getInt(6),
+							),
+						)
+					}
+				}
+			}
+		}
+	}
+
+	/** Independent, settled-account signals used exclusively by automatic demotion. */
+	fun autoDemotionStats(minReporters: Int): List<RuleStats> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT b.rule_id, b.term, b.tier, b.lang,
+			       count(DISTINCT b.user_id) AS reporters,
+			       count(DISTINCT b.user_id) FILTER (WHERE b.disputed_at IS NOT NULL) AS disputed
+			FROM filter_block b
+			JOIN user_trust trust ON trust.user_id = b.user_id
+			JOIN app_user account ON account.id = b.user_id
+			WHERE b.rule_id IS NOT NULL AND trust.tier >= ?
+			  AND NOT account.is_banned AND NOT account.is_shadowbanned
+			GROUP BY b.rule_id, b.term, b.tier, b.lang
+			HAVING count(DISTINCT b.user_id) >= ?
+			ORDER BY count(DISTINCT b.user_id) FILTER (WHERE b.disputed_at IS NOT NULL)::float /
+			         count(DISTINCT b.user_id) DESC,
+			         count(DISTINCT b.user_id) DESC
+			""".trimIndent(),
+		).use { statement ->
+			statement.setInt(1, TrustTier.ESTABLISHED.level)
+			statement.setInt(2, minReporters)
+			statement.executeQuery().use { rows ->
+				buildList {
+					while (rows.next()) {
+						add(
+							RuleStats(
+								ruleId = rows.getLong(1),
 								term = rows.getString(2),
 								tier = FilterTier.of(rows.getShort(3)),
 								lang = rows.getString(4),

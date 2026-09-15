@@ -1,6 +1,7 @@
 package io.kotatsuredo.server
 
 import io.kotatsuredo.server.catalogue.CatalogueLookup
+import io.kotatsuredo.server.catalogue.CatalogueLookupOverloaded
 import io.kotatsuredo.server.catalogue.CatalogueProvider
 import io.kotatsuredo.server.catalogue.CatalogueRecord
 import io.kotatsuredo.server.catalogue.HttpFetcher
@@ -8,6 +9,13 @@ import io.kotatsuredo.server.catalogue.KitsuCatalogue
 import io.kotatsuredo.server.catalogue.MangaUpdatesCatalogue
 import io.kotatsuredo.server.works.TitleNormalizer
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -166,6 +174,64 @@ class CatalogueTest {
 		repeat(5) { assertNull(lookup.lookup("Some Untracked Doujin")) }
 
 		assertEquals(1, calls.get(), "looked up a known miss ${calls.get()} times")
+	}
+
+	@Test
+	fun `concurrent lookups for one title share one provider request`() = runTest {
+		val calls = AtomicInteger()
+		val slow = object : CatalogueProvider {
+			override val name = "slow"
+			override suspend fun lookup(title: String, year: Int?): CatalogueRecord? {
+				calls.incrementAndGet()
+				delay(100)
+				return record(title)
+			}
+		}
+		val lookup = CatalogueLookup(listOf(slow))
+
+		val results = coroutineScope {
+			List(20) { async { lookup.lookup("One Shared Title") } }.awaitAll()
+		}
+
+		assertTrue(results.all { it != null })
+		assertEquals(1, calls.get())
+	}
+
+	@Test
+	@OptIn(ExperimentalCoroutinesApi::class)
+	fun `lookup admission is bounded and overload is not negative cached`() = runTest {
+		val release = CompletableDeferred<Unit>()
+		val calls = AtomicInteger()
+		val slow = object : CatalogueProvider {
+			override val name = "slow"
+			override suspend fun lookup(title: String, year: Int?): CatalogueRecord {
+				calls.incrementAndGet()
+				release.await()
+				return record(title)
+			}
+		}
+		val lookup = CatalogueLookup(listOf(slow), maxConcurrent = 1, maxQueued = 1)
+
+		val first = async { lookup.lookup("First") }
+		runCurrent()
+		val second = async { lookup.lookup("Second") }
+		runCurrent()
+		assertEquals(1, calls.get(), "one request should run while one waits")
+
+		var overloaded = false
+		try {
+			lookup.lookup("Third")
+		} catch (_: CatalogueLookupOverloaded) {
+			overloaded = true
+		}
+		assertTrue(overloaded, "excess unique work must fail fast without pretending to be a miss")
+		assertEquals(1, calls.get())
+
+		release.complete(Unit)
+		assertNotNull(first.await())
+		assertNotNull(second.await())
+		assertNotNull(lookup.lookup("Third"), "overload must not become a permanent negative-cache entry")
+		assertEquals(3, calls.get())
 	}
 
 	@Test

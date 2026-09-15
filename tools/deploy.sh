@@ -20,12 +20,14 @@ set -euo pipefail
 
 HOST=""
 DIR="/root/kotatsuserver"
+PROXY="nginx"
 ROLLBACK=0
 SKIP_BUILD=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--dir) DIR="$2"; shift 2 ;;
+		--proxy) PROXY="$2"; shift 2 ;;
 		--rollback) ROLLBACK=1; shift ;;
 		--skip-build) SKIP_BUILD=1; shift ;;
 		-*) echo "unknown option: $1" >&2; exit 2 ;;
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$HOST" ]; then
-	echo "usage: tools/deploy.sh user@host [--dir /path] [--rollback] [--skip-build]" >&2
+	echo "usage: tools/deploy.sh user@host [--dir /path] [--proxy nginx|caddy] [--rollback] [--skip-build]" >&2
 	exit 2
 fi
 
@@ -71,6 +73,21 @@ ssh "$HOST" "cd '$DIR' && mkdir -p backups && \
 
 say "streaming the image over ($(docker image inspect "$IMAGE" --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1000000}') uncompressed)"
 docker save "$IMAGE" | gzip -1 | ssh "$HOST" "gunzip | docker load"
+
+say "syncing docker-compose.yml"
+# The compose file is generated from the repository's, so anything added to the api's `environment:`
+# block arrives with the deploy. It used not to: the file on the server stayed frozen at whatever the
+# first bundle wrote, and every variable added afterwards was silently absent from the container
+# while .env and the documentation both insisted it was there.
+#
+# .env is never touched - it holds the secrets and is the one file the server owns.
+rm -rf .deploy-sync
+python tools/make_bundle.py --no-image --skip-build --proxy "$PROXY" --out .deploy-sync >/dev/null
+COMPOSE="$(find .deploy-sync -name docker-compose.yml | head -1)"
+test -n "$COMPOSE" || { echo "could not generate a compose file" >&2; exit 1; }
+ssh "$HOST" "cd '$DIR' && cp docker-compose.yml docker-compose.yml.previous"
+scp -q "$COMPOSE" "$HOST:$DIR/docker-compose.yml"
+rm -rf .deploy-sync
 
 say "switching to $IMAGE and restarting"
 ssh "$HOST" "cd '$DIR' && \

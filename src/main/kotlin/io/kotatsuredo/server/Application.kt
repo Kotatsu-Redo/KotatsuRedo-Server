@@ -7,8 +7,12 @@ import io.kotatsuredo.server.db.migrate
 import io.kotatsuredo.server.identity.DevicePepper
 import io.kotatsuredo.server.identity.IdentityRepository
 import io.kotatsuredo.server.identity.IdentityService
+import io.kotatsuredo.server.auth.configureTrustedProxyHeaders
 import io.kotatsuredo.server.plugins.configureLogging
+import io.kotatsuredo.server.plugins.configureAdminCsrf
+import io.kotatsuredo.server.plugins.configureBlockingCalls
 import io.kotatsuredo.server.plugins.configurePanelHeaders
+import io.kotatsuredo.server.plugins.configurePreAuthRateLimit
 import io.kotatsuredo.server.plugins.configureSerialization
 import io.kotatsuredo.server.plugins.configureStatusPages
 import io.kotatsuredo.server.routes.healthRoutes
@@ -29,7 +33,9 @@ import io.kotatsuredo.server.filter.StopwordLanguageDetector
 import io.kotatsuredo.server.filter.WordFilter
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
+import io.kotatsuredo.server.moderation.OverviewRepository
 import io.kotatsuredo.server.moderation.ModeratorRepository
+import io.kotatsuredo.server.moderation.TotpSecretCipher
 import io.kotatsuredo.server.routes.adminRoutes
 import io.kotatsuredo.server.routes.filterAdminRoutes
 import io.kotatsuredo.server.routes.rulesRoute
@@ -52,14 +58,26 @@ import io.ktor.server.netty.Netty
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 const val SERVER_VERSION = "0.1.0"
 
-fun main() {
+fun main(args: Array<String>) {
+	if (args.contentEquals(arrayOf("migrate"))) {
+		Database.connect(Config.migrationDatabaseFromEnv(), enforceQueryTimeouts = false).use { migrations ->
+			migrations.source.migrate()
+		}
+		return
+	}
+	require(args.isEmpty()) { "Unknown command. Use no arguments to serve, or 'migrate' to migrate the database." }
+
 	val config = Config.fromEnv()
 	val database = Database.connect(config.database)
-	database.source.migrate()
 
 	// Built before identity, because nicknames run through the same filter as comments.
 	val filterRepository = FilterRepository(database.source)
@@ -71,13 +89,9 @@ fun main() {
 	val commentRepository = CommentRepository(database.source)
 	val ratings = RatingService(RatingRepository(database.source))
 	val identities = IdentityService(
-		repository = IdentityRepository(database.exposed),
+		repository = IdentityRepository(database.exposed, database.source),
 		pepper = DevicePepper.of(config.devicePepper),
 		filter = wordFilter,
-		// Both are what make "delete everything about me" true rather than approximate: without them
-		// a deletion takes other people's replies with it and leaves the ratings it erased counted.
-		comments = commentRepository,
-		ratings = ratings,
 	)
 	val telemetryRepository = TelemetryRepository(database.source)
 	val telemetry = TelemetryService(telemetryRepository)
@@ -105,17 +119,23 @@ fun main() {
 		detector = StopwordLanguageDetector(),
 		minLength = config.commentMinLength,
 	)
+	val moderatorRepository = ModeratorRepository(
+		database.source,
+		TotpSecretCipher.fromEncoded(config.totpEncryptionKey),
+	)
+	moderatorRepository.encryptLegacyTotpSecrets()
 	val moderation = ModerationService(
-		moderators = ModeratorRepository(database.source),
+		moderators = moderatorRepository,
 		queues = queues,
 		comments = commentRepository,
-		identities = IdentityRepository(database.exposed),
+		identities = IdentityRepository(database.exposed, database.source),
 		works = workRepository,
 		ratings = ratings,
 	)
 	config.bootstrapModerator?.let { (username, password) ->
 		moderation.bootstrapFirstAdmin(username, password)
 	}
+	val limiter = RateLimiter()
 
 	// Retention is a promise in the privacy notice, so it runs for as long as the server does.
 	// Scoring runs on the same scope: raw rows are purged at 7 days, so if this stopped, scores would
@@ -125,8 +145,19 @@ fun main() {
 	scoring.schedule(jobs)
 	// Forgets the text behind old blocks, and demotes rules that keep being wrong.
 	filters.schedule(jobs)
+	jobs.launch(Dispatchers.IO) {
+		while (isActive) {
+			delay(60 * 60 * 1000L)
+			limiter.evictExpired()
+			runCatching { moderation.sweep() }
+				.onFailure { org.slf4j.LoggerFactory.getLogger("Housekeeping").warn("Housekeeping failed", it) }
+		}
+	}
 
-	Runtime.getRuntime().addShutdownHook(Thread(database::close))
+	Runtime.getRuntime().addShutdownHook(Thread {
+		jobs.cancel()
+		database.close()
+	})
 
 	embeddedServer(Netty, port = config.port, host = config.host) {
 		module(
@@ -142,12 +173,16 @@ fun main() {
 			works = workRepository,
 			moderation = moderation,
 			queues = queues,
+			overviews = OverviewRepository(database.source),
 			filters = filterRepository,
 			filterService = filters,
+			limiter = limiter,
+			trustProxyHeaders = config.trustProxyHeaders,
+			blockingParallelism = config.database.maxPoolSize,
 			rulesUrl = config.rulesUrl,
 			// Without TLS the session cookie would never be sent, and the panel could not log in at
 			// all on a local HTTP run.
-			secureCookies = config.isProduction,
+			secureCookies = config.secureCookies,
 		)
 	}.start(wait = true)
 }
@@ -172,24 +207,33 @@ fun Application.module(
 	filters: FilterRepository? = null,
 	filterService: FilterService? = null,
 	limiter: RateLimiter = RateLimiter(),
+	trustProxyHeaders: Boolean = false,
+	blockingParallelism: Int = 16,
+	overviews: OverviewRepository? = null,
 	rulesUrl: String = "/rules",
 	secureCookies: Boolean = true,
 ) {
+	configureBlockingCalls(blockingParallelism)
 	configureLogging()
 	configureSerialization()
 	configureStatusPages()
+	configureTrustedProxyHeaders(trustProxyHeaders)
+	configurePreAuthRateLimit(limiter)
 	configurePanelHeaders()
+	configureAdminCsrf()
+	limiter.validate(org.slf4j.LoggerFactory.getLogger("RateLimiter"))
 
 	routing {
 		route("/v1") {
 			healthRoutes(health, SERVER_VERSION)
+			// Source health is non-personal aggregate data and intentionally CDN-cacheable.
+			if (scoring != null) {
+				scoreRoutes(scoring)
+			}
 			if (identities != null) {
 				identityRoutes(identities, limiter, rulesUrl)
 				if (telemetry != null) {
 					telemetryRoutes(identities, telemetry, limiter)
-				}
-				if (scoring != null) {
-					scoreRoutes(identities, scoring, limiter)
 				}
 				if (resolver != null && linker != null) {
 					workRoutes(identities, resolver, linker, limiter, queues)
@@ -216,7 +260,7 @@ fun Application.module(
 		// Outside /v1 deliberately: a different audience, a different auth model, and nothing an app
 		// client holds should be able to reach it.
 		if (moderation != null && queues != null) {
-			adminRoutes(moderation, queues, secureCookies)
+			adminRoutes(moderation, queues, secureCookies, overviews, limiter)
 			if (filters != null && filterService != null) {
 				filterAdminRoutes(moderation, filters, filterService)
 			}

@@ -1,6 +1,7 @@
 package io.kotatsuredo.server.moderation
 
 import io.kotatsuredo.server.identity.Nicknames
+import java.sql.Connection
 import java.sql.ResultSet
 import java.time.OffsetDateTime
 import javax.sql.DataSource
@@ -291,6 +292,10 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 	}
 
 	fun resolveDispute(id: Long, moderatorId: String): Boolean = dataSource.connection.use { connection ->
+		resolveDispute(connection, id, moderatorId)
+	}
+
+	fun resolveDispute(connection: Connection, id: Long, moderatorId: String): Boolean =
 		connection.prepareStatement(
 			"UPDATE work_link_dispute SET resolved_at = now(), resolved_by = ? " +
 				"WHERE id = ? AND resolved_at IS NULL",
@@ -299,16 +304,18 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 			statement.setLong(2, id)
 			statement.executeUpdate() > 0
 		}
-	}
 
 	fun reviewBrigadeFlag(id: Long): Boolean = dataSource.connection.use { connection ->
+		reviewBrigadeFlag(connection, id)
+	}
+
+	fun reviewBrigadeFlag(connection: Connection, id: Long): Boolean =
 		connection.prepareStatement(
 			"UPDATE rating_brigade_flag SET reviewed_at = now() WHERE id = ? AND reviewed_at IS NULL",
 		).use { statement ->
 			statement.setLong(1, id)
 			statement.executeUpdate() > 0
 		}
-	}
 
 	/** Queue sizes for the panel's nav, in one round trip rather than five. */
 	fun counts(hours: Int, minDislikes: Int): Map<String, Int> = dataSource.connection.use { connection ->

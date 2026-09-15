@@ -27,6 +27,17 @@ application {
 	mainClass.set("io.kotatsuredo.server.ApplicationKt")
 }
 
+// Ktor's Netty engine can lag behind Netty's security patch train. Keep every Netty module on one
+// reviewed patch release so Gradle cannot resolve a partially-upgraded, vulnerable stack.
+configurations.configureEach {
+	resolutionStrategy.eachDependency {
+		if (requested.group == "io.netty") {
+			useVersion(libs.versions.netty.get())
+			because("Netty HTTP parser and HTTP/2 security fixes")
+		}
+	}
+}
+
 dependencies {
 	implementation(libs.ktor.server.core)
 	implementation(libs.ktor.server.netty)
@@ -35,6 +46,7 @@ dependencies {
 	implementation(libs.ktor.server.call.logging)
 	implementation(libs.ktor.server.call.id)
 	implementation(libs.ktor.server.default.headers)
+	implementation(libs.ktor.server.body.limit)
 	implementation(libs.ktor.serialization.json)
 
 	implementation(libs.logback.classic)

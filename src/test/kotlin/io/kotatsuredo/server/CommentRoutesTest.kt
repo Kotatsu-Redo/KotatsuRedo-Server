@@ -48,7 +48,7 @@ class CommentRoutesTest {
 
 	private val works by lazy { WorkRepository(PostgresTestBase.database.source) }
 	private val identities by lazy {
-		IdentityService(IdentityRepository(PostgresTestBase.database.exposed), DevicePepper.of("test"))
+		IdentityService(IdentityRepository(PostgresTestBase.database.exposed, PostgresTestBase.database.source), DevicePepper.of("test"))
 	}
 	private val comments by lazy {
 		CommentService(
@@ -79,8 +79,9 @@ class CommentRoutesTest {
 
 	/** Registers a secret so it authenticates, and hands the secret back as the bearer token. */
 	private fun secret(seed: String): String {
-		identities.hello(seed, DeviceIdentifiers("dev-$seed", null))
-		return seed
+		val credential = seed.padEnd(32, '_')
+		identities.hello(credential, DeviceIdentifiers("dev-$seed", null))
+		return credential
 	}
 
 	private fun ApplicationTestBuilder.setup() {
@@ -194,6 +195,25 @@ class CommentRoutesTest {
 		assertTrue(body.contains("\"filter_blocked\""), body)
 		assertTrue(body.contains("badword"), body)
 		assertTrue(body.contains("https://example.invalid/rules"), body)
+	}
+
+	@Test
+	fun `filtered attempts consume the comment quota`() = testApplication {
+		setup()
+		val client = jsonClient()
+		val workId = works.createWork("Some Manga", 2018, "manga", nsfw = false)
+		val token = secret("blocked-author")
+
+		repeat(RateLimiter.Bucket.COMMENTS.limitFor(io.kotatsuredo.server.identity.TrustTier.NEW)) {
+			assertEquals(
+				HttpStatusCode.UnprocessableEntity,
+				client.postComment(workId, token, "this chapter was badword awful").status,
+			)
+		}
+		assertEquals(
+			HttpStatusCode.TooManyRequests,
+			client.postComment(workId, token, "this chapter was badword awful").status,
+		)
 	}
 
 	@Test

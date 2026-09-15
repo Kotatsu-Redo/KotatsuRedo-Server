@@ -18,7 +18,7 @@ enum class TrustTier(val level: Int) {
 	/** Under 24h old, or fewer than 3 active days. Tight rate limits; publication is never gated. */
 	NEW(0),
 	NORMAL(1),
-	/** Long-lived and never sanctioned. */
+	/** At least 90 days old, active on 30 days, and never sanctioned. */
 	ESTABLISHED(2),
 	;
 
@@ -39,10 +39,8 @@ data class DeviceIdentifiers(
 sealed interface HelloOutcome {
 	/**
 	 * @property created a new account was made for this key.
-	 * @property restored the key was unknown, but the hardware was, so an existing account adopted it.
-	 *  Distinct from [created] because the app has something true to say about it - and because a
-	 *  restore silently presented as an ordinary signup is how someone ends up commenting from an
-	 *  account they did not know they were in.
+	 * @property restored retained for wire compatibility with older clients; secure deployments
+	 *  always return false because device identifiers are not credentials.
 	 */
 	data class Ok(
 		val identity: Identity,

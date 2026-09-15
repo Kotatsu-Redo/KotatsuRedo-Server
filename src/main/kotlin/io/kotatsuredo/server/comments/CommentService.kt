@@ -61,6 +61,9 @@ class CommentService(
 			// nothing left to reply to.
 			if (parent.workId != workId || parent.chapterId != chapterId) return PostResult.ParentNotFound
 			if (parent.state == CommentState.REMOVED) return PostResult.ParentNotFound
+			if (parent.state == CommentState.SHADOWED && parent.userId != author.id) {
+				return PostResult.ParentNotFound
+			}
 			if (isChainExhausted(repository.ancestors(parentId), author.id)) {
 				return PostResult.ChainDepthExceeded
 			}
@@ -129,16 +132,24 @@ class CommentService(
 
 		val normalizedLang = detector.detect(body, normalizeLang(lang)) ?: existing.lang
 		val context = ContentFilter.Context(editor.id, FilterSurface.COMMENT)
-		when (val verdict = filter.check(body, normalizedLang, context)) {
+		val verdict = filter.check(body, normalizedLang, context)
+		when (verdict) {
 			is ContentFilter.Verdict.Blocked ->
 				return EditResult.Blocked(verdict.term, verdict.tier, verdict.blockId)
 
 			// An edit that trips `watch` is flagged the same way a new comment would be.
-			is ContentFilter.Verdict.Flagged -> repository.flag(commentId, verdict.term)
+			is ContentFilter.Verdict.Flagged -> Unit
 			ContentFilter.Verdict.Allowed -> Unit
 		}
 
-		repository.update(commentId, body, normalizedLang)
+		val cutoff = OffsetDateTime.ofInstant(
+			clock.instant().minus(Duration.ofMinutes(CommentRules.EDIT_WINDOW_MINUTES)),
+			java.time.ZoneOffset.UTC,
+		)
+		if (!repository.updateIfEditable(commentId, editor.id, cutoff, body, normalizedLang)) {
+			return EditResult.NotEditable
+		}
+		if (verdict is ContentFilter.Verdict.Flagged) repository.flag(commentId, verdict.term)
 		val updated = requireNotNull(repository.find(commentId))
 		return EditResult.Edited(
 			CommentView(
@@ -151,12 +162,7 @@ class CommentService(
 	}
 
 	/** A user deleting their own comment. Leaves a tombstone so replies underneath survive. */
-	fun delete(commentId: Long, userId: String): Boolean {
-		val existing = repository.find(commentId) ?: return false
-		if (existing.userId != userId) return false
-		repository.setState(commentId, CommentState.REMOVED)
-		return true
-	}
+	fun delete(commentId: Long, userId: String): Boolean = repository.tombstoneByOwner(commentId, userId)
 
 	/**
 	 * @param lang show only threads in this language. Languages are deliberately not unioned: a wall
@@ -179,9 +185,13 @@ class CommentService(
 			lang = normalizeLang(lang),
 			sortByScore = sortByScore,
 			limit = limit.coerceIn(1, CommentRules.MAX_PAGE_SIZE),
-			offset = offset.coerceAtLeast(0),
+			offset = offset.coerceIn(0, CommentRules.MAX_OFFSET),
 		)
-		val all = roots + repository.descendantsOf(roots.map { it.id }, viewer.id)
+		val all = roots + repository.descendantsOf(
+			roots.map { it.id },
+			viewer.id,
+			CommentRules.MAX_THREAD_COMMENTS - roots.size,
+		)
 		return decorate(all, viewer)
 	}
 
@@ -189,8 +199,8 @@ class CommentService(
 	 * Visible comments per language, so the app can offer "also 12 in Spanish" rather than pretending
 	 * the other languages do not exist.
 	 */
-	fun countsByLanguage(workId: Long, chapterId: Long?): Map<String, Int> =
-		repository.countPerLanguage(workId, chapterId)
+	fun countsByLanguage(workId: Long, chapterId: Long?, viewerId: String? = null): Map<String, Int> =
+		repository.countPerLanguage(workId, chapterId, viewerId)
 
 	fun view(commentId: Long, viewer: Identity): CommentView? {
 		val comment = repository.find(commentId) ?: return null
@@ -198,7 +208,8 @@ class CommentService(
 		return decorate(listOf(comment), viewer).firstOrNull()
 	}
 
-	fun count(workId: Long, chapterId: Long?): Int = repository.countForWork(workId, chapterId)
+	fun count(workId: Long, chapterId: Long?, viewerId: String? = null): Int =
+		repository.countForWork(workId, chapterId, viewerId)
 
 	/**
 	 * @param value +1, -1, or 0 to withdraw.
@@ -215,8 +226,7 @@ class CommentService(
 		// faith - and answering at all would confirm it exists.
 		if (comment.state == CommentState.SHADOWED) return null
 
-		repository.setVote(commentId, voter.id, value)
-		repository.recountVotes(commentId)
+		repository.setVoteAndRecount(commentId, voter.id, value)
 		return view(commentId, voter)
 	}
 
@@ -256,7 +266,7 @@ class CommentService(
 			val anonymous = comment.state == CommentState.REMOVED || author == null
 			CommentView(
 				comment = if (anonymous) comment.copy(body = "") else comment,
-				authorName = if (anonymous || author == null) "" else Nicknames.display(names[author], author),
+				authorName = if (anonymous) "" else Nicknames.display(names[author], author!!),
 				myVote = votes[comment.id] ?: 0,
 				isMine = author != null && author == viewer.id,
 			)

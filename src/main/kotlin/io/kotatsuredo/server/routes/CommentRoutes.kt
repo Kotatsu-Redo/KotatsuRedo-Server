@@ -5,6 +5,7 @@ import io.kotatsuredo.server.ApiException
 import io.kotatsuredo.server.auth.RateLimiter
 import io.kotatsuredo.server.auth.enforceLimit
 import io.kotatsuredo.server.auth.requireCaller
+import io.kotatsuredo.server.auth.reserveLimits
 import io.kotatsuredo.server.comments.CommentRules
 import io.kotatsuredo.server.comments.CommentService
 import io.kotatsuredo.server.comments.CommentState
@@ -208,11 +209,12 @@ fun Route.commentRoutes(
 				// curious reader asking without one should not silently get a filtered view.
 				lang = call.request.queryParameters["lang"],
 			)
+			val countsByLanguage = comments.countsByLanguage(workId, chapterId, caller.identity.id)
 			call.respond(
 				CommentPageResponse(
 					comments = page.map { it.toDto() },
-					total = comments.count(workId, chapterId),
-					byLanguage = comments.countsByLanguage(workId, chapterId),
+					total = countsByLanguage.values.sum(),
+					byLanguage = countsByLanguage,
 					rules = CommentRulesDto(minLength = comments.minLength),
 				),
 			)
@@ -224,13 +226,12 @@ fun Route.commentRoutes(
 			val parentId = body.parentId?.toLongOrNull()
 			if (body.parentId != null && parentId == null) throw ApiException(ApiError.BadRequest("parent_id"))
 
-			call.enforceLimit(limiter, RateLimiter.Bucket.COMMENTS, caller.tier, caller.identity.id)
-			call.enforceLimit(limiter, RateLimiter.Bucket.COMMENTS_DAILY, caller.tier, caller.identity.id)
-			if (parentId != null) {
-				// A separate, tighter bucket: the hourly comment allowance is meant to be spent across
-				// the app, not on one argument.
-				call.enforceLimit(limiter, RateLimiter.Bucket.THREAD_REPLIES, caller.tier, caller.identity.id)
+			val buckets = buildList {
+				add(RateLimiter.Bucket.COMMENTS)
+				add(RateLimiter.Bucket.COMMENTS_DAILY)
+				if (parentId != null) add(RateLimiter.Bucket.THREAD_REPLIES)
 			}
+			val reservation = call.reserveLimits(limiter, buckets, caller.tier, caller.identity.id)
 
 			val workId = call.resolveWorkId(works)
 			val result = comments.post(
@@ -243,15 +244,28 @@ fun Route.commentRoutes(
 				lang = body.lang,
 			)
 			when (result) {
-				is PostResult.Posted -> call.respond(HttpStatusCode.Created, result.view.toDto())
-				is PostResult.TooShort -> throw ApiException(ApiError.TooShort(result.minimum))
-				PostResult.TooLong -> throw ApiException(ApiError.BadRequest("body"))
-				is PostResult.Blocked -> throw ApiException(
-					ApiError.FilterBlocked(result.term, result.tier, rulesUrl, result.blockId?.toString()),
-				)
-
-				PostResult.ChainDepthExceeded -> throw ApiException(ApiError.ChainDepthExceeded)
-				PostResult.ParentNotFound -> throw ApiException(ApiError.NotFound)
+				is PostResult.Posted -> {
+					reservation.commit()
+					call.respond(HttpStatusCode.Created, result.view.toDto())
+				}
+				is PostResult.Blocked -> {
+					// A block writes an audit row and returns a dispute token. Charge it like a post so a
+					// caller cannot turn rejected text into an unbounded database-write endpoint.
+					reservation.commit()
+					throw ApiException(
+						ApiError.FilterBlocked(result.term, result.tier, rulesUrl, result.blockId?.toString()),
+					)
+				}
+				else -> {
+					reservation.refund()
+					when (result) {
+						is PostResult.TooShort -> throw ApiException(ApiError.TooShort(result.minimum))
+						PostResult.TooLong -> throw ApiException(ApiError.BadRequest("body"))
+						PostResult.ChainDepthExceeded -> throw ApiException(ApiError.ChainDepthExceeded)
+						PostResult.ParentNotFound -> throw ApiException(ApiError.NotFound)
+						is PostResult.Posted, is PostResult.Blocked -> error("handled above")
+					}
+				}
 			}
 		}
 	}
@@ -260,6 +274,7 @@ fun Route.commentRoutes(
 
 		patch {
 			val caller = call.requireCaller(identities)
+			call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 			val commentId = call.commentId()
 			val body = call.receive<EditCommentRequest>()
 
@@ -279,6 +294,7 @@ fun Route.commentRoutes(
 
 		delete {
 			val caller = call.requireCaller(identities)
+			call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 			if (!comments.delete(call.commentId(), caller.identity.id)) {
 				throw ApiException(ApiError.NotFound)
 			}

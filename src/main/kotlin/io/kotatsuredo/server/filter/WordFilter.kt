@@ -212,11 +212,13 @@ class WordFilter(
 			// implausible. `жид` is a genuine slur and three characters, and it sits inside `жидкость`
 			// - the ordinary Russian for "liquid". Whole-token matching still blocks it standing
 			// alone, which is how it is actually used.
-			val match = current.severe.findFirst(folded) ?: continue
-			if (match.length < MIN_SEVERE_SUBSTRING_LENGTH) continue
-			if (blocksToken(current, folded, match.length)) {
-				return FilterHit(match.term, FilterTier.SEVERE, current.severeRules[match.term], lang)
-			}
+			current.severe.findAll(folded)
+				.firstOrNull { match ->
+					match.length >= MIN_SEVERE_SUBSTRING_LENGTH && blocksToken(current, folded, match.length)
+				}
+				?.let { match ->
+					return FilterHit(match.term, FilterTier.SEVERE, current.severeRules[match.term], lang)
+				}
 		}
 
 		// Separator evasion: `f u c k` is four tokens and one word. Windows are bounded to a few short

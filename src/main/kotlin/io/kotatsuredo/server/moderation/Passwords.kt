@@ -29,10 +29,12 @@ object Passwords {
 	const val ITERATIONS = 600_000
 
 	const val MIN_LENGTH = 12
+	const val MAX_LENGTH = 1024
 
 	private val random = SecureRandom()
 	private val encoder: Base64.Encoder = Base64.getEncoder().withoutPadding()
 	private val decoder: Base64.Decoder = Base64.getDecoder()
+	private val dummyHash: String by lazy { hash("not-a-real-moderator-password") }
 
 	fun hash(password: String, iterations: Int = ITERATIONS): String {
 		val salt = ByteArray(SALT_BYTES).also(random::nextBytes)
@@ -57,6 +59,10 @@ object Passwords {
 		val expected = runCatching { decoder.decode(parts[3]) }.getOrNull() ?: return false
 		return MessageDigest.isEqual(derive(password, salt, iterations), expected)
 	}
+
+	/** Performs the same KDF work for an unknown account as for a real one. */
+	fun verifyOrDummy(password: String, stored: String?): Boolean =
+		verify(password, stored ?: dummyHash) && stored != null
 
 	private fun derive(password: String, salt: ByteArray, iterations: Int): ByteArray {
 		val spec = PBEKeySpec(password.toCharArray(), salt, iterations, KEY_BITS)

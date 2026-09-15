@@ -22,7 +22,7 @@ class RatingServiceTest {
 	private val service by lazy { RatingService(repository) }
 	private val works by lazy { WorkRepository(PostgresTestBase.database.source) }
 	private val identities by lazy {
-		IdentityService(IdentityRepository(PostgresTestBase.database.exposed), DevicePepper.of("test"))
+		IdentityService(IdentityRepository(PostgresTestBase.database.exposed, PostgresTestBase.database.source), DevicePepper.of("test"))
 	}
 
 	@BeforeTest

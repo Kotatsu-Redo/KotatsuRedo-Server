@@ -29,6 +29,13 @@ data class WorkSeed(
 	val externalIds: Map<String, String>,
 )
 
+data class WorkCreationResult(
+	val workId: Long,
+	val created: Boolean,
+	/** True when another request had already claimed this exact source alias. */
+	val aliasAlreadyExisted: Boolean,
+)
+
 class WorkRepository(private val dataSource: DataSource) {
 
 	/**
@@ -55,7 +62,10 @@ class WorkRepository(private val dataSource: DataSource) {
 						"UPDATE work SET canonical_title = ?, year = ?, content_type = ?, nsfw = ? WHERE id = ?",
 					).use { statement ->
 						statement.setString(1, seed.canonicalTitle)
-						seed.year?.let { statement.setShort(2, it.toShort()) } ?: statement.setNull(2, Types.SMALLINT)
+						seed.year?.let {
+							require(WorkLimits.isValidYear(it)) { "work year is outside the supported range" }
+							statement.setShort(2, it.toShort())
+						} ?: statement.setNull(2, Types.SMALLINT)
 						statement.setString(3, seed.contentType)
 						statement.setBoolean(4, seed.nsfw)
 						statement.setLong(5, id)
@@ -66,7 +76,10 @@ class WorkRepository(private val dataSource: DataSource) {
 					Statement.RETURN_GENERATED_KEYS,
 				).use { statement ->
 					statement.setString(1, seed.canonicalTitle)
-					seed.year?.let { statement.setShort(2, it.toShort()) } ?: statement.setNull(2, Types.SMALLINT)
+					seed.year?.let {
+						require(WorkLimits.isValidYear(it)) { "work year is outside the supported range" }
+						statement.setShort(2, it.toShort())
+					} ?: statement.setNull(2, Types.SMALLINT)
 					statement.setString(3, seed.contentType)
 					statement.setBoolean(4, seed.nsfw)
 					statement.executeUpdate()
@@ -120,7 +133,7 @@ class WorkRepository(private val dataSource: DataSource) {
 		connection.prepareStatement(
 			"""
 			INSERT INTO work_external_id (provider, external_id, work_id) VALUES (?, ?, ?)
-			ON CONFLICT (provider, external_id) DO UPDATE SET work_id = EXCLUDED.work_id
+			ON CONFLICT (provider, external_id) DO NOTHING
 			""".trimIndent(),
 		).use { statement ->
 			ids.forEach { (provider, externalId) ->
@@ -130,6 +143,118 @@ class WorkRepository(private val dataSource: DataSource) {
 				statement.addBatch()
 			}
 			statement.executeBatch()
+		}
+	}
+
+	/**
+	 * Atomically claims a new source alias and all data belonging to its work.
+	 *
+	 * Misses are rare after warm-up, so a single transaction-level advisory lock is deliberately
+	 * simpler and safer than leaving orphan works when two different aliases discover the same
+	 * catalogue id concurrently. Existing alias hits never enter this path.
+	 */
+	fun createAndLinkWork(
+		canonicalTitle: String,
+		year: Int?,
+		contentType: String?,
+		nsfw: Boolean,
+		titles: List<TitleToStore>,
+		externalIds: Map<String, String>,
+		source: String,
+		sourceKey: String,
+		confidence: Double,
+		evidence: String,
+		coverPHash: Long?,
+	): WorkCreationResult = dataSource.connection.use connectionUse@ { connection ->
+		connection.autoCommit = false
+		try {
+			connection.prepareStatement("SELECT pg_advisory_xact_lock(?)").use { statement ->
+				statement.setLong(1, WORK_CREATION_LOCK)
+				statement.execute()
+			}
+
+			val existingAlias = connection.prepareStatement(
+				"SELECT work_id FROM work_alias WHERE source = ? AND source_key = ?",
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
+			}
+			if (existingAlias != null) {
+				connection.commit()
+				return@connectionUse WorkCreationResult(existingAlias, created = false, aliasAlreadyExisted = true)
+			}
+
+			// External ids are stored as metadata, never used here as a selector. A catalogue adapter can
+			// be wrong, and client-supplied ids are explicitly untrusted; silently joining two global
+			// comment/rating histories is a much worse failure than leaving a duplicate for review.
+			val workId = connection.prepareStatement(
+				"INSERT INTO work (canonical_title, year, content_type, nsfw) VALUES (?, ?, ?, ?)",
+				Statement.RETURN_GENERATED_KEYS,
+			).use { statement ->
+				statement.setString(1, canonicalTitle)
+				year?.let {
+					require(WorkLimits.isValidYear(it)) { "work year is outside the supported range" }
+					statement.setShort(2, it.toShort())
+				} ?: statement.setNull(2, Types.SMALLINT)
+				statement.setString(3, contentType)
+				statement.setBoolean(4, nsfw)
+				statement.executeUpdate()
+				statement.generatedKeys.use { keys -> keys.next(); keys.getLong(1) }
+			}
+
+			storeTitles(connection, workId, titles)
+			storeExternalIds(connection, workId, externalIds)
+			val aliasInserted = connection.prepareStatement(
+				"""
+				INSERT INTO work_alias (source, source_key, work_id, confidence, evidence, is_verified)
+				VALUES (?, ?, ?, ?, ?, TRUE)
+				ON CONFLICT (source, source_key) DO NOTHING
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setLong(3, workId)
+				statement.setDouble(4, confidence)
+				statement.setString(5, evidence)
+				statement.executeUpdate() > 0
+			}
+			if (!aliasInserted) {
+				// Another resolution path claimed the alias after our initial check. Roll back every
+				// provisional row and return its winner instead of leaking an orphan or a 500.
+				val winner = connection.prepareStatement(
+					"SELECT work_id FROM work_alias WHERE source = ? AND source_key = ?",
+				).use { statement ->
+					statement.setString(1, source)
+					statement.setString(2, sourceKey)
+					statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
+				}
+				connection.rollback()
+				return@connectionUse WorkCreationResult(
+					checkNotNull(winner) { "conflicting alias disappeared" },
+					created = false,
+					aliasAlreadyExisted = true,
+				)
+			}
+			coverPHash?.let { phash ->
+				connection.prepareStatement(
+					"""
+					INSERT INTO work_cover_hash (work_id, phash, source) VALUES (?, ?, ?)
+					ON CONFLICT (work_id, source) DO UPDATE SET phash = EXCLUDED.phash
+					""".trimIndent(),
+				).use { statement ->
+					statement.setLong(1, workId)
+					statement.setLong(2, phash)
+					statement.setString(3, source)
+					statement.executeUpdate()
+				}
+			}
+
+			connection.commit()
+			WorkCreationResult(workId, created = true, aliasAlreadyExisted = false)
+		} catch (e: Exception) {
+			connection.rollback()
+			throw e
 		}
 	}
 
@@ -226,6 +351,156 @@ class WorkRepository(private val dataSource: DataSource) {
 			}
 		}
 
+	/** Only corroborated aliases may short-circuit resolution for every account. */
+	fun findVerifiedAlias(source: String, sourceKey: String): Long? =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"SELECT work_id FROM work_alias WHERE source = ? AND source_key = ? AND is_verified",
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
+			}
+		}
+
+	fun observedAlias(source: String, sourceKey: String, userId: String, titleKeys: Collection<String>): Long? {
+		if (titleKeys.isEmpty()) return null
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT work_id FROM work_alias_observation
+				WHERE source = ? AND source_key = ? AND user_id = ? AND title_keys && ?::text[]
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setString(3, userId)
+				statement.setArray(4, connection.createArrayOf("text", titleKeys.distinct().toTypedArray()))
+				statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
+			}
+		}
+	}
+
+	/** Pending claims sharing a normalized title, ordered by independent support. */
+	fun matchingObservedAliases(source: String, sourceKey: String, titleKeys: Collection<String>): List<Long> {
+		if (titleKeys.isEmpty()) return emptyList()
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT work_id
+				FROM work_alias_observation
+				WHERE source = ? AND source_key = ? AND title_keys && ?::text[]
+				GROUP BY work_id
+				ORDER BY count(*) DESC, work_id
+				LIMIT 20
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setArray(3, connection.createArrayOf("text", titleKeys.distinct().toTypedArray()))
+				statement.executeQuery().use { rows ->
+					buildList { while (rows.next()) add(rows.getLong(1)) }
+				}
+			}
+		}
+	}
+
+	/**
+	 * Records one account's claim and promotes it only after independent settled-account agreement.
+	 * A previously verified, conflicting alias is never replaced automatically.
+	 */
+	fun observeAlias(
+		source: String,
+		sourceKey: String,
+		userId: String,
+		workId: Long,
+		titleKeys: Collection<String>,
+	): Boolean = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			val verified = observeAlias(connection, source, sourceKey, userId, workId, titleKeys)
+			connection.commit()
+			verified
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
+
+	private fun observeAlias(
+		connection: java.sql.Connection,
+		source: String,
+		sourceKey: String,
+		userId: String,
+		workId: Long,
+		titleKeys: Collection<String>,
+	): Boolean {
+			// Serialise the count-and-promote decision for this source key. Without this lock, the
+			// second and third observations can each see only two committed rows and both skip promotion.
+			connection.prepareStatement("SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))").use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.execute()
+			}
+			connection.prepareStatement(
+				"""
+				INSERT INTO work_alias_observation (source, source_key, user_id, work_id, title_keys)
+				VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT (source, source_key, user_id) DO UPDATE SET
+					work_id = EXCLUDED.work_id, title_keys = EXCLUDED.title_keys, updated_at = now()
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setString(3, userId)
+				statement.setLong(4, workId)
+				statement.setArray(5, connection.createArrayOf("text", titleKeys.distinct().toTypedArray()))
+				statement.executeUpdate()
+			}
+			val agreement = connection.prepareStatement(
+				"""
+				SELECT count(*)
+				FROM work_alias_observation observation
+				JOIN user_trust trust ON trust.user_id = observation.user_id
+				JOIN app_user account ON account.id = observation.user_id
+				WHERE observation.source = ? AND observation.source_key = ? AND observation.work_id = ?
+				  AND observation.title_keys && ?::text[] AND trust.tier >= ?
+				  AND NOT account.is_banned AND NOT account.is_shadowbanned
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setLong(3, workId)
+				statement.setArray(4, connection.createArrayOf("text", titleKeys.distinct().toTypedArray()))
+				statement.setInt(5, io.kotatsuredo.server.identity.TrustTier.ESTABLISHED.level)
+				statement.executeQuery().use { rows -> rows.next(); rows.getInt(1) }
+			}
+			val verified = agreement >= ALIAS_AGREEMENT_REQUIRED
+			if (verified) {
+				connection.prepareStatement(
+					"""
+					INSERT INTO work_alias (source, source_key, work_id, confidence, evidence, is_verified)
+					VALUES (?, ?, ?, ?, 'account_quorum', TRUE)
+					ON CONFLICT (source, source_key) DO UPDATE SET
+						work_id = EXCLUDED.work_id,
+						confidence = EXCLUDED.confidence,
+						evidence = EXCLUDED.evidence,
+						is_verified = TRUE
+					WHERE NOT work_alias.is_verified
+					""".trimIndent(),
+				).use { statement ->
+					statement.setString(1, source)
+					statement.setString(2, sourceKey)
+					statement.setLong(3, workId)
+					statement.setDouble(4, ResolutionMethod.OBSERVATION.confidence)
+					statement.executeUpdate()
+				}
+			}
+			return verified
+	}
+
 	/**
 	 * A scrobbler link is the strongest anchor there is, so any one of them hitting is enough. Each
 	 * provider is a separate cheap indexed lookup rather than one clever query.
@@ -249,15 +524,16 @@ class WorkRepository(private val dataSource: DataSource) {
 	}
 
 	/** Exact key hit. The hot path once a work knows the renderings sources actually use. */
-	fun findByTitleKeys(keys: Collection<String>): List<Long> {
+	fun findByTitleKeys(keys: Collection<String>, minimumWeight: Double = 0.0): List<Long> {
 		if (keys.isEmpty()) return emptyList()
 		val placeholders = keys.joinToString(",") { "?" }
 		return dataSource.connection.use { connection ->
 			connection.prepareStatement(
 				"SELECT DISTINCT t.work_id FROM work_title t $ACTIVE_WORK " +
-					"WHERE t.title_norm IN ($placeholders)",
+					"WHERE t.weight >= ? AND t.title_norm IN ($placeholders)",
 			).use { statement ->
-				keys.forEachIndexed { index, key -> statement.setString(index + 1, key) }
+				statement.setDouble(1, minimumWeight)
+				keys.forEachIndexed { index, key -> statement.setString(index + 2, key) }
 				statement.executeQuery().use { rows ->
 					buildList { while (rows.next()) add(rows.getLong(1)) }
 				}
@@ -269,7 +545,57 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * Trigram candidates, ranked. Uses the pg_trgm GIN index via the `%` operator rather than
 	 * computing similarity over every row.
 	 */
-	fun findSimilarTitles(key: String, threshold: Double, limit: Int = 20): List<Pair<Long, Double>> =
+	fun findSimilarTitles(
+		key: String,
+		threshold: Double,
+		limit: Int = 20,
+		minimumWeight: Double = 0.0,
+	): List<Pair<Long, Double>> = findSimilarTitles(listOf(key), threshold, limit, minimumWeight)
+
+	/**
+	 * Resolves all fuzzy keys with one checkout and one statement. The lateral subquery preserves the
+	 * per-key candidate limit and lets PostgreSQL use the pg_trgm index for each input key.
+	 */
+	fun findSimilarTitles(
+		keys: Collection<String>,
+		threshold: Double,
+		limitPerKey: Int = 20,
+		minimumWeight: Double = 0.0,
+	): List<Pair<Long, Double>> {
+		if (keys.isEmpty()) return emptyList()
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement("SELECT set_limit(?::real)").use {
+				it.setDouble(1, threshold)
+				it.execute()
+			}
+			connection.prepareStatement(
+				"""
+				SELECT candidate.work_id, MAX(candidate.sim) AS sim
+				FROM unnest(?::text[]) AS input(key)
+				CROSS JOIN LATERAL (
+					SELECT t.work_id, MAX(similarity(t.title_norm, input.key)) AS sim
+					FROM work_title t $ACTIVE_WORK
+					WHERE t.weight >= ? AND t.title_norm % input.key
+					GROUP BY t.work_id
+					ORDER BY sim DESC
+					LIMIT ?
+				) candidate
+				GROUP BY candidate.work_id
+				ORDER BY sim DESC
+				""".trimIndent(),
+			).use { statement ->
+				statement.setArray(1, connection.createArrayOf("text", keys.distinct().toTypedArray()))
+				statement.setDouble(2, minimumWeight)
+				statement.setInt(3, limitPerKey)
+				statement.executeQuery().use { rows ->
+					return@use buildList { while (rows.next()) add(rows.getLong(1) to rows.getDouble(2)) }
+				}
+			}
+		}
+	}
+
+	@Deprecated("Use the batched overload")
+	private fun findSimilarTitlesOneAtATime(key: String, threshold: Double, limit: Int): List<Pair<Long, Double>> =
 		dataSource.connection.use { connection ->
 			// set_limit takes `real`, so the cast is required; it also sets the threshold the `%`
 			// operator uses, and it is session-scoped - hence doing it on this same connection.
@@ -338,7 +664,81 @@ class WorkRepository(private val dataSource: DataSource) {
 			}
 	}
 
+	fun metadataOf(workIds: Collection<Long>): Map<Long, Triple<String, Int?, String?>> {
+		if (workIds.isEmpty()) return emptyMap()
+		val placeholders = workIds.joinToString(",") { "?" }
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"SELECT id, canonical_title, year, content_type FROM work " +
+					"WHERE merged_into IS NULL AND id IN ($placeholders)",
+			).use { statement ->
+				workIds.forEachIndexed { index, id -> statement.setLong(index + 1, id) }
+				statement.executeQuery().use { rows ->
+					buildMap {
+						while (rows.next()) {
+							val year = rows.getInt(3).takeUnless { rows.wasNull() }
+							put(rows.getLong(1), Triple(rows.getString(2), year, rows.getString(4)))
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// -- writes ----------------------------------------------------------------------------------
+
+	/** Creates a provisional work and its account observation as one all-or-nothing unit. */
+	fun createObservedWork(
+		canonicalTitle: String,
+		year: Int?,
+		contentType: String?,
+		nsfw: Boolean,
+		titles: List<TitleToStore>,
+		externalIds: Map<String, String>,
+		source: String,
+		sourceKey: String,
+		reporterId: String,
+		titleKeys: Collection<String>,
+		coverPHash: Long?,
+	): Long = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			val workId = connection.prepareStatement(
+				"INSERT INTO work (canonical_title, year, content_type, nsfw) VALUES (?, ?, ?, ?)",
+				Statement.RETURN_GENERATED_KEYS,
+			).use { statement ->
+				statement.setString(1, canonicalTitle)
+				year?.let {
+					require(WorkLimits.isValidYear(it)) { "work year is outside the supported range" }
+					statement.setShort(2, it.toShort())
+				} ?: statement.setNull(2, Types.SMALLINT)
+				statement.setString(3, contentType)
+				statement.setBoolean(4, nsfw)
+				statement.executeUpdate()
+				statement.generatedKeys.use { keys -> keys.next(); keys.getLong(1) }
+			}
+			storeTitles(connection, workId, titles)
+			storeExternalIds(connection, workId, externalIds)
+			coverPHash?.let { phash ->
+				connection.prepareStatement(
+					"INSERT INTO work_cover_hash (work_id, phash, source) VALUES (?, ?, ?)",
+				).use { statement ->
+					statement.setLong(1, workId)
+					statement.setLong(2, phash)
+					statement.setString(3, source)
+					statement.executeUpdate()
+				}
+			}
+			observeAlias(connection, source, sourceKey, reporterId, workId, titleKeys)
+			connection.commit()
+			workId
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
 
 	fun createWork(canonicalTitle: String, year: Int?, contentType: String?, nsfw: Boolean): Long =
 		dataSource.connection.use { connection ->
@@ -347,7 +747,10 @@ class WorkRepository(private val dataSource: DataSource) {
 				Statement.RETURN_GENERATED_KEYS,
 			).use { statement ->
 				statement.setString(1, canonicalTitle)
-				year?.let { statement.setShort(2, it.toShort()) } ?: statement.setNull(2, Types.SMALLINT)
+				year?.let {
+					require(WorkLimits.isValidYear(it)) { "work year is outside the supported range" }
+					statement.setShort(2, it.toShort())
+				} ?: statement.setNull(2, Types.SMALLINT)
 				statement.setString(3, contentType)
 				statement.setBoolean(4, nsfw)
 				statement.executeUpdate()
@@ -365,16 +768,25 @@ class WorkRepository(private val dataSource: DataSource) {
 		dataSource.connection.use { connection -> storeExternalIds(connection, workId, ids) }
 	}
 
-	fun linkAlias(source: String, sourceKey: String, workId: Long, confidence: Double, evidence: String) {
+	fun linkAlias(source: String, sourceKey: String, workId: Long, confidence: Double, evidence: String): Long =
 		dataSource.connection.use { connection ->
 			connection.prepareStatement(
 				"""
-				INSERT INTO work_alias (source, source_key, work_id, confidence, evidence)
-				VALUES (?, ?, ?, ?, ?)
+				WITH linked AS (
+				INSERT INTO work_alias (source, source_key, work_id, confidence, evidence, is_verified)
+				VALUES (?, ?, ?, ?, ?, TRUE)
 				ON CONFLICT (source, source_key) DO UPDATE SET
 					work_id = EXCLUDED.work_id,
 					confidence = EXCLUDED.confidence,
-					evidence = EXCLUDED.evidence
+					evidence = EXCLUDED.evidence,
+					is_verified = TRUE
+				WHERE NOT work_alias.is_verified
+				RETURNING work_id
+				)
+				SELECT work_id FROM linked
+				UNION ALL
+				SELECT work_id FROM work_alias WHERE source = ? AND source_key = ?
+				LIMIT 1
 				""".trimIndent(),
 			).use { statement ->
 				statement.setString(1, source)
@@ -382,10 +794,14 @@ class WorkRepository(private val dataSource: DataSource) {
 				statement.setLong(3, workId)
 				statement.setDouble(4, confidence)
 				statement.setString(5, evidence)
-				statement.executeUpdate()
+				statement.setString(6, source)
+				statement.setString(7, sourceKey)
+				statement.executeQuery().use { rows ->
+					check(rows.next()) { "alias insert or lookup returned no row" }
+					rows.getLong(1)
+				}
 			}
 		}
-	}
 
 	fun storeCoverHash(workId: Long, source: String, phash: Long) {
 		dataSource.connection.use { connection ->
@@ -686,6 +1102,9 @@ class WorkRepository(private val dataSource: DataSource) {
 	}
 
 	private companion object {
+		const val ALIAS_AGREEMENT_REQUIRED = 5
+		/** Stable, application-specific lock id; held only while committing a newly discovered work. */
+		const val WORK_CREATION_LOCK = 0x4B52574FL
 		/** Joined into every title lookup: a merged work is a redirect, not a candidate. */
 		const val ACTIVE_WORK = "JOIN work w ON w.id = t.work_id AND w.merged_into IS NULL"
 

@@ -59,12 +59,23 @@ fun Route.telemetryRoutes(
 	post("/probes") {
 		val caller = call.requireCaller(identities)
 		val secret = call.bearerSecret() ?: throw ApiException(ApiError.Unauthorized)
-		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 
 		val body = call.receive<ProbeBatchRequest>()
 		if (body.probes.size > ProbeLimits.MAX_BATCH) {
 			throw ApiException(ApiError.BadRequest("too_many_probes"))
 		}
+		if (body.probes.asSequence().map { it.source.trim() }.distinct().count() > ProbeLimits.MAX_DISTINCT_SOURCES) {
+			throw ApiException(ApiError.BadRequest("too_many_sources"))
+		}
+		// The unit of work is a probe row, not an HTTP request. Otherwise a maximum-size batch costs the
+		// same as one probe and multiplies the effective ingestion allowance hundreds of times.
+		call.enforceLimit(
+			limiter,
+			RateLimiter.Bucket.TELEMETRY,
+			caller.tier,
+			caller.identity.id,
+			cost = maxOf(1, body.probes.size),
+		)
 
 		val probes = body.probes.mapNotNull { dto ->
 			val op = ProbeOp.parse(dto.op) ?: return@mapNotNull null

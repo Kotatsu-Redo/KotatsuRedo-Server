@@ -1,14 +1,17 @@
-# Two containers plus a TLS terminator. That is the whole deployment (PLAN.md §A).
+# Runtime API and database, a one-shot migrator, plus the TLS terminator.
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_USER: ${DATABASE_USER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-runtime-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -18,16 +21,31 @@ services:
     expose:
       - "5432"
 
-  api:
+  migrate:
     build: .
-    restart: unless-stopped
+    restart: "no"
+    command: ["migrate"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
+      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_MIGRATION_USER: ${DATABASE_MIGRATION_USER}
+      DATABASE_MIGRATION_PASSWORD: ${DATABASE_MIGRATION_PASSWORD}
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
       APP_ENV: ${APP_ENV:-production}
       PORT: ${PORT:-8787}
       HOST: 0.0.0.0
+      # The API is reachable only through Caddy in this topology, so its appended address is trusted.
+      TRUST_PROXY_HEADERS: "true"
+      SECURE_COOKIES: "true"
       DATABASE_URL: ${DATABASE_URL}
       DATABASE_USER: ${DATABASE_USER}
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}
@@ -35,10 +53,16 @@ services:
       # No default on purpose: a fallback would make every deployment's device hashes
       # interchangeable, and changing this invalidates every existing device ban.
       DEVICE_PEPPER: ${DEVICE_PEPPER}
+      MOD_TOTP_ENCRYPTION_KEY: ${MOD_TOTP_ENCRYPTION_KEY}
       RULES_URL: ${RULES_URL:-/rules}
       # Tunable without a rebuild: the app reads the limit off every comment page rather than
       # holding its own copy, so changing this and restarting is the whole procedure.
       COMMENT_MIN_LENGTH: ${COMMENT_MIN_LENGTH:-10}
+      # Comments per hour, by trust tier. Read straight from the environment by RateLimiter, so
+      # raising them is an edit here and a restart.
+      RATE_COMMENTS_NEW: ${RATE_COMMENTS_NEW:-5}
+      RATE_COMMENTS_NORMAL: ${RATE_COMMENTS_NORMAL:-20}
+      RATE_COMMENTS_ESTABLISHED: ${RATE_COMMENTS_ESTABLISHED:-40}
       # The first-moderator bootstrap. Empty by default and empty is the same as unset, because
       # Config trims blanks - so an unclaimed panel needs these set, and a claimed one does not care.
       MOD_BOOTSTRAP_USERNAME: ${MOD_BOOTSTRAP_USERNAME:-}
@@ -47,7 +71,7 @@ services:
       - "${PORT:-8787}"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: unless-stopped
     depends_on:
       - api

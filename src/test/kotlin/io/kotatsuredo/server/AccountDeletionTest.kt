@@ -32,13 +32,11 @@ class AccountDeletionTest {
 	private val source by lazy { PostgresTestBase.database.source }
 	private val comments by lazy { CommentRepository(source) }
 	private val service by lazy { CommentService(comments) }
-	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed) }
+	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed, source) }
 	private val identities by lazy {
 		IdentityService(
 			repository = identityRepository,
 			pepper = DevicePepper.of("test"),
-			comments = comments,
-			ratings = ratings,
 		)
 	}
 	private val works by lazy { WorkRepository(source) }

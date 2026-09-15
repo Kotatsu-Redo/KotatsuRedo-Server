@@ -39,7 +39,7 @@ class KitsuCatalogue(
 		val body = fetcher.get(url) ?: return null
 
 		return runCatching { parse(body, title, year) }
-			.onFailure { log.warn("Failed to parse Kitsu response for '{}'", title, it) }
+			.onFailure { log.warn("Failed to parse Kitsu response", it) }
 			.getOrNull()
 	}
 
@@ -51,11 +51,13 @@ class KitsuCatalogue(
 		val mappingsById = root["included"]?.jsonArray.orEmpty()
 			.mapNotNull { it.jsonObject.takeIf { obj -> obj.str("type") == "mappings" } }
 			.mapNotNull { mapping ->
+				val mappingId = mapping.str("id") ?: return@mapNotNull null
 				val attrs = mapping["attributes"]?.jsonObject ?: return@mapNotNull null
 				val site = attrs.str("externalSite") ?: return@mapNotNull null
 				val id = attrs.str("externalId") ?: return@mapNotNull null
-				site to id
+				mappingId to (site to id)
 			}
+			.toMap()
 
 		val wantedKeys = TitleNormalizer.keys(wantedTitle)
 
@@ -71,7 +73,7 @@ class KitsuCatalogue(
 		}
 	}
 
-	private fun JsonObject.toRecord(mappings: List<Pair<String, String>>): CatalogueRecord? {
+	private fun JsonObject.toRecord(mappings: Map<String, Pair<String, String>>): CatalogueRecord? {
 		val attributes = this["attributes"]?.jsonObject ?: return null
 		val canonical = attributes.str("canonicalTitle") ?: return null
 
@@ -96,7 +98,12 @@ class KitsuCatalogue(
 			contentType = attributes.str("subtype"),
 			nsfw = attributes["nsfw"]?.jsonPrimitive?.contentOrNull == "true",
 			externalIds = buildMap {
-				mappings.forEach { (site, id) ->
+				val mappingIds = this@toRecord["relationships"]?.jsonObject
+					?.get("mappings")?.jsonObject
+					?.get("data")?.jsonArray
+					.orEmpty()
+					.mapNotNull { it.jsonObject.str("id") }
+				mappingIds.mapNotNull(mappings::get).forEach { (site, id) ->
 					when {
 						site.startsWith("myanimelist") -> put("mal", id)
 						site.startsWith("anilist") -> put("anilist", id)

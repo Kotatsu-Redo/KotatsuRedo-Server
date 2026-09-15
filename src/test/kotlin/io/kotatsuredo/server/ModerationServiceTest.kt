@@ -10,6 +10,7 @@ import io.kotatsuredo.server.identity.HelloOutcome
 import io.kotatsuredo.server.identity.Identity
 import io.kotatsuredo.server.identity.IdentityRepository
 import io.kotatsuredo.server.identity.IdentityService
+import io.kotatsuredo.server.identity.sha256
 import io.kotatsuredo.server.moderation.EnrolResult
 import io.kotatsuredo.server.moderation.LoginResult
 import io.kotatsuredo.server.moderation.ModActions
@@ -18,11 +19,16 @@ import io.kotatsuredo.server.moderation.ModerationService
 import io.kotatsuredo.server.moderation.Moderator
 import io.kotatsuredo.server.moderation.ModeratorRepository
 import io.kotatsuredo.server.moderation.ModeratorRole
+import io.kotatsuredo.server.moderation.PasswordChangeResult
+import io.kotatsuredo.server.moderation.Passwords
 import io.kotatsuredo.server.moderation.Totp
 import io.kotatsuredo.server.ratings.RatingRepository
 import io.kotatsuredo.server.ratings.RatingService
 import io.kotatsuredo.server.works.WorkRepository
 import java.time.Clock
+import java.time.OffsetDateTime
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -35,11 +41,11 @@ import kotlin.test.assertTrue
 class ModerationServiceTest {
 
 	private val source by lazy { PostgresTestBase.database.source }
-	private val moderators by lazy { ModeratorRepository(source) }
+	private val moderators by lazy { ModeratorRepository(source, testTotpCipher()) }
 	private val queues by lazy { ModerationQueueRepository(source) }
 	private val commentRepository by lazy { CommentRepository(source) }
 	private val comments by lazy { CommentService(commentRepository) }
-	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed) }
+	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed, source) }
 	private val works by lazy { WorkRepository(source) }
 	private val ratings by lazy { RatingService(RatingRepository(source)) }
 	private val service by lazy {
@@ -77,8 +83,9 @@ class ModerationServiceTest {
 	/** Bootstraps an admin and finishes its TOTP enrolment, which is the normal starting state. */
 	private fun enrolledAdmin(username: String = "root"): Moderator {
 		val moderator = admin(username)
-		val secret = assertIs<EnrolResult.Started>(service.startEnrolment(moderator)).secret
-		assertTrue(service.confirmEnrolment(moderator, Totp.code(secret, Totp.timeStep(now()))))
+		val login = assertIs<LoginResult.Ok>(service.login(username, "a-long-enough-password", null))
+		val secret = assertIs<EnrolResult.Started>(service.startEnrolment(moderator, login.token)).secret
+		assertTrue(service.confirmEnrolment(moderator, login.token, Totp.code(secret, Totp.timeStep(now()))))
 		return assertNotNull(moderators.find(moderator.id))
 	}
 
@@ -115,6 +122,76 @@ class ModerationServiceTest {
 	}
 
 	@Test
+	fun `totp seeds are encrypted in PostgreSQL and still usable`() {
+		val root = admin()
+		val login = assertIs<LoginResult.Ok>(service.login("root", "a-long-enough-password", null))
+		val secret = assertIs<EnrolResult.Started>(service.startEnrolment(root, login.token)).secret
+		val stored = source.connection.use { connection ->
+			connection.prepareStatement("SELECT totp_secret FROM moderator WHERE id = ?").use {
+				it.setString(1, root.id)
+				it.executeQuery().use { rows -> rows.next(); rows.getString(1) }
+			}
+		}
+
+		assertTrue(stored.startsWith("enc:v1:"))
+		assertFalse(stored.contains(secret))
+		assertEquals(secret, moderators.totpSecretOf(root.id))
+	}
+
+	@Test
+	fun `legacy plaintext totp seeds are encrypted during startup migration`() {
+		val root = admin()
+		val secret = Totp.generateSecret()
+		source.connection.use { connection ->
+			connection.prepareStatement("UPDATE moderator SET totp_secret = ? WHERE id = ?").use {
+				it.setString(1, secret)
+				it.setString(2, root.id)
+				it.executeUpdate()
+			}
+		}
+
+		assertEquals(1, moderators.encryptLegacyTotpSecrets())
+		assertEquals(secret, moderators.totpSecretOf(root.id))
+	}
+
+	@Test
+	fun `password rotation verifies both factors and closes every session`() {
+		val root = enrolledAdmin()
+		val secret = assertNotNull(moderators.totpSecretOf(root.id))
+		val token = "an-open-session"
+		val tokenHash = sha256(token.toByteArray())
+		moderators.openSession(tokenHash, root.id, OffsetDateTime.now().plusHours(1))
+
+		assertEquals(
+			PasswordChangeResult.CHANGED,
+			service.changePassword(root, "a-long-enough-password", "a-different-long-password", freshCode(secret)),
+		)
+		assertNull(moderators.findSession(tokenHash, OffsetDateTime.now()))
+		assertTrue(Passwords.verify("a-different-long-password", assertNotNull(moderators.passwordHashOf(root.id))))
+		assertFalse(Passwords.verify("a-long-enough-password", assertNotNull(moderators.passwordHashOf(root.id))))
+		assertEquals(ModActions.CHANGE_PASSWORD, service.actions(root, null, 1).single().action)
+	}
+
+	@Test
+	fun `concurrent admin demotions cannot remove the last enabled admin`() {
+		val first = enrolledAdmin("first")
+		val second = assertNotNull(service.invite(first, "second", "another-long-password", ModeratorRole.ADMIN))
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			val results = executor.invokeAll(
+				listOf(
+					Callable { service.updateModerator(first, first.id, ModeratorRole.MODERATOR, null) },
+					Callable { service.updateModerator(second, second.id, ModeratorRole.MODERATOR, null) },
+				),
+			)
+			assertEquals(1, results.count { it.get() })
+			assertEquals(1, moderators.countAdmins())
+		} finally {
+			executor.shutdownNow()
+		}
+	}
+
+	@Test
 	fun `an unknown username and a wrong password are the same answer`() {
 		admin()
 		assertEquals(LoginResult.InvalidCredentials, service.login("root", "wrong-password", null))
@@ -122,16 +199,40 @@ class ModerationServiceTest {
 	}
 
 	@Test
-	fun `a fresh account signs in without a code and can then do nothing but enrol`() {
+	fun `only the session that confirms enrolment receives MFA privilege`() {
+		val moderator = admin()
+		val earlier = assertIs<LoginResult.Ok>(service.login("root", "a-long-enough-password", null))
+		val confirming = assertIs<LoginResult.Ok>(service.login("root", "a-long-enough-password", null))
+		assertTrue(earlier.session.needsTotpEnrolment)
+		assertTrue(confirming.session.needsTotpEnrolment)
+
+		val started = assertIs<EnrolResult.Started>(service.startEnrolment(moderator, confirming.token))
+		assertEquals(
+			EnrolResult.InProgress,
+			service.startEnrolment(moderator, earlier.token),
+			"a sibling password-only session was given access to the pending seed",
+		)
+		assertTrue(
+			service.confirmEnrolment(
+				moderator,
+				confirming.token,
+				Totp.code(started.secret, Totp.timeStep(now())),
+			),
+		)
+
+		assertNull(service.authenticate(earlier.token), "a password-only sibling session survived enrolment")
+		assertFalse(assertNotNull(service.authenticate(confirming.token)).needsTotpEnrolment)
+	}
+
+	@Test
+	fun `starting enrolment twice returns the same seed`() {
 		val moderator = admin()
 		val login = assertIs<LoginResult.Ok>(service.login("root", "a-long-enough-password", null))
-		assertTrue(login.session.needsTotpEnrolment)
+		val first = assertIs<EnrolResult.Started>(service.startEnrolment(moderator, login.token))
+		val second = assertIs<EnrolResult.Started>(service.startEnrolment(moderator, login.token))
 
-		val started = assertIs<EnrolResult.Started>(service.startEnrolment(moderator))
-		assertTrue(service.confirmEnrolment(moderator, Totp.code(started.secret, Totp.timeStep(now()))))
-
-		val session = assertNotNull(service.authenticate(login.token))
-		assertFalse(session.needsTotpEnrolment)
+		assertEquals(first.secret, second.secret)
+		assertEquals(first.uri, second.uri)
 	}
 
 	@Test
@@ -189,8 +290,9 @@ class ModerationServiceTest {
 	fun `resetting two-factor sends the account back to enrolment`() {
 		val root = enrolledAdmin()
 		val other = assertNotNull(service.invite(root, "helper", "a-long-enough-password", ModeratorRole.MODERATOR))
-		val secret = assertIs<EnrolResult.Started>(service.startEnrolment(other)).secret
-		assertTrue(service.confirmEnrolment(other, Totp.code(secret, Totp.timeStep(now()))))
+		val login = assertIs<LoginResult.Ok>(service.login("helper", "a-long-enough-password", null))
+		val secret = assertIs<EnrolResult.Started>(service.startEnrolment(other, login.token)).secret
+		assertTrue(service.confirmEnrolment(other, login.token, Totp.code(secret, Totp.timeStep(now()))))
 
 		assertTrue(service.resetTotp(root, other.id))
 		assertFalse(assertNotNull(moderators.find(other.id)).totpConfirmed)
@@ -306,6 +408,22 @@ class ModerationServiceTest {
 		// The flag exists server-side and never travels: IdentityResponse has no field for it, which
 		// is the only reason the shadowban is worth anything.
 		assertFalse(reloaded.isBanned)
+	}
+
+	@Test
+	fun `changing a voter's shadowban repairs stored comment aggregates`() {
+		val root = enrolledAdmin()
+		val workId = work()
+		val commentId = comment(workId, user("author"))
+		val voter = user("voter")
+		comments.vote(commentId, voter, 1)
+		assertEquals(1, assertNotNull(commentRepository.find(commentId)).up)
+
+		assertTrue(service.setShadowban(root, voter.id, shadowbanned = true, reason = "vote manipulation"))
+		assertEquals(0, assertNotNull(commentRepository.find(commentId)).up)
+
+		assertTrue(service.setShadowban(root, voter.id, shadowbanned = false, reason = "appeal accepted"))
+		assertEquals(1, assertNotNull(commentRepository.find(commentId)).up)
 	}
 
 	@Test

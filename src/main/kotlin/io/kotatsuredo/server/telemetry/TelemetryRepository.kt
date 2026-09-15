@@ -14,9 +14,8 @@ import javax.sql.DataSource
 class TelemetryRepository(private val dataSource: DataSource) {
 
 	/**
-	 * Adds counts into the reporter's row for the day. Re-uploading the same window is additive
-	 * rather than idempotent, which is the right trade here: the client only uploads once per day,
-	 * and a lost upload matters more than a double-counted one for a single reporter among thousands.
+	 * Stores the reporter's latest daily snapshot. Retries are idempotent: they replace the same
+	 * source/op row instead of letting one device multiply its influence by uploading repeatedly.
 	 */
 	fun record(
 		probes: List<Probe>,
@@ -86,12 +85,12 @@ class TelemetryRepository(private val dataSource: DataSource) {
 				 ok, fail, empty, cf_blocked, latency_p50_ms, latency_p90_ms)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (source, day, region, op, reporter_day) DO UPDATE SET
-				ok             = source_probe_raw.ok         + EXCLUDED.ok,
-				fail           = source_probe_raw.fail       + EXCLUDED.fail,
-				empty          = source_probe_raw.empty      + EXCLUDED.empty,
-				cf_blocked     = source_probe_raw.cf_blocked + EXCLUDED.cf_blocked,
-				latency_p50_ms = GREATEST(source_probe_raw.latency_p50_ms, EXCLUDED.latency_p50_ms),
-				latency_p90_ms = GREATEST(source_probe_raw.latency_p90_ms, EXCLUDED.latency_p90_ms),
+				ok             = EXCLUDED.ok,
+				fail           = EXCLUDED.fail,
+				empty          = EXCLUDED.empty,
+				cf_blocked     = EXCLUDED.cf_blocked,
+				latency_p50_ms = EXCLUDED.latency_p50_ms,
+				latency_p90_ms = EXCLUDED.latency_p90_ms,
 				tier           = EXCLUDED.tier,
 				updated_at     = now()
 		""".trimIndent()

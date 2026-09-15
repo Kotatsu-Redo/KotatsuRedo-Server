@@ -12,6 +12,7 @@ import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.moderation.EnrolResult
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
+import io.kotatsuredo.server.moderation.OverviewRepository
 import io.kotatsuredo.server.moderation.Moderator
 import io.kotatsuredo.server.moderation.ModeratorRepository
 import io.kotatsuredo.server.moderation.ModeratorRole
@@ -19,6 +20,8 @@ import io.kotatsuredo.server.moderation.Totp
 import io.kotatsuredo.server.ratings.RatingRepository
 import io.kotatsuredo.server.ratings.RatingService
 import io.kotatsuredo.server.routes.MOD_SESSION_COOKIE
+import io.kotatsuredo.server.routes.ADMIN_CSRF_HEADER
+import io.kotatsuredo.server.routes.ADMIN_CSRF_VALUE
 import io.kotatsuredo.server.works.WorkRepository
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
@@ -52,11 +55,11 @@ import kotlin.test.assertTrue
 class AdminRoutesTest {
 
 	private val source by lazy { PostgresTestBase.database.source }
-	private val moderators by lazy { ModeratorRepository(source) }
+	private val moderators by lazy { ModeratorRepository(source, testTotpCipher()) }
 	private val queues by lazy { ModerationQueueRepository(source) }
 	private val commentRepository by lazy { CommentRepository(source) }
 	private val comments by lazy { CommentService(commentRepository) }
-	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed) }
+	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed, source) }
 	private val works by lazy { WorkRepository(source) }
 	private val moderation by lazy {
 		ModerationService(
@@ -95,6 +98,7 @@ class AdminRoutesTest {
 				works = works,
 				moderation = moderation,
 				queues = queues,
+				overviews = OverviewRepository(PostgresTestBase.database.source),
 				// A local HTTP run: a Secure cookie would never come back and nothing would work.
 				secureCookies = false,
 			)
@@ -102,8 +106,11 @@ class AdminRoutesTest {
 	}
 
 	private fun enrol(moderator: Moderator): String {
-		val secret = assertIs<EnrolResult.Started>(moderation.startEnrolment(moderator)).secret
-		assertTrue(moderation.confirmEnrolment(moderator, Totp.code(secret, step())))
+		val login = assertIs<io.kotatsuredo.server.moderation.LoginResult.Ok>(
+			moderation.login(moderator.username, "a-long-enough-password", null),
+		)
+		val secret = assertIs<EnrolResult.Started>(moderation.startEnrolment(moderator, login.token)).secret
+		assertTrue(moderation.confirmEnrolment(moderator, login.token, Totp.code(secret, step())))
 		return secret
 	}
 
@@ -114,6 +121,7 @@ class AdminRoutesTest {
 
 	private suspend fun HttpClient.login(username: String, password: String, code: String? = null): HttpResponse =
 		post("/admin/api/login") {
+			header(ADMIN_CSRF_HEADER, ADMIN_CSRF_VALUE)
 			contentType(ContentType.Application.Json)
 			setBody(
 				buildString {
@@ -134,6 +142,7 @@ class AdminRoutesTest {
 	} else {
 		post("/admin/api$path") {
 			header(HttpHeaders.Cookie, "$MOD_SESSION_COOKIE=$token")
+			header(ADMIN_CSRF_HEADER, ADMIN_CSRF_VALUE)
 			contentType(ContentType.Application.Json)
 			setBody(body)
 		}
@@ -146,6 +155,16 @@ class AdminRoutesTest {
 		assertNotNull(cookies().firstOrNull { it.name == MOD_SESSION_COOKIE }, "no session cookie").value
 
 	// -- login -------------------------------------------------------------------------------------
+
+	@Test
+	fun `admin mutations require the anti csrf header`() = testApplication {
+		setup()
+		val response = client.post("/admin/api/login") {
+			contentType(ContentType.Application.Json)
+			setBody("""{"username":"root","password":"not-the-password"}""")
+		}
+		assertEquals(HttpStatusCode.Forbidden, response.status)
+	}
 
 	@Test
 	fun `signing in returns a session in an httpOnly cookie`() = testApplication {
@@ -268,6 +287,28 @@ class AdminRoutesTest {
 	// -- the panel itself --------------------------------------------------------------------------
 
 	@Test
+	fun `the overview answers with every section the home page draws`() = testApplication {
+		setup()
+		val root = assertNotNull(moderation.bootstrapFirstAdmin("root", "a-long-enough-password"))
+		val secret = enrol(root)
+		// The next step, because confirming the enrolment just burned this one.
+		val token = client.login("root", "a-long-enough-password", Totp.code(secret, step() + 1))
+			.sessionCookie()
+
+		val body = client.withSession(token, "/overview")
+		assertEquals(HttpStatusCode.OK, body.status)
+		val text = body.bodyAsText()
+
+		// Named rather than shape-checked: the home page reads each of these, and a renamed field
+		// would leave that part of the dashboard silently blank rather than failing.
+		for (field in listOf("totals", "today", "queues", "series", "top_rules", "languages")) {
+			assertTrue(text.contains("\"$field\""), "the overview is missing `$field`: $text")
+		}
+		// Fourteen days, zero-filled, so the chart never has to guess at a gap.
+		assertEquals(14, Regex("\"day\":").findAll(text).count())
+	}
+
+	@Test
 	fun `the panel is served from the same container`() = testApplication {
 		setup()
 		val response = client.get("/admin/")
@@ -302,4 +343,3 @@ class AdminRoutesTest {
 		assertNull(client.get("/v1/health").headers["Content-Security-Policy"])
 	}
 }
-

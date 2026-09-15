@@ -63,7 +63,12 @@ data class Probe(
 object ProbeLimits {
 	/** A device has a few hundred sources at most, times three operations. */
 	const val MAX_BATCH = 512
+	const val MAX_DISTINCT_SOURCES = 200
 	const val MAX_COUNT_PER_PROBE = 100_000
 	const val MAX_LATENCY_MS = 120_000
 	const val MAX_SOURCE_NAME = 64
+	private val SOURCE_PATTERN = Regex("[A-Za-z0-9_.-]+")
+
+	fun isValidSource(source: String): Boolean =
+		source.length in 1..MAX_SOURCE_NAME && SOURCE_PATTERN.matches(source)
 }

@@ -44,7 +44,7 @@ class ExportRoutesTest {
 	private val source by lazy { PostgresTestBase.database.source }
 	private val commentRepository by lazy { CommentRepository(source) }
 	private val comments by lazy { CommentService(commentRepository) }
-	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed) }
+	private val identityRepository by lazy { IdentityRepository(PostgresTestBase.database.exposed, source) }
 	private val identities by lazy { IdentityService(identityRepository, DevicePepper.of("test")) }
 	private val works by lazy { WorkRepository(source) }
 	private val ratings by lazy { RatingService(RatingRepository(source)) }
@@ -64,7 +64,7 @@ class ExportRoutesTest {
 	}
 
 	private fun user(seed: String): Identity =
-		(identities.hello(seed, DeviceIdentifiers("dev-$seed", null)) as HelloOutcome.Ok).identity
+		(identities.hello(testSecret(seed), DeviceIdentifiers("dev-$seed", null)) as HelloOutcome.Ok).identity
 
 	private fun ApplicationTestBuilder.setup() {
 		application {
@@ -100,7 +100,7 @@ class ExportRoutesTest {
 		ratings.rate(workId, me.id, 8)
 
 		val response = client.get("/v1/identity/export") {
-			header(HttpHeaders.Authorization, "Bearer mine")
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("mine")}")
 		}
 		assertEquals(HttpStatusCode.OK, response.status)
 		// Saved as a file rather than rendered.
@@ -120,6 +120,32 @@ class ExportRoutesTest {
 	}
 
 	@Test
+	fun `the export crosses a storage page without dropping records`() = testApplication {
+		setup()
+		val client = createClient { install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) } }
+		val me = user("paged")
+		val workId = works.createWork("Long-running thread", 2020, "manga", nsfw = false)
+
+		source.connection.use { connection ->
+			connection.prepareStatement(
+				"INSERT INTO comment (work_id, origin_work_id, user_id, body) " +
+					"SELECT ?, ?, ?, 'export row ' || n FROM generate_series(1, 251) n",
+			).use {
+				it.setLong(1, workId)
+				it.setLong(2, workId)
+				it.setString(3, me.id)
+				it.executeUpdate()
+			}
+		}
+
+		val export = client.get("/v1/identity/export") {
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("paged")}")
+		}.body<ExportDto>()
+		assertEquals(251, export.comments.size)
+		assertEquals(251, export.comments.map { it.id }.distinct().size)
+	}
+
+	@Test
 	fun `the export is only ever your own data`() = testApplication {
 		setup()
 		val client = createClient { install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) } }
@@ -131,7 +157,7 @@ class ExportRoutesTest {
 		ratings.rate(workId, other.id, 10)
 
 		val export = client.get("/v1/identity/export") {
-			header(HttpHeaders.Authorization, "Bearer mine")
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("mine")}")
 		}.body<ExportDto>()
 
 		assertTrue(export.comments.isEmpty(), "someone else's comment appeared in the export")
@@ -159,7 +185,7 @@ class ExportRoutesTest {
 		commentRepository.setState(gone.id, io.kotatsuredo.server.comments.CommentState.REMOVED)
 
 		val export = client.get("/v1/identity/export") {
-			header(HttpHeaders.Authorization, "Bearer mine")
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("mine")}")
 		}.body<ExportDto>()
 
 		assertEquals(2, export.comments.size, "a removed comment was omitted from the export")
@@ -178,7 +204,7 @@ class ExportRoutesTest {
 		user("mine")
 
 		val export = client.get("/v1/identity/export") {
-			header(HttpHeaders.Authorization, "Bearer mine")
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("mine")}")
 		}.body<ExportDto>()
 
 		// Telemetry genuinely cannot be exported - its pseudonym is derived from a key the server
@@ -203,11 +229,13 @@ class ExportRoutesTest {
 		// Consistent with every other endpoint: a ban removes read access, which is the deliberate
 		// consequence of identity being all-or-nothing.
 		val response = client.get("/v1/identity/export") {
-			header(HttpHeaders.Authorization, "Bearer banned")
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("banned")}")
 		}
 		assertEquals(HttpStatusCode.Forbidden, response.status)
 		assertFalse(response.status.isSuccess())
 	}
 }
+
+private fun testSecret(seed: String): String = seed.padEnd(32, '_')
 
 private fun HttpStatusCode.isSuccess() = value in 200..299

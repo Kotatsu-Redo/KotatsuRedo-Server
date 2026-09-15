@@ -32,7 +32,7 @@ class CommentServiceTest {
 	private val service by lazy { CommentService(repository) }
 	private val works by lazy { WorkRepository(PostgresTestBase.database.source) }
 	private val identities by lazy {
-		IdentityService(IdentityRepository(PostgresTestBase.database.exposed), DevicePepper.of("test"))
+		IdentityService(IdentityRepository(PostgresTestBase.database.exposed, PostgresTestBase.database.source), DevicePepper.of("test"))
 	}
 
 	@BeforeTest
@@ -184,10 +184,14 @@ class CommentServiceTest {
 
 		val mine = service.thread(workId, null, shadowed, sortByScore = true, limit = 25, offset = 0)
 		assertEquals(1, mine.size)
+		assertEquals(1, service.count(workId, null, author.id))
+		assertEquals(mapOf("en" to 1), service.countsByLanguage(workId, null, author.id))
 
-		val theirs = service.thread(workId, null, user("b"), sortByScore = true, limit = 25, offset = 0)
+		val other = user("b")
+		val theirs = service.thread(workId, null, other, sortByScore = true, limit = 25, offset = 0)
 		assertTrue(theirs.isEmpty())
-		assertEquals(0, service.count(workId, null))
+		assertEquals(0, service.count(workId, null, other.id))
+		assertTrue(service.countsByLanguage(workId, null, other.id).isEmpty())
 	}
 
 	@Test

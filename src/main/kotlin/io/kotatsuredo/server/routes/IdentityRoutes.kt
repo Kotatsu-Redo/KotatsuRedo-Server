@@ -5,6 +5,7 @@ import io.kotatsuredo.server.ApiException
 import io.kotatsuredo.server.auth.RateLimiter
 import io.kotatsuredo.server.auth.bearerSecret
 import io.kotatsuredo.server.auth.enforceLimit
+import io.kotatsuredo.server.auth.opaqueRateLimitKey
 import io.kotatsuredo.server.auth.requireCaller
 import io.kotatsuredo.server.identity.DeviceIdentifiers
 import io.kotatsuredo.server.identity.HelloOutcome
@@ -45,13 +46,7 @@ data class IdentityResponse(
 	val nickname: String?,
 	@SerialName("display_name") val displayName: String,
 	val tier: Int,
-	/**
-	 * The key was unknown but the hardware was, so this account adopted it.
-	 *
-	 * Sent because the app has something true to tell the user, and because a restore that looks
-	 * exactly like a signup is how somebody ends up commenting from an account they did not know
-	 * they were in.
-	 */
+	/** Retained for older clients. Device-only recovery is disabled, so this is always false. */
 	val restored: Boolean = false,
 )
 
@@ -68,9 +63,22 @@ fun Route.identityRoutes(
 	post("/hello") {
 		val secret = call.bearerSecret() ?: throw ApiException(ApiError.Unauthorized)
 		val body = call.receive<HelloRequest>()
-		if (body.ssaid.isBlank()) throw ApiException(ApiError.BadRequest("ssaid"))
+		if (body.ssaid.isBlank() || body.ssaid.length > MAX_SSAID_LENGTH) {
+			throw ApiException(ApiError.BadRequest("ssaid"))
+		}
+		if (body.drmId?.length?.let { it > MAX_DRM_ID_LENGTH } == true) {
+			throw ApiException(ApiError.BadRequest("drm_id"))
+		}
+		if (body.nickname?.length?.let { it > Nicknames.MAX_LENGTH } == true) {
+			throw ApiException(ApiError.BadRequest("nickname_too_long"))
+		}
 
-		call.enforceLimit(limiter, RateLimiter.Bucket.HELLO, TrustTier.NEW, body.ssaid)
+		call.enforceLimit(
+			limiter,
+			RateLimiter.Bucket.HELLO,
+			TrustTier.NEW,
+			opaqueRateLimitKey(body.ssaid),
+		)
 
 		when (val outcome = identities.hello(secret, DeviceIdentifiers(body.ssaid, body.drmId))) {
 			HelloOutcome.DeviceBanned -> throw ApiException(ApiError.Banned)
@@ -89,11 +97,13 @@ fun Route.identityRoutes(
 
 	get("/me") {
 		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 		call.respond(caller.identity.toResponse(caller.tier))
 	}
 
 	post("/nickname") {
 		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 		val body = call.receive<NicknameRequest>()
 		identities.setNickname(caller.identity.id, body.nickname).rejectIfInvalid(rulesUrl)
 		val updated = identities.get(caller.identity.id) ?: caller.identity
@@ -106,6 +116,7 @@ fun Route.identityRoutes(
 	 */
 	delete("/me") {
 		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 		identities.deleteEverything(caller.identity.id)
 		call.respond(HttpStatusCode.NoContent)
 	}
@@ -133,3 +144,6 @@ private fun io.kotatsuredo.server.identity.Identity.toResponse(tier: TrustTier) 
 	displayName = displayName,
 	tier = tier.level,
 )
+
+private const val MAX_SSAID_LENGTH = 128
+private const val MAX_DRM_ID_LENGTH = 512

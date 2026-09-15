@@ -48,7 +48,7 @@ When your identity is first created, and **only** then, the app sends two values
 
 | Value | What it is | What it is for |
 |---|---|---|
-| `ANDROID_ID` | An identifier Android gives to each app install on each device | Enforcing a device ban, and giving your account back |
+| `ANDROID_ID` | An identifier Android gives to each app install on each device | Enforcing a device ban |
 | MediaDrm ID | A DRM identifier many Android devices have | Flagging suspected ban evasion |
 
 Both are **hashed with a secret held only by the server** before being stored, so the stored values
@@ -62,26 +62,10 @@ These are sent at signup and never again. Ordinary requests do not carry them.
 
 ### Getting your account back
 
-Your key is the only proof that an account is yours, and clearing the app's data destroys it. When
-that happens the app introduces itself with a new key, and the server checks whether that
-`ANDROID_ID` hash already belongs to an account. If it does, **the new key joins that account instead
-of starting another one** — your comments, ratings and nickname come back.
-
-This is worth being plain about, because it is the one place the server uses a device fingerprint for
-something other than a ban:
-
-- **The server can tell that two accounts came from the same phone.** It always could — that is what
-  a device ban needs — but until now it never acted on it except to block. It does now.
-- **It only ever restores the account that phone used most recently.** A phone that has made several
-  accounts does not get to pick.
-- **A banned device restores nothing.** The ban is checked first, and banned accounts are skipped.
-- **Your old key keeps working.** An account can hold more than one key, so restoring on one phone
-  does not lock out another that still has yours.
-
-If you would rather this never happened, there is nothing to switch off — but you can avoid it
-entirely by turning the community features off, which deletes nothing less than everything about you
-from this server (see below). There is no setting that keeps the account and refuses the link,
-because the link is how the account was found.
+Your key is the only proof that an account is yours. The server never treats an `ANDROID_ID` or
+MediaDrm value as a login credential and never attaches a new key to an existing account because a
+device identifier matches. If Android backup restores the original key, the account continues to
+work. If that key is lost, the server cannot recover the account; a new key creates a new account.
 
 ### What you write
 

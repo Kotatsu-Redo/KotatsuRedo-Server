@@ -3,6 +3,7 @@ package io.kotatsuredo.server
 import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.identity.dailyReporterId
 import io.kotatsuredo.server.telemetry.Probe
+import io.kotatsuredo.server.telemetry.ProbeLimits
 import io.kotatsuredo.server.telemetry.ProbeOp
 import io.kotatsuredo.server.telemetry.Region
 import io.kotatsuredo.server.telemetry.TelemetryRepository
@@ -53,13 +54,13 @@ class TelemetryServiceTest {
 	}
 
 	@Test
-	fun `repeat uploads for the same day accumulate into one row`() {
+	fun `repeat uploads for the same day replace the daily snapshot`() {
 		service.record("secret", TrustTier.NORMAL, Region.EU, listOf(probe(ok = 10, fail = 2)))
 		service.record("secret", TrustTier.NORMAL, Region.EU, listOf(probe(ok = 5, fail = 1)))
 
 		assertEquals(1L, repository.countRows(), "same reporter, day, source and op must be one row")
-		assertEquals(15, columnValue("ok"))
-		assertEquals(3, columnValue("fail"))
+		assertEquals(5, columnValue("ok"))
+		assertEquals(1, columnValue("fail"))
 	}
 
 	@Test
@@ -117,6 +118,22 @@ class TelemetryServiceTest {
 			TrustTier.NORMAL,
 			Region.EU,
 			listOf(probe(ok = 0, fail = 0, empty = 0, cf = 0)),
+		)
+
+		assertEquals(0, accepted)
+		assertEquals(0L, repository.countRows())
+	}
+
+	@Test
+	fun `invalid source identifiers are dropped rather than truncated into database keys`() {
+		val accepted = service.record(
+			"secret",
+			TrustTier.NORMAL,
+			Region.EU,
+			listOf(
+				probe(source = "contains spaces"),
+				probe(source = "x".repeat(ProbeLimits.MAX_SOURCE_NAME + 1)),
+			),
 		)
 
 		assertEquals(0, accepted)

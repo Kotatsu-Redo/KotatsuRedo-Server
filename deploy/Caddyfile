@@ -20,6 +20,9 @@
 	# X-Forwarded-For is deliberately left intact. The app needs the client address to maintain the
 	# per-/24 rate-limit buckets (PLAN.md §1), which live in memory, are keyed by a hash, and are
 	# never persisted or written to a log line. Transient use, no retention.
+	request_body {
+		max_size 256KB
+	}
 	reverse_proxy api:{$API_PORT:8787}
 
 	header {

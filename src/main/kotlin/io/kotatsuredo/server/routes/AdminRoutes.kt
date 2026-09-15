@@ -2,7 +2,11 @@ package io.kotatsuredo.server.routes
 
 import io.kotatsuredo.server.ApiError
 import io.kotatsuredo.server.ApiException
+import io.kotatsuredo.server.auth.RateLimiter
+import io.kotatsuredo.server.auth.enforceLimit
+import io.kotatsuredo.server.auth.opaqueRateLimitKey
 import io.kotatsuredo.server.identity.BannedDevice
+import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.moderation.EnrolResult
 import io.kotatsuredo.server.moderation.LoginResult
 import io.kotatsuredo.server.moderation.ModActionRecord
@@ -10,6 +14,8 @@ import io.kotatsuredo.server.moderation.ModSession
 import io.kotatsuredo.server.moderation.ModerationRules
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
+import io.kotatsuredo.server.moderation.OverviewRepository
+import io.kotatsuredo.server.moderation.PasswordChangeResult
 import io.kotatsuredo.server.moderation.Moderator
 import io.kotatsuredo.server.moderation.ModeratorRole
 import io.kotatsuredo.server.moderation.QueuedBanEvasion
@@ -27,6 +33,8 @@ import io.ktor.server.routing.patch
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import io.ktor.util.AttributeKey
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import java.time.OffsetDateTime
@@ -36,6 +44,12 @@ private val SessionKey = AttributeKey<ModSession>("kotatsuredo.mod-session")
 
 /** The panel is same-origin, so the session rides in a cookie the page's own JavaScript cannot read. */
 const val MOD_SESSION_COOKIE = "kr_mod"
+private const val MAX_LOGIN_USERNAME = 64
+private const val MAX_LOGIN_PASSWORD = 1024
+private const val MAX_LOGIN_CODE = 16
+internal const val ADMIN_CSRF_HEADER = "X-KotatsuRedo-CSRF"
+internal const val ADMIN_CSRF_VALUE = "1"
+private val passwordVerificationDispatcher = Dispatchers.Default.limitedParallelism(2)
 
 private fun OffsetDateTime.iso(): String = DateTimeFormatter.ISO_INSTANT.format(toInstant())
 
@@ -68,6 +82,13 @@ data class EnrolDto(val secret: String, val uri: String)
 
 @Serializable
 data class CodeRequest(val code: String)
+
+@Serializable
+data class ChangePasswordRequest(
+	@SerialName("current_password") val currentPassword: String,
+	@SerialName("new_password") val newPassword: String,
+	val code: String,
+)
 
 @Serializable
 data class InviteRequest(val username: String, val password: String, val role: String = "moderator")
@@ -161,6 +182,44 @@ data class ActionDto(
 
 @Serializable
 data class QueueCountsResponse(val counts: Map<String, Int>)
+
+@Serializable
+data class OverviewResponse(
+	val totals: TotalsDto,
+	val today: TodayDto,
+	val queues: Map<String, Int>,
+	val series: List<DayDto>,
+	@SerialName("top_rules") val topRules: List<RuleLoadDto>,
+	val languages: List<LanguageLoadDto>,
+)
+
+@Serializable
+data class TotalsDto(
+	val users: Int,
+	val comments: Int,
+	val removed: Int,
+	val ratings: Int,
+	val works: Int,
+	val moderators: Int,
+)
+
+@Serializable
+data class TodayDto(
+	val comments: Int,
+	val users: Int,
+	val ratings: Int,
+	val blocked: Int,
+	val actions: Int,
+)
+
+@Serializable
+data class DayDto(val day: String, val comments: Int, val users: Int)
+
+@Serializable
+data class RuleLoadDto(val term: String, val tier: String, val blocks: Int, val disputed: Int)
+
+@Serializable
+data class LanguageLoadDto(val lang: String, val comments: Int, val blocked: Int)
 
 @Serializable
 data class OkResponse(val ok: Boolean = true)
@@ -266,12 +325,37 @@ private fun ModActionRecord.toDto() = ActionDto(
  * `localStorage` is not. `SameSite=Strict` is what stops another site posting to these endpoints on
  * a logged-in moderator's behalf.
  */
-fun Route.adminRoutes(moderation: ModerationService, queues: ModerationQueueRepository, secureCookies: Boolean) =
+fun Route.adminRoutes(
+	moderation: ModerationService,
+	queues: ModerationQueueRepository,
+	secureCookies: Boolean,
+	/** Null only in tests that do not exercise the home page. */
+	overviews: OverviewRepository? = null,
+	limiter: RateLimiter = RateLimiter(),
+) =
 	route("/admin/api") {
 
 		post("/login") {
 			val body = call.receive<LoginRequest>()
-			when (val result = moderation.login(body.username, body.password, body.code)) {
+			if (
+				body.username.isBlank() ||
+				body.username.length > MAX_LOGIN_USERNAME ||
+				body.password.length > MAX_LOGIN_PASSWORD ||
+				body.code?.length?.let { it > MAX_LOGIN_CODE } == true
+			) {
+				call.respond(HttpStatusCode.Unauthorized, ErrorDto("invalid_credentials"))
+				return@post
+			}
+			call.enforceLimit(
+				limiter,
+				RateLimiter.Bucket.ADMIN_LOGIN,
+				TrustTier.NEW,
+				opaqueRateLimitKey(body.username.trim().lowercase()),
+			)
+			val login = withContext(passwordVerificationDispatcher) {
+				moderation.login(body.username, body.password, body.code)
+			}
+			when (val result = login) {
 				is LoginResult.Ok -> {
 					call.response.cookies.append(
 						name = MOD_SESSION_COOKIE,
@@ -315,23 +399,87 @@ fun Route.adminRoutes(moderation: ModerationService, queues: ModerationQueueRepo
 
 		post("/totp/enroll") {
 			val session = call.requireSession(moderation)
-			when (val result = moderation.startEnrolment(session.moderator)) {
+			val token = call.request.cookies[MOD_SESSION_COOKIE] ?: throw ApiException(ApiError.Unauthorized)
+			when (val result = moderation.startEnrolment(session.moderator, token)) {
 				is EnrolResult.Started -> call.respond(EnrolDto(result.secret, result.uri))
 				EnrolResult.AlreadyEnrolled ->
 					call.respond(HttpStatusCode.Conflict, ErrorDto("already_enrolled"))
+				EnrolResult.InProgress ->
+					call.respond(HttpStatusCode.Conflict, ErrorDto("enrolment_in_progress"))
 			}
 		}
 
 		post("/totp/confirm") {
 			val session = call.requireSession(moderation)
-			if (!moderation.confirmEnrolment(session.moderator, call.receive<CodeRequest>().code)) {
+			val token = call.request.cookies[MOD_SESSION_COOKIE] ?: throw ApiException(ApiError.Unauthorized)
+			if (!moderation.confirmEnrolment(session.moderator, token, call.receive<CodeRequest>().code)) {
 				call.respond(HttpStatusCode.BadRequest, ErrorDto("bad_code"))
 				return@post
 			}
 			call.respond(OkResponse())
 		}
 
+		post("/password") {
+			val session = call.requireEnrolled(moderation)
+			call.enforceLimit(
+				limiter,
+				RateLimiter.Bucket.ADMIN_LOGIN,
+				TrustTier.NEW,
+				session.moderator.id,
+			)
+			val body = call.receive<ChangePasswordRequest>()
+			if (body.currentPassword.length > MAX_LOGIN_PASSWORD ||
+				body.newPassword.length > MAX_LOGIN_PASSWORD || body.code.length > MAX_LOGIN_CODE
+			) {
+				throw ApiException(ApiError.BadRequest("password"))
+			}
+			when (moderation.changePassword(
+				session.moderator,
+				body.currentPassword,
+				body.newPassword,
+				body.code,
+			)) {
+				PasswordChangeResult.CHANGED -> {
+					call.response.cookies.append(
+						name = MOD_SESSION_COOKIE,
+						value = "",
+						httpOnly = true,
+						secure = secureCookies,
+						path = "/admin",
+						maxAge = 0,
+						extensions = mapOf("SameSite" to "Strict"),
+					)
+					call.respond(OkResponse())
+				}
+				PasswordChangeResult.INVALID_CURRENT_PASSWORD ->
+					call.respond(HttpStatusCode.Unauthorized, ErrorDto("invalid_current_password"))
+				PasswordChangeResult.INVALID_TOTP ->
+					call.respond(HttpStatusCode.Unauthorized, ErrorDto("bad_code"))
+				PasswordChangeResult.INVALID_NEW_PASSWORD ->
+					call.respond(HttpStatusCode.BadRequest, ErrorDto("weak_password"))
+			}
+		}
+
 		// -- queues --------------------------------------------------------------------------------
+
+		get("/overview") {
+			call.requireEnrolled(moderation)
+			val counts = queues.counts(DISLIKE_WINDOW_HOURS, MIN_DISLIKES)
+			val overview = overviews?.load(counts)
+				?: throw ApiException(ApiError.NotFound)
+			call.respond(
+				OverviewResponse(
+					totals = with(overview.totals) {
+						TotalsDto(users, comments, removed, ratings, works, moderators)
+					},
+					today = with(overview.today) { TodayDto(comments, users, ratings, blocked, actions) },
+					queues = overview.queues,
+					series = overview.series.map { DayDto(it.day, it.comments, it.users) },
+					topRules = overview.topRules.map { RuleLoadDto(it.term, it.tier, it.blocks, it.disputed) },
+					languages = overview.languages.map { LanguageLoadDto(it.lang, it.comments, it.blocked) },
+				),
+			)
+		}
 
 		get("/queues/counts") {
 			call.requireEnrolled(moderation)

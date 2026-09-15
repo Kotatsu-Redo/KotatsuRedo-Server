@@ -53,9 +53,12 @@ class WorkLinker(
 		a: Pair<String, String>,
 		b: Pair<String, String>,
 		evidence: String,
+		allowMerge: Boolean = true,
 	): LinkOutcome {
-		val workA = repository.findByAlias(a.first, a.second)
-		val workB = repository.findByAlias(b.first, b.second)
+		// A migration may only build on aliases already trusted globally. Using pending/legacy aliases
+		// here would let one established account turn somebody else's unverified claim into truth.
+		val workA = repository.findVerifiedAlias(a.first, a.second)
+		val workB = repository.findVerifiedAlias(b.first, b.second)
 
 		return when {
 			workA != null && workB != null && workA == workB -> LinkOutcome.AlreadyLinked(workA)
@@ -71,7 +74,12 @@ class WorkLinker(
 				LinkOutcome.Linked(workB)
 			}
 
-			workA != null && workB != null -> merge(workA, workB, evidence)
+			workA != null && workB != null && allowMerge -> merge(workA, workB, evidence)
+
+			workA != null && workB != null -> {
+				review.needsReview(workA, workB, evidence)
+				LinkOutcome.NeedsReview(workA, workB)
+			}
 
 			else -> LinkOutcome.Unknown
 		}
@@ -95,7 +103,7 @@ class WorkLinker(
 
 		val (into, from) = if (bHasContent) workB to workA else workA to workB
 		repository.mergeWorks(from = from, into = into, reason = evidence)
-		log.info("Merged work {} into {} ({})", from, into, evidence)
+		log.info("Merged work {} into {}", from, into)
 		return LinkOutcome.Merged(into = into, from = from)
 	}
 }

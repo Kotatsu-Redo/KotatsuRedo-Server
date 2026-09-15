@@ -37,7 +37,7 @@ class MangaUpdatesCatalogue(
 		val searchResponse = fetcher.fetch("$baseUrl/series/search", searchBody) ?: return null
 
 		val seriesId = runCatching { pickSeries(searchResponse, title, year) }
-			.onFailure { log.warn("Failed to parse MangaUpdates search for '{}'", title, it) }
+			.onFailure { log.warn("Failed to parse MangaUpdates search response", it) }
 			.getOrNull() ?: return null
 
 		val detail = fetcher.get("$baseUrl/series/$seriesId") ?: return null
