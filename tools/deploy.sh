@@ -49,14 +49,18 @@ if [ "$ROLLBACK" = 1 ]; then
 	say "rolling back on $HOST"
 	ssh "$HOST" "cd '$DIR' && \
 		test -f .env.previous || { echo 'no .env.previous - nothing to roll back to'; exit 1; }; \
-		cp .env .env.failed && cp .env.previous .env && docker compose up -d"
+		cp .env .env.failed && cp .env.previous .env && \
+		if test -f docker-compose.yml.previous; then cp docker-compose.yml.previous docker-compose.yml; fi && \
+		docker compose up -d"
 	echo "Rolled back. The image that failed is still loaded, so a re-deploy is cheap."
 	exit 0
 fi
 
 TAG="$(git rev-parse --short HEAD 2>/dev/null || echo local)"
 if [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then
-	TAG="$TAG-dirty"
+	# A mutable `commit-dirty` tag makes rollback point at whichever image was built most recently,
+	# not the image that was actually running. Keep dirty deployments unique just like commits are.
+	TAG="$TAG-dirty-$(date -u +%Y%m%d%H%M%S)"
 fi
 IMAGE="kotatsuredo-server:$TAG"
 
@@ -90,10 +94,15 @@ scp -q "$COMPOSE" "$HOST:$DIR/docker-compose.yml"
 rm -rf .deploy-sync
 
 say "switching to $IMAGE and restarting"
-ssh "$HOST" "cd '$DIR' && \
+if ! ssh "$HOST" "cd '$DIR' && \
 	cp .env .env.previous && \
 	grep -q '^API_IMAGE=' .env && sed -i 's|^API_IMAGE=.*|API_IMAGE=$IMAGE|' .env || echo 'API_IMAGE=$IMAGE' >> .env; \
-	docker compose up -d"
+	docker compose up -d"; then
+	say "compose start failed - rolling back"
+	ssh "$HOST" "cd '$DIR' && cp .env.previous .env && \
+		cp docker-compose.yml.previous docker-compose.yml && docker compose up -d"
+	exit 1
+fi
 
 say "health"
 # The api migrates and seeds on boot, so give it a moment before deciding it is broken.
@@ -107,7 +116,8 @@ if ssh "$HOST" "for i in \$(seq 1 30); do \
 	echo "Previous .env kept as .env.previous - tools/deploy.sh $HOST --rollback puts it back."
 else
 	say "health check failed - rolling back"
-	ssh "$HOST" "cd '$DIR' && cp .env.previous .env && docker compose up -d"
+	ssh "$HOST" "cd '$DIR' && cp .env.previous .env && \
+		cp docker-compose.yml.previous docker-compose.yml && docker compose up -d"
 	echo "Rolled back to the previous image. The new one is loaded but not in use."
 	echo "Look at: ssh $HOST 'cd $DIR && docker compose logs --tail=50 api'"
 	exit 1

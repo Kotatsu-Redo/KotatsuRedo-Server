@@ -160,16 +160,19 @@ class ScoringRepository(private val dataSource: DataSource) {
 		const val MAX_SCORES_PER_REGION = 1_200
 
 		/**
-			 * Only established identities contribute to public scores. Device identifiers are self-declared,
-			 * so three-day accounts remain cheap to manufacture in bulk even when each reporter-day is capped.
+		 * Every authenticated identity contributes. A reporter counts once per source, operation, and day;
+		 * seniority changes its bounded weight instead of deciding whether its telemetry exists at all.
 		 */
 		val AGGREGATE = """
 			WITH decayed AS (
 				SELECT source, region, day, reporter_day, tier,
 				       ok, fail, empty, cf_blocked, latency_p50_ms,
-				       power(0.5, (CURRENT_DATE - day)::numeric / ?::numeric) AS w
+				       power(
+				         0.5,
+				         ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - day)::numeric / ?::numeric
+				       ) AS w
 				FROM source_probe_raw
-				WHERE day >= CURRENT_DATE - ?::int AND tier >= 2
+				WHERE day >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - ?::int
 			),
 			reporter_samples AS (
 				SELECT source, region, day, reporter_day, MAX(tier) AS tier, MAX(w) AS w,
@@ -184,32 +187,26 @@ class ScoringRepository(private val dataSource: DataSource) {
 				FROM decayed
 				GROUP BY source, region, day, reporter_day
 			),
-			counts AS (
+			aggregated AS (
 				SELECT source, region,
 				       SUM((ok / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS ok_w,
 				       SUM((fail / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS fail_w,
 				       SUM((empty / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS empty_w,
 				       SUM((cf_blocked / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS cf_w,
 				       SUM(latency * w * (0.5 + tier * 0.25)) AS lat_num,
-				       SUM(w * (0.5 + tier * 0.25)) AS lat_den
-				FROM reporter_samples GROUP BY source, region
-			),
-			reporters AS (
-				SELECT source, region,
-				       SUM(w * (0.5 + tier * 0.25)) AS reporter_w,
+				       SUM(w * (0.5 + tier * 0.25)) AS weight,
 				       COUNT(*)                     AS sample_size
 				FROM reporter_samples GROUP BY source, region
 			)
-			SELECT c.source, c.region,
-			       c.ok_w::float8    AS ok_w,
-			       c.fail_w::float8  AS fail_w,
-			       c.empty_w::float8 AS empty_w,
-			       c.cf_w::float8    AS cf_w,
-			       COALESCE(c.lat_num / NULLIF(c.lat_den, 0), 0)::float8 AS p50_w,
-			       r.reporter_w::float8 AS reporter_w,
-			       r.sample_size
-			FROM counts c
-			JOIN reporters r ON r.source = c.source AND r.region = c.region
+			SELECT source, region,
+			       ok_w::float8    AS ok_w,
+			       fail_w::float8  AS fail_w,
+			       empty_w::float8 AS empty_w,
+			       cf_w::float8    AS cf_w,
+			       COALESCE(lat_num / NULLIF(weight, 0), 0)::float8 AS p50_w,
+			       weight::float8 AS reporter_w,
+			       sample_size
+			FROM aggregated
 		""".trimIndent()
 
 		val UPSERT = """

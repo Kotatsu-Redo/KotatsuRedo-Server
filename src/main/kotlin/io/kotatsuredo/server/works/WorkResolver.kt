@@ -107,10 +107,21 @@ class WorkResolver(
 		}
 
 		if (reporterId != null) {
+			// Repeat opens stay on the (source, key, account) primary-key path. The wider account-title
+			// lookup below is needed only when this source entry has not been observed before.
 			repository.observedAlias(fingerprint.source, fingerprint.sourceKey, reporterId, keys)?.let { observed ->
 				if (isCompatible(fingerprint, repository.metadataOf(observed))) {
 					return Resolution(observed, ResolutionMethod.OBSERVATION, created = false)
 				}
+			}
+			// Reuse this account's own exact-title observation across sources. The mapping remains private
+			// to that account until authoritative catalogue data or the established-account quorum backs
+			// it, so a remote client cannot poison how another account resolves the title.
+			val own = repository.observedWorks(reporterId, keys)
+			val ownMetadata = repository.metadataOf(own)
+			own.firstOrNull { isCompatible(fingerprint, ownMetadata[it]) }?.let {
+				repository.observeAlias(fingerprint.source, fingerprint.sourceKey, reporterId, it, keys)
+				return Resolution(it, ResolutionMethod.OBSERVATION, created = false)
 			}
 			val pending = repository.matchingObservedAliases(fingerprint.source, fingerprint.sourceKey, keys)
 			val pendingMetadata = repository.metadataOf(pending)
@@ -138,21 +149,19 @@ class WorkResolver(
 		// 4. Fuzzy, corroborated. Trigram narrows to a handful of candidates; the cover hash decides.
 		//    The cover is never searched globally - only compared against candidates the title already
 		//    produced, which is why no hash index is needed (PLAN.md §2.4).
-		val candidatesByScore = repository.findSimilarTitles(
-			keys, candidateThreshold, minimumWeight = minimumTitleWeight,
-		).toMap()
-		val fuzzyMetadata = repository.metadataOf(candidatesByScore.keys)
-		val candidates = candidatesByScore
-			.filterKeys { candidate -> isCompatible(fingerprint, fuzzyMetadata[candidate]) }
+		//    A similar title alone is never accepted: near-identical names can still be separate works.
+		if (fingerprint.coverPHash != null) {
+			val candidatesByScore = repository.findSimilarTitles(
+				keys, candidateThreshold, minimumWeight = minimumTitleWeight,
+			).toMap()
+			val fuzzyMetadata = repository.metadataOf(candidatesByScore.keys)
+			val candidates = candidatesByScore
+				.filterKeys { candidate -> isCompatible(fingerprint, fuzzyMetadata[candidate]) }
 
-		if (candidates.isNotEmpty()) {
-			verifyByCover(fingerprint, candidates.keys)?.let {
-				return link(fingerprint, it, ResolutionMethod.TITLE_AND_COVER, reporterId)
-			}
-			val best = candidates.maxByOrNull { it.value }
-			if (best != null && best.value >= TITLE_ONLY_THRESHOLD) {
-				// Linked but flagged: a title that merely looks similar, with nothing backing it up.
-				return link(fingerprint, best.key, ResolutionMethod.FUZZY_TITLE, reporterId)
+			if (candidates.isNotEmpty()) {
+				verifyByCover(fingerprint, candidates.keys)?.let {
+					return link(fingerprint, it, ResolutionMethod.TITLE_AND_COVER, reporterId)
+				}
 			}
 		}
 
@@ -170,30 +179,12 @@ class WorkResolver(
 	private fun isCompatible(
 		fingerprint: WorkFingerprint,
 		metadata: Triple<String, Int?, String?>?,
-	): Boolean {
-		metadata ?: return false
-		val (canonicalTitle, year, contentType) = metadata
-
-		if (TitleNormalizer.sequenceSignature(fingerprint.title) !=
-			TitleNormalizer.sequenceSignature(canonicalTitle)
-		) {
-			return false
-		}
-
-		// Years disagree between sources often enough that agreement cannot be required - but a gap
-		// this wide means two different works with a shared title, which does happen.
-		if (fingerprint.year != null && year != null && kotlin.math.abs(fingerprint.year - year) > YEAR_TOLERANCE) {
-			return false
-		}
-
-		if (fingerprint.contentType != null && contentType != null &&
-			!contentType.equals(fingerprint.contentType, ignoreCase = true) &&
-			contentType.lowercase() in KNOWN_TYPES && fingerprint.contentType.lowercase() in KNOWN_TYPES
-		) {
-			return false
-		}
-		return true
-	}
+	): Boolean = WorkCompatibility.isCompatible(
+		fingerprint.title,
+		fingerprint.year,
+		fingerprint.contentType,
+		metadata,
+	)
 
 	/** @return the candidate whose cover matches, if any. */
 	private fun verifyByCover(fingerprint: WorkFingerprint, candidates: Set<Long>): Long? {
@@ -341,7 +332,7 @@ class WorkResolver(
 		externalIds: Map<String, String>,
 		method: ResolutionMethod,
 	): Resolution {
-		val workId = repository.createObservedWork(
+		val result = repository.createObservedWork(
 			canonicalTitle = canonicalTitle,
 			year = year,
 			contentType = contentType,
@@ -354,7 +345,7 @@ class WorkResolver(
 			titleKeys = listOf(fingerprint.title).flatMap(TitleNormalizer::keys),
 			coverPHash = fingerprint.coverPHash,
 		)
-		return Resolution(workId, method, created = true)
+		return Resolution(result.workId, method, created = result.created)
 	}
 
 	companion object {
@@ -373,20 +364,11 @@ class WorkResolver(
 		 */
 		const val CANDIDATE_THRESHOLD = 0.40
 
-		/**
-		 * Acceptance on a title alone, with nothing corroborating it. High on purpose: below this the
-		 * candidate is dropped rather than linked, because a wrong merge cannot be walked back the way
-		 * a missed one can.
-		 */
-		const val TITLE_ONLY_THRESHOLD = 0.85
-
-		const val YEAR_TOLERANCE = 2
+		const val YEAR_TOLERANCE = WorkCompatibility.YEAR_TOLERANCE
 		const val MAX_CONCURRENT_RESOLUTIONS = 8
 		const val MAX_QUEUED_RESOLUTIONS = 32
 		const val ALIAS_LOCK_STRIPES = 256
 		const val MAX_QUEUED_PER_ALIAS_STRIPE = 8
-
-		private val KNOWN_TYPES = setOf("manga", "manhwa", "manhua", "novel", "oneshot", "doujinshi")
 
 		fun hammingDistance(a: Long, b: Long): Int = java.lang.Long.bitCount(a xor b)
 	}

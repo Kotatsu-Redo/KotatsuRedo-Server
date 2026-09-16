@@ -86,6 +86,15 @@ def build_env(domain: str, image: str) -> str:
 def build_compose(image: str, proxy: str, port: int) -> str:
     """Derives the deployment compose file from the real one, so the two cannot drift apart."""
     text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    migrate_marker = "  migrate:\n    build: .\n"
+    assert migrate_marker in text, "docker-compose.yml no longer builds the migrator the way this script expects"
+    text = text.replace(
+        migrate_marker,
+        "  migrate:\n"
+        "    # Run the schema migration with the exact same release image as the API.\n"
+        f"    image: ${{API_IMAGE:-{image}}}\n",
+        1,
+    )
     marker = "  api:\n    build: .\n"
     assert marker in text, "docker-compose.yml no longer builds the api the way this script expects"
     text = text.replace(

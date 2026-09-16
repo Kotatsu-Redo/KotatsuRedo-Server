@@ -115,7 +115,7 @@ class ScoringPipelineTest {
 	}
 
 	@Test
-	fun `fresh and normal account telemetry is retained but excluded from public aggregation`() {
+	fun `fresh and normal account telemetry contributes with bounded trust weight`() {
 		telemetry.record(
 			"fresh-attacker", TrustTier.NEW, Region.EU,
 			listOf(Probe("SOURCE", ProbeOp.SEARCH, 0, 100_000, 0, 0, 100_000, 100_000)),
@@ -128,8 +128,9 @@ class ScoringPipelineTest {
 
 		assertEquals(3L, telemetryRepository.countRows(), "raw privacy-limited snapshots are still accepted")
 		val aggregate = scoringRepository.aggregate().single()
-		assertEquals(1, aggregate.sampleSize)
-		assertEquals(0.0, aggregate.failWeighted)
+		assertEquals(3, aggregate.sampleSize)
+		assertEquals(2.25, aggregate.reporterWeight, 0.0001)
+		assertTrue(aggregate.failWeighted > 0.0)
 		assertTrue(aggregate.okWeighted > 0.0)
 	}
 

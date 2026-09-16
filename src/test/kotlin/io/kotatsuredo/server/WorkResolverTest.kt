@@ -3,6 +3,8 @@ package io.kotatsuredo.server
 import io.kotatsuredo.server.catalogue.CatalogueLookup
 import io.kotatsuredo.server.catalogue.CatalogueProvider
 import io.kotatsuredo.server.catalogue.CatalogueRecord
+import io.kotatsuredo.server.ratings.RatingRepository
+import io.kotatsuredo.server.ratings.RatingService
 import io.kotatsuredo.server.works.LinkOutcome
 import io.kotatsuredo.server.works.ResolutionMethod
 import io.kotatsuredo.server.works.WorkFingerprint
@@ -85,7 +87,8 @@ class WorkResolverTest {
 		year: Int? = 2018,
 		phash: Long? = null,
 		externalIds: Map<String, String> = emptyMap(),
-	) = WorkFingerprint(source, key, title, alt, year, "manga", false, phash, externalIds)
+		contentType: String = "manga",
+	) = WorkFingerprint(source, key, title, alt, year, contentType, false, phash, externalIds)
 
 	private fun reporter(id: String, settled: Boolean = true) {
 		PostgresTestBase.database.source.connection.use { connection ->
@@ -253,6 +256,64 @@ class WorkResolverTest {
 		}
 
 		assertEquals(null, repository.findVerifiedAlias("SOURCE", key))
+	}
+
+	@Test
+	fun `one account sees the same exact title as one work across comic sources`() = runTest {
+		reporter("reader", settled = false)
+		val resolver = WorkResolver(repository, catalogue = null)
+
+		val manga = resolver.resolve(
+			fingerprint("SOURCE_A", key = "/manga", title = "Shared Story", contentType = "manga"),
+			"reader",
+		)
+		val manhwa = resolver.resolve(
+			fingerprint("SOURCE_B", key = "/manhwa", title = "Shared Story", contentType = "manhwa"),
+			"reader",
+		)
+
+		assertEquals(manga.workId, manhwa.workId)
+		assertEquals(ResolutionMethod.OBSERVATION, manhwa.method)
+		assertEquals(1L, repository.countWorks())
+	}
+
+	@Test
+	fun `one account observation cannot select a work for another account`() = runTest {
+		reporter("reader-a", settled = false)
+		reporter("reader-b", settled = false)
+		val resolver = WorkResolver(repository, catalogue = null)
+
+		val first = resolver.resolve(fingerprint("SOURCE_A", title = "Untrusted Title"), "reader-a")
+		val second = resolver.resolve(fingerprint("SOURCE_B", title = "Untrusted Title"), "reader-b")
+
+		assertNotEquals(first.workId, second.workId)
+		assertEquals(2L, repository.countWorks())
+	}
+
+	@Test
+	fun `one account keeps same-title works with incompatible years separate`() = runTest {
+		reporter("reader", settled = false)
+		val resolver = WorkResolver(repository, catalogue = null)
+
+		val old = resolver.resolve(fingerprint("SOURCE_A", title = "Blue", year = 1990), "reader")
+		val remake = resolver.resolve(fingerprint("SOURCE_B", title = "Blue", year = 2025), "reader")
+
+		assertNotEquals(old.workId, remake.workId)
+	}
+
+	@Test
+	fun `one account keeps a novel separate from a comic with the same title`() = runTest {
+		reporter("reader", settled = false)
+		val resolver = WorkResolver(repository, catalogue = null)
+
+		val comic = resolver.resolve(
+			fingerprint("SOURCE_A", title = "Shared Name", contentType = "manhwa"), "reader",
+		)
+		val novel = resolver.resolve(
+			fingerprint("SOURCE_B", title = "Shared Name", contentType = "novel"), "reader",
+		)
+
+		assertNotEquals(comic.workId, novel.workId)
 	}
 
 	@Test
@@ -464,6 +525,126 @@ class WorkResolverTest {
 	}
 
 	@Test
+	fun `concurrent catalogue creation across different sources leaves one work`() {
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			val results = executor.invokeAll(
+				listOf("SOURCE_A", "SOURCE_B").map { source ->
+					Callable {
+						repository.createAndLinkWork(
+							canonicalTitle = "Shared Catalogue Work",
+							year = 2024,
+							contentType = "manhwa",
+							nsfw = false,
+							titles = listOf(TitleToStore("Shared Catalogue Work", "catalogue")),
+							externalIds = mapOf("mangaupdates" to "shared-42"),
+							source = source,
+							sourceKey = "/title/$source",
+							confidence = 0.95,
+							evidence = "mangaupdates",
+							coverPHash = null,
+						)
+					}
+				},
+			)
+			assertEquals(1, results.map { it.get().workId }.distinct().size)
+			assertEquals(1L, repository.countWorks())
+		} finally {
+			executor.shutdownNow()
+		}
+	}
+
+	@Test
+	fun `concurrent authenticated catalogue creation leaves one work`() {
+		listOf("reader-a", "reader-b").forEach { reporter(it, settled = false) }
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			val results = executor.invokeAll(
+				listOf("reader-a", "reader-b").mapIndexed { index, userId ->
+					Callable {
+						repository.createObservedWork(
+							canonicalTitle = "Authenticated Catalogue Work",
+							year = 2024,
+							contentType = "manhwa",
+							nsfw = false,
+							titles = listOf(TitleToStore("Authenticated Catalogue Work", "catalogue")),
+							externalIds = mapOf("mangaupdates" to "authenticated-42"),
+							source = "SOURCE_$index",
+							sourceKey = "/title/$index",
+							reporterId = userId,
+							titleKeys = listOf("authenticated catalogue work"),
+							coverPHash = null,
+						)
+					}
+				},
+			)
+			assertEquals(1, results.map { it.get().workId }.distinct().size)
+			assertEquals(1, results.count { it.get().created })
+			assertEquals(1L, repository.countWorks())
+		} finally {
+			executor.shutdownNow()
+		}
+	}
+
+	@Test
+	fun `concurrent cross-source creation without catalogue ids leaves one account work`() {
+		reporter("reader", settled = false)
+		val executor = Executors.newFixedThreadPool(2)
+		try {
+			val results = executor.invokeAll(
+				listOf("SOURCE_A", "SOURCE_B").map { source ->
+					Callable {
+						repository.createObservedWork(
+							canonicalTitle = "No Catalogue Work",
+							year = 2024,
+							contentType = "manhwa",
+							nsfw = false,
+							titles = listOf(TitleToStore("No Catalogue Work", "source_observed")),
+							externalIds = emptyMap(),
+							source = source,
+							sourceKey = "/title/$source",
+							reporterId = "reader",
+							titleKeys = listOf("no catalogue work"),
+							coverPHash = null,
+						)
+					}
+				},
+			)
+			assertEquals(1, results.map { it.get().workId }.distinct().size)
+			assertEquals(1, results.count { it.get().created })
+			assertEquals(1L, repository.countWorks())
+		} finally {
+			executor.shutdownNow()
+		}
+	}
+
+	@Test
+	fun `conflicting catalogue identifiers do not select an arbitrary work`() {
+		val malWork = repository.createWork("MAL Work", 2024, "manga", false)
+		val kitsuWork = repository.createWork("Kitsu Work", 2024, "manga", false)
+		repository.addExternalIds(malWork, mapOf("mal" to "mal-1"))
+		repository.addExternalIds(kitsuWork, mapOf("kitsu" to "kitsu-2"))
+
+		val result = repository.createAndLinkWork(
+			canonicalTitle = "Ambiguous Catalogue Work",
+			year = 2024,
+			contentType = "manga",
+			nsfw = false,
+			titles = listOf(TitleToStore("Ambiguous Catalogue Work", "catalogue")),
+			externalIds = mapOf("mal" to "mal-1", "kitsu" to "kitsu-2"),
+			source = "SOURCE",
+			sourceKey = "/ambiguous",
+			confidence = 0.95,
+			evidence = "test",
+			coverPHash = null,
+		)
+
+		assertTrue(result.created)
+		assertNotEquals(malWork, result.workId)
+		assertNotEquals(kitsuWork, result.workId)
+	}
+
+	@Test
 	fun `failed observed creation rolls back the provisional work`() {
 		assertFailsWith<SQLException> {
 			repository.createObservedWork(
@@ -489,7 +670,8 @@ class WorkResolverTest {
 		val first = resolver.resolve(
 			fingerprint("MANGADEX", title = "Chainsaw Man", externalIds = mapOf("mal" to "116778")),
 		)
-		val second = resolver.resolve(
+		// No catalogue authority on the second request: its client-controlled id must remain a hint.
+		val second = WorkResolver(repository, catalogue = null).resolve(
 			fingerprint("WEIRD", title = "CSM RAW v2 [Complete]", externalIds = mapOf("mal" to "116778")),
 		)
 
@@ -554,6 +736,26 @@ class WorkResolverTest {
 
 		assertEquals(first.workId, second.workId)
 		assertEquals(ResolutionMethod.TITLE_AND_COVER, second.method)
+	}
+
+	@Test
+	fun `near identical manhwa titles stay separate without corroboration`() = runTest {
+		val resolver = resolver()
+		val singular = resolver.resolve(
+			fingerprint(
+				"SOURCE_A", key = "/youngest-son", title = "The Youngest Son of a Conglomerate",
+				contentType = "manhwa",
+			),
+		)
+		val plural = resolver.resolve(
+			fingerprint(
+				"SOURCE_B", key = "/youngest-sons", title = "The Youngest Sons of a Conglomerate",
+				contentType = "manhwa",
+			),
+		)
+
+		assertNotEquals(singular.workId, plural.workId)
+		assertEquals(2L, repository.countWorks())
 	}
 
 	@Test
@@ -646,6 +848,28 @@ class WorkResolverTest {
 
 		assertEquals(outcome.into, repository.mergedInto(outcome.from))
 		assertFalse(a.workId == b.workId)
+	}
+
+	@Test
+	fun `merge and unmerge preserve observations and rating aggregates`() {
+		listOf("observer", "rater-a", "rater-b").forEach { reporter(it, settled = false) }
+		val ratings = RatingService(RatingRepository(PostgresTestBase.database.source))
+		val into = repository.createWork("Same Work", 2024, "manga", false)
+		val from = repository.createWork("Same Work", 2024, "manhwa", false)
+		repository.observeAlias("SOURCE_B", "/same", "observer", from, listOf("same work"))
+		ratings.rate(into, "rater-a", 8)
+		ratings.rate(from, "rater-b", 10)
+
+		repository.mergeWorks(from, into, "test")
+
+		assertEquals(listOf(into), repository.observedWorks("observer", listOf("same work")))
+		assertEquals(2, ratings.aggregate(into).count)
+		assertEquals(9.0, ratings.aggregate(into).mean)
+
+		assertEquals(from to into, repository.unmergeWork(from))
+		assertEquals(listOf(from), repository.observedWorks("observer", listOf("same work")))
+		assertEquals(1, ratings.aggregate(into).count)
+		assertEquals(1, ratings.aggregate(from).count)
 	}
 
 	@Test

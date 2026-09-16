@@ -185,10 +185,11 @@ class WorkRepository(private val dataSource: DataSource) {
 				return@connectionUse WorkCreationResult(existingAlias, created = false, aliasAlreadyExisted = true)
 			}
 
-			// External ids are stored as metadata, never used here as a selector. A catalogue adapter can
-			// be wrong, and client-supplied ids are explicitly untrusted; silently joining two global
-			// comment/rating histories is a much worse failure than leaving a duplicate for review.
-			val workId = connection.prepareStatement(
+			// These identifiers come from a server-side catalogue record. Re-check them under the
+			// creation lock: different source aliases can finish the same lookup concurrently, before
+			// either work was visible to the resolver. Client-supplied identifiers never select here.
+			val existingWork = findByExternalIds(connection, externalIds)
+			val workId = existingWork ?: connection.prepareStatement(
 				"INSERT INTO work (canonical_title, year, content_type, nsfw) VALUES (?, ?, ?, ?)",
 				Statement.RETURN_GENERATED_KEYS,
 			).use { statement ->
@@ -251,7 +252,7 @@ class WorkRepository(private val dataSource: DataSource) {
 			}
 
 			connection.commit()
-			WorkCreationResult(workId, created = true, aliasAlreadyExisted = false)
+			WorkCreationResult(workId, created = existingWork == null, aliasAlreadyExisted = false)
 		} catch (e: Exception) {
 			connection.rollback()
 			throw e
@@ -508,19 +509,88 @@ class WorkRepository(private val dataSource: DataSource) {
 	fun findByExternalIds(ids: Map<String, String>): Long? {
 		if (ids.isEmpty()) return null
 		dataSource.connection.use { connection ->
-			connection.prepareStatement(
-				"SELECT work_id FROM work_external_id WHERE provider = ? AND external_id = ?",
-			).use { statement ->
-				ids.forEach { (provider, externalId) ->
-					statement.setString(1, provider)
-					statement.setString(2, externalId)
-					statement.executeQuery().use { rows ->
-						if (rows.next()) return rows.getLong(1)
+			return findByExternalIds(connection, ids)
+		}
+	}
+
+	private fun findByExternalIds(connection: java.sql.Connection, ids: Map<String, String>): Long? {
+		if (ids.isEmpty()) return null
+		var match: Long? = null
+		connection.prepareStatement(
+			"SELECT work_id FROM work_external_id WHERE provider = ? AND external_id = ?",
+		).use { statement ->
+			ids.forEach { (provider, externalId) ->
+				statement.setString(1, provider)
+				statement.setString(2, externalId)
+				statement.executeQuery().use { rows ->
+					if (rows.next()) {
+						val candidate = rows.getLong(1)
+						// A bad catalogue payload can occasionally contain identifiers belonging to two
+						// works. Refuse the ambiguous anchor instead of selecting by map iteration order.
+						if (match != null && match != candidate) return null
+						match = candidate
 					}
 				}
 			}
 		}
-		return null
+		return match
+	}
+
+	private fun findCompatibleObservedWork(
+		connection: java.sql.Connection,
+		userId: String,
+		titleKeys: Collection<String>,
+		canonicalTitle: String,
+		year: Int?,
+		contentType: String?,
+	): Long? {
+		if (titleKeys.isEmpty()) return null
+		return connection.prepareStatement(
+			"""
+			SELECT DISTINCT work.id, work.canonical_title, work.year, work.content_type
+			FROM work_alias_observation observation
+			JOIN work ON work.id = observation.work_id AND work.merged_into IS NULL
+			WHERE observation.user_id = ? AND observation.title_keys && ?::text[]
+			ORDER BY work.id
+			LIMIT 20
+			""".trimIndent(),
+		).use { statement ->
+			statement.setString(1, userId)
+			statement.setArray(2, connection.createArrayOf("text", titleKeys.distinct().toTypedArray()))
+			statement.executeQuery().use { rows ->
+				while (rows.next()) {
+					val candidateYear = rows.getInt(3).takeUnless { rows.wasNull() }
+					val metadata = Triple(rows.getString(2), candidateYear, rows.getString(4))
+					if (WorkCompatibility.isCompatible(canonicalTitle, year, contentType, metadata)) {
+						return rows.getLong(1)
+					}
+				}
+				null
+			}
+		}
+	}
+
+	/** Exact-title works this account has already associated with any source. */
+	fun observedWorks(userId: String, titleKeys: Collection<String>): List<Long> {
+		if (titleKeys.isEmpty()) return emptyList()
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT DISTINCT observation.work_id
+				FROM work_alias_observation observation
+				JOIN work ON work.id = observation.work_id AND work.merged_into IS NULL
+				WHERE observation.user_id = ? AND observation.title_keys && ?::text[]
+				ORDER BY observation.work_id
+				LIMIT 20
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setArray(2, connection.createArrayOf("text", titleKeys.distinct().toTypedArray()))
+				statement.executeQuery().use { rows ->
+					buildList { while (rows.next()) add(rows.getLong(1)) }
+				}
+			}
+		}
 	}
 
 	/** Exact key hit. The hot path once a work knows the renderings sources actually use. */
@@ -700,10 +770,25 @@ class WorkRepository(private val dataSource: DataSource) {
 		reporterId: String,
 		titleKeys: Collection<String>,
 		coverPHash: Long?,
-	): Long = dataSource.connection.use { connection ->
+	): WorkCreationResult = dataSource.connection.use { connection ->
 		connection.autoCommit = false
 		try {
-			val workId = connection.prepareStatement(
+			// Resolutions for different source keys use different in-process locks. Serialize only their
+			// commit path, then recheck authoritative ids and this account's compatible observations in
+			// case another request won the race while this one was resolving.
+			connection.prepareStatement("SELECT pg_advisory_xact_lock(?)").use { statement ->
+				statement.setLong(1, WORK_CREATION_LOCK)
+				statement.execute()
+			}
+			val existingWork = findByExternalIds(connection, externalIds) ?: findCompatibleObservedWork(
+				connection,
+				reporterId,
+				titleKeys,
+				canonicalTitle,
+				year,
+				contentType,
+			)
+			val workId = existingWork ?: connection.prepareStatement(
 				"INSERT INTO work (canonical_title, year, content_type, nsfw) VALUES (?, ?, ?, ?)",
 				Statement.RETURN_GENERATED_KEYS,
 			).use { statement ->
@@ -731,7 +816,7 @@ class WorkRepository(private val dataSource: DataSource) {
 			}
 			observeAlias(connection, source, sourceKey, reporterId, workId, titleKeys)
 			connection.commit()
-			workId
+			WorkCreationResult(workId, created = existingWork == null, aliasAlreadyExisted = false)
 		} catch (error: Exception) {
 			connection.rollback()
 			throw error
@@ -863,12 +948,14 @@ class WorkRepository(private val dataSource: DataSource) {
 			try {
 				val moved = buildJsonObject {
 					put("aliases", movedAliases(connection, from))
+					put("observations", movedObservations(connection, from))
 					put("externals", movedExternalIds(connection, from))
 					put("covers", movedCoverHashes(connection, from, into))
 				}
 
 				listOf(
 					"UPDATE work_alias SET work_id = ? WHERE work_id = ?",
+					"UPDATE work_alias_observation SET work_id = ? WHERE work_id = ?",
 					"UPDATE work_external_id SET work_id = ? WHERE work_id = ?",
 					"UPDATE comment SET work_id = ? WHERE work_id = ?",
 				).forEach { sql ->
@@ -894,6 +981,11 @@ class WorkRepository(private val dataSource: DataSource) {
 						statement.setLong(3, into)
 						statement.executeUpdate()
 					}
+				}
+				rebuildRatingAggregate(connection, into)
+				connection.prepareStatement("DELETE FROM work_rating_agg WHERE work_id = ?").use { statement ->
+					statement.setLong(1, from)
+					statement.executeUpdate()
 				}
 
 				// Titles can collide on (work_id, title_norm, kind), so let the conflict drop them.
@@ -977,6 +1069,20 @@ class WorkRepository(private val dataSource: DataSource) {
 					statement.executeUpdate()
 				}
 			}
+			record?.get("observations")?.jsonArray?.forEach { element ->
+				val observation = element.jsonObject
+				connection.prepareStatement(
+					"UPDATE work_alias_observation SET work_id = ? " +
+						"WHERE work_id = ? AND source = ? AND source_key = ? AND user_id = ?",
+				).use { statement ->
+					statement.setLong(1, from)
+					statement.setLong(2, into)
+					statement.setString(3, observation.getValue("source").jsonPrimitive.content)
+					statement.setString(4, observation.getValue("key").jsonPrimitive.content)
+					statement.setString(5, observation.getValue("user").jsonPrimitive.content)
+					statement.executeUpdate()
+				}
+			}
 			record?.get("externals")?.jsonArray?.forEach { element ->
 				val external = element.jsonObject
 				connection.prepareStatement(
@@ -1009,6 +1115,8 @@ class WorkRepository(private val dataSource: DataSource) {
 					statement.executeUpdate()
 				}
 			}
+			rebuildRatingAggregate(connection, into)
+			rebuildRatingAggregate(connection, from)
 
 			connection.prepareStatement("UPDATE work SET merged_into = NULL WHERE id = ?").use { statement ->
 				statement.setLong(1, from)
@@ -1045,6 +1153,26 @@ class WorkRepository(private val dataSource: DataSource) {
 				}
 			}
 
+	private fun movedObservations(connection: java.sql.Connection, from: Long): JsonArray =
+		connection.prepareStatement(
+			"SELECT source, source_key, user_id FROM work_alias_observation WHERE work_id = ?",
+		).use { statement ->
+			statement.setLong(1, from)
+			statement.executeQuery().use { rows ->
+				buildJsonArray {
+					while (rows.next()) {
+						add(
+							buildJsonObject {
+								put("source", rows.getString(1))
+								put("key", rows.getString(2))
+								put("user", rows.getString(3))
+							},
+						)
+					}
+				}
+			}
+		}
+
 	private fun movedExternalIds(connection: java.sql.Connection, from: Long): JsonArray =
 		connection.prepareStatement("SELECT provider, external_id FROM work_external_id WHERE work_id = ?")
 			.use { statement ->
@@ -1079,6 +1207,36 @@ class WorkRepository(private val dataSource: DataSource) {
 				}
 			}
 		}
+
+	/** Rebuilds one denormalized rating row after a merge changes rating ownership. */
+	private fun rebuildRatingAggregate(connection: java.sql.Connection, workId: Long) {
+		connection.prepareStatement("DELETE FROM work_rating_agg WHERE work_id = ?").use { statement ->
+			statement.setLong(1, workId)
+			statement.executeUpdate()
+		}
+		connection.prepareStatement(
+			"""
+			INSERT INTO work_rating_agg (work_id, count, value_sum, mean, bayesian, histogram, updated_at)
+			SELECT ?, count(*)::integer, sum(value)::bigint, avg(value)::real,
+			       ((20.0 * COALESCE(
+			           (SELECT sum(value_sum)::float8 / NULLIF(sum(count), 0) FROM rating_global_shard), 0
+			       )) + sum(value)) / (20.0 + count(*)),
+			       ARRAY[
+			           count(*) FILTER (WHERE value BETWEEN 1 AND 2),
+			           count(*) FILTER (WHERE value BETWEEN 3 AND 4),
+			           count(*) FILTER (WHERE value BETWEEN 5 AND 6),
+			           count(*) FILTER (WHERE value BETWEEN 7 AND 8),
+			           count(*) FILTER (WHERE value BETWEEN 9 AND 10)
+			       ]::integer[], now()
+			FROM rating WHERE work_id = ?
+			HAVING count(*) > 0
+			""".trimIndent(),
+		).use { statement ->
+			statement.setLong(1, workId)
+			statement.setLong(2, workId)
+			statement.executeUpdate()
+		}
+	}
 
 	/**
 	 * Where a merged-away work went, so clients holding a stale id can be redirected (PLAN.md §5).
