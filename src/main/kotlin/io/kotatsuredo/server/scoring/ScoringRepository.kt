@@ -160,8 +160,26 @@ class ScoringRepository(private val dataSource: DataSource) {
 		const val MAX_SCORES_PER_REGION = 1_200
 
 		/**
-		 * Every authenticated identity contributes. A reporter counts once per source, operation, and day;
-		 * seniority changes its bounded weight instead of deciding whether its telemetry exists at all.
+		 * A reporter-day is evidence worth at most this many attempts. One failed try is one failure, not
+		 * as much as a device that made hundreds - and no single device can outvote many others either.
+		 */
+		const val MAX_EVIDENCE_PER_SAMPLE = 20
+
+		/** Below this many sources in a day there is too little to tell a broken device from bad luck. */
+		const val DEVICE_FAILURE_MIN_SOURCES = 3
+
+		/** Share of a reporter's sources that mostly failed before the device, not the sources, is blamed. */
+		const val DEVICE_FAILURE_SHARE = 0.8
+
+		/**
+		 * Every authenticated identity contributes. A reporter counts once per source and day; seniority
+		 * changes its bounded weight instead of deciding whether its telemetry exists at all.
+		 *
+		 * Stability excludes reporter-days where the *device* looks broken: offline, captive portal, dead
+		 * DNS or a bad VPN fail every source at once, and averaging that in would demote whatever those
+		 * devices happened to use. A source that only such devices reported falls back to their data -
+		 * a real outage everywhere must still show, and discarding it all would score the source as zero.
+		 * Popularity and sample size still count every reporter: a broken device still used the source.
 		 */
 		val AGGREGATE = """
 			WITH decayed AS (
@@ -187,23 +205,47 @@ class ScoringRepository(private val dataSource: DataSource) {
 				FROM decayed
 				GROUP BY source, region, day, reporter_day
 			),
+			device_health AS (
+				SELECT region, day, reporter_day,
+				       NOT (
+				         COUNT(*) >= $DEVICE_FAILURE_MIN_SOURCES
+				         AND COUNT(*) FILTER (WHERE fail > ok) >= $DEVICE_FAILURE_SHARE * COUNT(*)
+				       ) AS healthy
+				FROM reporter_samples
+				WHERE ok + fail > 0
+				GROUP BY region, day, reporter_day
+			),
+			weighted AS (
+				SELECT s.source, s.region, s.ok, s.fail, s.empty, s.cf_blocked, s.latency,
+				       s.w * (0.5 + s.tier * 0.25) AS trust_w,
+				       LEAST(s.ok + s.fail, $MAX_EVIDENCE_PER_SAMPLE) AS evidence,
+				       COALESCE(h.healthy, TRUE) AS healthy
+				FROM reporter_samples s
+				LEFT JOIN device_health h USING (region, day, reporter_day)
+			),
+			selected AS (
+				SELECT *,
+				       healthy OR NOT bool_or(healthy) OVER (PARTITION BY source, region) AS counted
+				FROM weighted
+			),
 			aggregated AS (
 				SELECT source, region,
-				       SUM((ok / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS ok_w,
-				       SUM((fail / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS fail_w,
-				       SUM((empty / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS empty_w,
-				       SUM((cf_blocked / NULLIF(ok + fail, 0)) * w * (0.5 + tier * 0.25) * 20) AS cf_w,
-				       SUM(latency * w * (0.5 + tier * 0.25)) AS lat_num,
-				       SUM(w * (0.5 + tier * 0.25)) AS weight,
+				       SUM((ok / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS ok_w,
+				       SUM((fail / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS fail_w,
+				       SUM((empty / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS empty_w,
+				       SUM((cf_blocked / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS cf_w,
+				       SUM(latency * trust_w * evidence) FILTER (WHERE counted) AS lat_num,
+				       SUM(trust_w * evidence) FILTER (WHERE counted) AS lat_den,
+				       SUM(trust_w)                 AS weight,
 				       COUNT(*)                     AS sample_size
-				FROM reporter_samples GROUP BY source, region
+				FROM selected GROUP BY source, region
 			)
 			SELECT source, region,
-			       ok_w::float8    AS ok_w,
-			       fail_w::float8  AS fail_w,
-			       empty_w::float8 AS empty_w,
-			       cf_w::float8    AS cf_w,
-			       COALESCE(lat_num / NULLIF(weight, 0), 0)::float8 AS p50_w,
+			       COALESCE(ok_w, 0)::float8    AS ok_w,
+			       COALESCE(fail_w, 0)::float8  AS fail_w,
+			       COALESCE(empty_w, 0)::float8 AS empty_w,
+			       COALESCE(cf_w, 0)::float8    AS cf_w,
+			       COALESCE(lat_num / NULLIF(lat_den, 0), 0)::float8 AS p50_w,
 			       weight::float8 AS reporter_w,
 			       sample_size
 			FROM aggregated

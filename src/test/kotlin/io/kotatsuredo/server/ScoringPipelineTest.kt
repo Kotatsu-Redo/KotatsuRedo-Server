@@ -134,6 +134,55 @@ class ScoringPipelineTest {
 		assertTrue(aggregate.okWeighted > 0.0)
 	}
 
+	/** A single failed try is one failure, not a device-day's worth of them. */
+	@Test
+	fun `evidence is capped by attempts so one blip cannot outweigh a busy reporter`() {
+		report("blip", "SOURCE", ok = 0, fail = 1)
+		report("steady", "SOURCE", ok = 200, fail = 0)
+
+		val aggregate = scoringRepository.aggregate().single()
+
+		assertEquals(1.0, aggregate.failWeighted, 0.0001, "one attempt is one attempt")
+		assertEquals(20.0, aggregate.okWeighted, 0.0001, "a busy reporter is capped, not unbounded")
+	}
+
+	/** Offline, captive portal, dead DNS: every source fails at once, and none of them is to blame. */
+	@Test
+	fun `a device failing every source does not demote those sources`() {
+		listOf("ONE", "TWO", "THREE").forEach { source ->
+			report("healthy-device", source, ok = 100, fail = 0)
+			report("offline-device", source, ok = 0, fail = 100)
+		}
+
+		scoringRepository.aggregate().forEach { aggregate ->
+			assertEquals(0.0, aggregate.failWeighted, 0.0001, "${aggregate.source} blamed for a broken device")
+			assertEquals(2, aggregate.sampleSize, "a broken device still counts as a reporter")
+		}
+	}
+
+	@Test
+	fun `a source failing for an otherwise healthy device is still demoted`() {
+		report("reporter", "WORKS", ok = 100, fail = 0)
+		report("reporter", "ALSO_WORKS", ok = 100, fail = 0)
+		report("reporter", "DEAD", ok = 0, fail = 100)
+
+		val dead = scoringRepository.aggregate().single { it.source == "DEAD" }
+
+		assertEquals(20.0, dead.failWeighted, 0.0001)
+	}
+
+	/** If only broken-looking devices reported a source, their data is all there is - a real outage. */
+	@Test
+	fun `a source seen only by failing devices falls back to their reports`() {
+		listOf("ONE", "TWO", "THREE").forEach { source -> report("offline-device", source, ok = 0, fail = 100) }
+		report("healthy-device", "ONE", ok = 100, fail = 0)
+
+		val aggregates = scoringRepository.aggregate().associateBy { it.source }
+
+		assertEquals(0.0, aggregates.getValue("ONE").failWeighted, 0.0001)
+		assertTrue(aggregates.getValue("TWO").failWeighted > 0.0, "an outage seen by no healthy device must still show")
+	}
+
 	@Test
 	fun `regions are scored independently`() {
 		telemetry.record(
