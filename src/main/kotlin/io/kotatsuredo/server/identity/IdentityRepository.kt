@@ -24,7 +24,13 @@ class IdentityRepository(
 	private val db: ExposedDatabase,
 	private val dataSource: DataSource,
 ) {
-	private data class RatingStats(val workId: Long, val count: Int, val mean: Double, val histogram: List<Int>)
+	private data class RatingStats(
+		val workId: Long,
+		val count: Int,
+		val valueSum: Long,
+		val mean: Double,
+		val histogram: List<Int>,
+	)
 
 	data class HelloRecord(
 		val identity: Identity,
@@ -300,7 +306,7 @@ class IdentityRepository(
 		}
 		val aggregates = connection.prepareStatement(
 			"""
-			SELECT input.work_id, count(r.value), COALESCE(avg(r.value), 0),
+			SELECT input.work_id, count(r.value), COALESCE(sum(r.value), 0), COALESCE(avg(r.value), 0),
 			       count(r.value) FILTER (WHERE r.value BETWEEN 1 AND 2),
 			       count(r.value) FILTER (WHERE r.value BETWEEN 3 AND 4),
 			       count(r.value) FILTER (WHERE r.value BETWEEN 5 AND 6),
@@ -315,27 +321,37 @@ class IdentityRepository(
 			it.executeQuery().use { rows ->
 				buildList {
 					while (rows.next()) {
-						val count = rows.getInt(2)
-						val mean = rows.getDouble(3)
-						add(RatingStats(rows.getLong(1), count, mean, (4..8).map(rows::getInt)))
+						add(
+							RatingStats(
+								workId = rows.getLong(1),
+								count = rows.getInt(2),
+								valueSum = rows.getLong(3),
+								mean = rows.getDouble(4),
+								histogram = (5..9).map(rows::getInt),
+							),
+						)
 					}
 				}
 			}
 		}
+		// value_sum is what the next incremental rating write adds to. Leaving it out kept the erased
+		// ratings in it, so every later average was computed against a sum that still held them.
 		connection.prepareStatement(
 			"""
-			INSERT INTO work_rating_agg (work_id, count, mean, bayesian, histogram, updated_at)
-			VALUES (?, ?, ?, ?, ?, now())
-			ON CONFLICT (work_id) DO UPDATE SET count = EXCLUDED.count, mean = EXCLUDED.mean,
-				bayesian = EXCLUDED.bayesian, histogram = EXCLUDED.histogram, updated_at = now()
+			INSERT INTO work_rating_agg (work_id, count, value_sum, mean, bayesian, histogram, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, now())
+			ON CONFLICT (work_id) DO UPDATE SET count = EXCLUDED.count, value_sum = EXCLUDED.value_sum,
+				mean = EXCLUDED.mean, bayesian = EXCLUDED.bayesian, histogram = EXCLUDED.histogram,
+				updated_at = now()
 			""".trimIndent(),
 		).use { update ->
 			aggregates.forEach { stats ->
 				update.setLong(1, stats.workId)
 				update.setInt(2, stats.count)
-				update.setDouble(3, stats.mean)
-				update.setDouble(4, RatingService.bayesianAverage(stats.count, stats.mean, globalMean))
-				update.setArray(5, connection.createArrayOf("integer", stats.histogram.toTypedArray()))
+				update.setLong(3, stats.valueSum)
+				update.setDouble(4, stats.mean)
+				update.setDouble(5, RatingService.bayesianAverage(stats.count, stats.mean, globalMean))
+				update.setArray(6, connection.createArrayOf("integer", stats.histogram.toTypedArray()))
 				update.addBatch()
 			}
 			update.executeBatch()

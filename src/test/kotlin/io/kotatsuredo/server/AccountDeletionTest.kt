@@ -90,4 +90,23 @@ class AccountDeletionTest {
 		assertEquals("And here are mine in response.", survivor.body)
 		assertEquals(other.id, survivor.userId)
 	}
+
+	/**
+	 * The erased rating must leave the running sum too, not only the count and histogram. Otherwise the
+	 * next rating is averaged against a sum that still holds the old one: a work with a single 5-star
+	 * rating was shown at 10 stars.
+	 */
+	@Test
+	fun `deleting an account removes its rating from the average`() {
+		val workId = works.createWork("Rated Manga", 2020, "manga", nsfw = false)
+		val leaving = user("leaving")
+		ratings.rate(workId, leaving.id, 10)
+		identities.deleteEverything(leaving.id)
+
+		val aggregate = ratings.rate(workId, user("staying").id, 10)
+
+		assertEquals(1, aggregate.count)
+		assertEquals(10.0, aggregate.mean, "the average must not exceed the highest possible rating")
+		assertEquals(10.0, ratings.aggregate(workId).mean)
+	}
 }
