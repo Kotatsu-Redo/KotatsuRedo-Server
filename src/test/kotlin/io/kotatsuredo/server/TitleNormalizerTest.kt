@@ -34,6 +34,7 @@ class TitleNormalizerTest {
 		assertMerges("Chainsaw Man", "Chainsaw Man (Full Color)")
 		assertMerges("Berserk", "Berserk (Digital)")
 		assertMerges("Vagabond", "Vagabond [Remastered]")
+		assertMerges("Past Life Returner", "Past Life Returner (Remake 2022)")
 	}
 
 	@Test

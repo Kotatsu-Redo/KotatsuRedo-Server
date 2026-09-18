@@ -20,6 +20,11 @@ services:
     # Not published to the host: only the api container needs to reach it.
     expose:
       - "5432"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   migrate:
     build: .
@@ -43,6 +48,7 @@ services:
       APP_ENV: ${APP_ENV:-production}
       PORT: ${PORT:-8787}
       HOST: 0.0.0.0
+      LOG_DIR: /var/log/kotatsuredo
       # The API is reachable only through Caddy in this topology, so its appended address is trusted.
       TRUST_PROXY_HEADERS: "true"
       SECURE_COOKIES: "true"
@@ -69,6 +75,19 @@ services:
       MOD_BOOTSTRAP_PASSWORD: ${MOD_BOOTSTRAP_PASSWORD:-}
     expose:
       - "${PORT:-8787}"
+    # A ceiling, not a reservation. The JVM already sizes its heap to the container
+    # (MaxRAMPercentage in the Dockerfile); this stops a leak here from taking the database - or
+    # anything else on the box - down with it.
+    mem_limit: ${API_MEM_LIMIT:-2g}
+    volumes:
+      # Logs outlive the container. `docker compose logs` only ever shows the current one, so a
+      # redeploy used to erase the very window an incident needed looking at.
+      - api-logs:/var/log/kotatsuredo
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   caddy:
     image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
@@ -89,5 +108,6 @@ services:
 
 volumes:
   postgres-data:
+  api-logs:
   caddy-data:
   caddy-config:

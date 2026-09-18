@@ -611,6 +611,48 @@ class ModeratorRepository(
 		}
 	}
 
+	/**
+	 * Marks a comment as judged and fine, so the computed queues stop offering it.
+	 *
+	 * Nothing about the comment itself changes - not its text, not its state, not what its author
+	 * sees. Dismissing twice is not an error; the second one simply changes nothing and is not
+	 * audited, because a queue button that reports failure for being pressed twice is a bad button.
+	 */
+	fun dismissCommentWithAudit(
+		moderatorId: String,
+		commentId: Long,
+		reason: String?,
+		flaggedRule: String?,
+	): Boolean = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			val changed = connection.prepareStatement(
+				"UPDATE comment SET dismissed_at = now(), dismissed_by = ? " +
+					"WHERE id = ? AND dismissed_at IS NULL",
+			).use { statement ->
+				statement.setString(1, moderatorId)
+				statement.setLong(2, commentId)
+				statement.executeUpdate() > 0
+			}
+			if (!changed) {
+				connection.rollback()
+				return@use false
+			}
+			insertAudit(
+				connection, moderatorId, ModActions.DISMISS_COMMENT, ModActions.TARGET_COMMENT,
+				commentId.toString(), reason,
+				buildJsonObject { put("flagged_rule", flaggedRule) }.toString(),
+			)
+			connection.commit()
+			true
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
+
 	fun removeCommentWithAudit(
 		moderatorId: String,
 		commentId: Long,

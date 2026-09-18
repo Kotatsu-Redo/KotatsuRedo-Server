@@ -25,6 +25,8 @@ object TitleNormalizer {
 	private val EDITION_TOKENS = setOf(
 		"official", "officially", "colored", "coloured", "color", "colour", "full color", "full colour",
 		"fan colored", "fan coloured", "digital", "digitally", "raw", "raws", "remastered", "remaster",
+		// A redrawn release of the same story: sources list "X (Remake 2022)" beside plain "X".
+		"remake",
 		"webtoon", "webcomic", "novel", "light novel", "doujinshi", "doujin", "manhwa", "manhua",
 		"uncensored", "censored", "scanlation", "scan", "scans", "hd", "reprint", "omnibus",
 		"complete", "completed", "ongoing", "oneshot", "one shot", "anthology", "tankoubon",

@@ -50,17 +50,44 @@ class CatalogueLookup(
 	 * round trip ever rather than one per user who opens it. Bounded, and cheap to lose on restart.
 	 */
 	private val misses = ConcurrentHashMap.newKeySet<String>()
-	private val inFlight = ConcurrentHashMap<String, Deferred<CatalogueRecord?>>()
+	private val inFlight = ConcurrentHashMap<String, Deferred<CatalogueOutcome>>()
 
-	suspend fun lookup(title: String, year: Int? = null): CatalogueRecord? = coroutineScope {
-		val key = TitleNormalizer.normalize(title)
-		if (key.isEmpty() || key in misses) return@coroutineScope null
+	/** The record, or null whether nobody lists it or nobody answered. See [lookupOutcome]. */
+	suspend fun lookup(
+		title: String,
+		year: Int? = null,
+		contentType: String? = null,
+	): CatalogueRecord? = (lookupOutcome(title, year, contentType) as? CatalogueOutcome.Found)?.record
+
+	/**
+	 * The full answer, for callers that must tell "no catalogue lists this" from "no catalogue
+	 * answered". The enricher is one: the first means the work stands on its own title for good, the
+	 * second means try again later, and treating them alike loses works to a bad minute.
+	 */
+	suspend fun lookupOutcome(
+		title: String,
+		year: Int? = null,
+		contentType: String? = null,
+	): CatalogueOutcome = coroutineScope {
+		// The content type is part of the question, not a filter on the answer: the same title asked
+		// about as a novel and as a manhwa can have two different right answers, and one must not
+		// negative-cache or share an in-flight lookup with the other.
+		val key = TitleNormalizer.normalize(title).let { normalized ->
+			if (normalized.isEmpty()) normalized else "$normalized|${contentType?.lowercase().orEmpty()}"
+		}
+		if (key.isEmpty() || key in misses) return@coroutineScope CatalogueOutcome.NotListed
 		inFlight[key]?.let { return@coroutineScope it.await() }
 		// Overload must not look like a catalogue miss: the resolver would otherwise create and retain
 		// a provisional work even though no provider was consulted.
 		if (!admission.tryAcquire()) throw CatalogueLookupOverloaded()
 		val mine = async(start = CoroutineStart.LAZY) {
-			withTimeoutOrNull(LOOKUP_DEADLINE_MS) { lookupOnce(key, title, year) }
+			// A lookup that ran out of time has not answered either, and the queue above is sized to
+			// drain well inside this deadline. Calling it a miss would leave a provisional work behind -
+			// the exact split a slow provider used to cause - so it refuses instead, which costs the
+			// caller one retry and nothing permanent.
+			withTimeoutOrNull(LOOKUP_DEADLINE_MS) {
+				lookupOnce(key, title, year, contentType)
+			} ?: throw CatalogueLookupOverloaded()
 		}
 		val active = inFlight.putIfAbsent(key, mine) ?: mine
 		if (active !== mine) {
@@ -77,32 +104,109 @@ class CatalogueLookup(
 		}
 	}
 
-	private suspend fun lookupOnce(key: String, title: String, year: Int?): CatalogueRecord? {
+	private suspend fun lookupOnce(
+		key: String,
+		title: String,
+		year: Int?,
+		contentType: String?,
+	): CatalogueOutcome {
+		var silent = false
+		val found = mutableListOf<CatalogueRecord>()
 		gate.withPermit {
 			// Another caller may have completed the same miss while this one waited for the gate.
-			if (key in misses) return null
+			if (key in misses) return CatalogueOutcome.NotListed
+			// Every provider, not the first that answers. Each one knows identifiers the others do not
+			// - MangaDex carries the MyAnimeList and AniList ids, MangaUpdates the associated names -
+			// and it is having *all* of them that lets two works found by two sources turn out to be
+			// one. Stopping at the first answer is how a work ends up with a single id and no way to
+			// meet its own duplicate.
 			providers.forEach { provider ->
-				val record = runCatching { provider.lookup(title, year) }
-					.onFailure { log.warn("Catalogue {} lookup failed", provider.name, it) }
+				val record = runCatching { provider.lookup(title, year, contentType) }
+					.onFailure { error ->
+						// A provider that could not answer has said nothing about this title. Counting
+						// that as "not in any catalogue" is how an outage turns into a permanent
+						// provisional work that no other source can ever match.
+						silent = true
+						when (error) {
+							is CatalogueUnavailable -> log.debug("Catalogue {} is unavailable", provider.name)
+							else -> log.warn("Catalogue {} lookup failed", provider.name, error)
+						}
+					}
 					.getOrNull()
-				if (record != null) {
-					log.debug("Catalogue resolved a title via {} ({} titles)", provider.name, record.titles.size)
-					return record
-				}
+				if (record != null) found += record
 			}
 		}
 
+		if (found.isNotEmpty()) {
+			val combined = combine(found)
+			log.debug(
+				"Catalogue resolved a title via {} ({} titles, {} ids)",
+				found.joinToString("+") { it.provider }, combined.titles.size, combined.externalIds.size,
+			)
+			// Partial when somebody was unreachable: what came back is worth keeping, and the work is
+			// worth asking about again once they are back.
+			return CatalogueOutcome.Found(combined, partial = silent)
+		}
+		if (silent) return CatalogueOutcome.Unavailable
 		if (misses.size < MAX_NEGATIVE_CACHE) misses.add(key)
-		return null
+		return CatalogueOutcome.NotListed
+	}
+
+	/**
+	 * Folds every answer into one record.
+	 *
+	 * The first provider to answer names the work - order is the preference - and the rest contribute
+	 * what they alone know: their titles, and above all their identifiers.
+	 */
+	private fun combine(records: List<CatalogueRecord>): CatalogueRecord {
+		val primary = records.first()
+		if (records.size == 1) return primary
+		return primary.copy(
+			titles = records.flatMap { it.titles }.distinct(),
+			// An earlier provider's id wins a collision, so the answer does not change with timing.
+			externalIds = buildMap { records.forEach { record -> record.externalIds.forEach(::putIfAbsent) } },
+			year = records.firstNotNullOfOrNull { it.year },
+			contentType = records.firstNotNullOfOrNull { it.contentType },
+			// Any catalogue calling it adult is enough; none of them mark it by accident.
+			nsfw = records.any { it.nsfw },
+			relations = records.flatMap { it.relations }.distinct(),
+		)
 	}
 
 	private companion object {
-		/** Politeness to catalogues that are doing us a favour by being open and unauthenticated. */
-		const val MAX_CONCURRENT = 2
-		const val MAX_QUEUED = 16
+		/**
+		 * Politeness to catalogues that are doing us a favour by being open and unauthenticated. This
+		 * is a courtesy to someone else's server, so it is deliberately not scaled to our hardware.
+		 */
+		const val MAX_CONCURRENT = 4
+
+		/**
+		 * Where the 429s came from: this pool, not the database. Refusing a queued lookup turns an
+		 * external catalogue being busy into a missing rating row, so the queue is now deep enough to
+		 * absorb a burst and shallow enough to drain inside [LOOKUP_DEADLINE_MS] - at four in flight
+		 * and about a second each, roughly 120 lookups fit in the deadline, so 96 waits rather than
+		 * times out.
+		 */
+		const val MAX_QUEUED = 96
 		const val MAX_NEGATIVE_CACHE = 50_000
 		const val LOOKUP_DEADLINE_MS = 30_000L
 	}
+}
+
+/** What a completed lookup can say. */
+sealed interface CatalogueOutcome {
+	/**
+	 * @param partial true when at least one provider could not be reached, so the record is what the
+	 *  rest knew. Worth applying and worth asking again later, because the missing provider is often
+	 *  the one holding the identifier that joins this work to its duplicate.
+	 */
+	data class Found(val record: CatalogueRecord, val partial: Boolean = false) : CatalogueOutcome
+
+	/** Every provider answered and none of them has this title. Worth remembering. */
+	data object NotListed : CatalogueOutcome
+
+	/** At least one provider could not be reached or replied unusably. Worth retrying. */
+	data object Unavailable : CatalogueOutcome
 }
 
 class CatalogueLookupOverloaded : RuntimeException("catalogue lookup capacity exhausted")
@@ -122,11 +226,11 @@ class JdkHttpFetcher(
 ) : HttpFetcher {
 	private data class FetchResponse(val statusCode: Int, val retryAfter: String?, val body: String?)
 
-	override suspend fun fetch(url: String, jsonBody: String?): String? {
+	override suspend fun fetch(url: String, jsonBody: String?, accept: String): String? {
 		repeat(MAX_ATTEMPTS) { attempt ->
 			val builder = HttpRequest.newBuilder(URI.create(url))
 				.header("User-Agent", userAgent)
-				.header("Accept", "application/json")
+				.header("Accept", accept)
 				.timeout(Duration.ofSeconds(20))
 			if (jsonBody != null) {
 				builder.header("Content-Type", "application/json")

@@ -8,6 +8,7 @@ import io.kotatsuredo.server.auth.requireCaller
 import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
+import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.works.LinkOutcome
 import io.kotatsuredo.server.works.WorkFingerprint
 import io.kotatsuredo.server.works.WorkLinker
@@ -94,7 +95,11 @@ fun Route.workRoutes(
 			RateLimiter.Bucket.WORK_MUTATION,
 			caller.tier,
 			caller.identity.id,
-			cost = titleInputs,
+			// One manga, one unit. Charging per title made an app that sends the alt title its source
+			// shows - which is most of them, and exactly what makes matching work - cost double, so a
+			// new account's hundred an hour was really fifty manga of browsing. The batch is still
+			// bounded by MAX_TITLE_INPUTS_PER_BATCH above.
+			cost = body.works.size,
 		)
 
 		val resolved = try {
@@ -125,7 +130,9 @@ fun Route.workRoutes(
 				}
 			}.awaitAll() }
 		} catch (_: WorkResolutionOverloaded) {
-			throw ApiException(ApiError.RateLimited(1, "work_resolution_capacity"))
+			// Not a quota: the caller did nothing wrong and the same request will work in a moment.
+			ServerMetrics.recordOverloaded("work_resolution")
+			throw ApiException(ApiError.Overloaded(1, "work_resolution"))
 		}
 		call.respond(ResolveResponse(resolved))
 	}
@@ -225,6 +232,7 @@ private fun FingerprintRef.isValid(): Boolean =
 
 private fun FingerprintDto.isValid(): Boolean =
 	FingerprintRef(source, key).isValid() &&
+		source !in WorkLimits.NON_NETWORK_SOURCES &&
 		title.length in 1..MAX_TITLE &&
 		title.none(Char::isISOControl) &&
 		altTitles.size <= MAX_ALT_TITLES &&

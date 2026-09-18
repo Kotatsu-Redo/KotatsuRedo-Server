@@ -10,8 +10,10 @@ import io.kotatsuredo.server.works.ResolutionMethod
 import io.kotatsuredo.server.works.WorkFingerprint
 import io.kotatsuredo.server.works.WorkLinker
 import io.kotatsuredo.server.works.WorkRepository
+import io.kotatsuredo.server.works.WorkEnricher
 import io.kotatsuredo.server.works.WorkResolver
 import io.kotatsuredo.server.works.WorkResolutionOverloaded
+import io.kotatsuredo.server.works.TitleNormalizer
 import io.kotatsuredo.server.works.TitleToStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -59,7 +61,7 @@ class WorkResolverTest {
 		listOf(
 			object : CatalogueProvider {
 				override val name = "fake"
-				override suspend fun lookup(title: String, year: Int?): CatalogueRecord? {
+				override suspend fun lookup(title: String, year: Int?, contentType: String?): CatalogueRecord? {
 					catalogueCalls.incrementAndGet()
 					return if (titles.isEmpty()) null else CatalogueRecord(
 						provider = "fake",
@@ -76,8 +78,11 @@ class WorkResolverTest {
 		),
 	)
 
-	private fun resolver(vararg catalogueTitles: String) =
-		WorkResolver(repository, catalogue(*catalogueTitles))
+	private fun resolver(vararg catalogueTitles: String) = WorkResolver(repository)
+
+	/** The enricher the resolver now hands unknown works to, wired to the fake catalogue above. */
+	private fun enricher(vararg catalogueTitles: String) =
+		WorkEnricher(repository, catalogue(*catalogueTitles), ratings = null)
 
 	private fun fingerprint(
 		source: String,
@@ -147,47 +152,32 @@ class WorkResolverTest {
 	// -- the ladder ------------------------------------------------------------------------------
 
 	@Test
-	fun `an unknown manga is created from the catalogue with all its renderings`() = runTest {
-		val resolution = resolver("Chainsaw Man", "Chainsawman", "チェンソーマン")
-			.resolve(fingerprint("MANGADEX", title = "Chainsaw Man"))
+	fun `an unknown manga is created at once and the catalogue fills it in afterwards`() = runTest {
+		// The reader never waits on Kitsu: the work exists as soon as the request is answered.
+		val resolution = resolver().resolve(fingerprint("MANGADEX", title = "Chainsaw Man"))
 
 		assertTrue(resolution.created)
-		assertEquals(ResolutionMethod.CATALOGUE, resolution.method)
+		assertEquals(ResolutionMethod.CREATED, resolution.method)
 		assertEquals(1L, repository.countWorks())
-	}
+		assertEquals(0, catalogueCalls.get(), "resolution must not consult a catalogue")
 
-	@Test
-	fun `an invalid catalogue year falls back to the client year`() = runTest {
-		val invalidYearCatalogue = CatalogueLookup(
-			listOf(
-				object : CatalogueProvider {
-					override val name = "invalid-year"
-					override suspend fun lookup(title: String, year: Int?) = CatalogueRecord(
-						provider = name,
-						externalId = "invalid-year-1",
-						canonicalTitle = title,
-						titles = listOf(title),
-						year = Int.MAX_VALUE,
-						contentType = "manga",
-						nsfw = false,
-						externalIds = emptyMap(),
-					)
-				},
-			),
+		val report = enricher("Chainsaw Man", "Chainsawman", "チェンソーマン").drainOnce()
+
+		assertEquals(1, report.enriched)
+		val titles = repository.titlesOf(resolution.workId)
+		assertTrue(
+			TitleNormalizer.keys("Chainsawman").any { it in titles },
+			"the catalogue's renderings should now be indexed: " + titles,
 		)
-
-		val resolution = WorkResolver(repository, invalidYearCatalogue)
-			.resolve(fingerprint("MANGADEX", title = "Fallback Year", year = 2026))
-
-		assertTrue(resolution.created)
-		assertEquals(2026, repository.metadataOf(resolution.workId)?.second)
 	}
 
 	/** The point of the whole design: a different source with a different spelling, same thread. */
 	@Test
 	fun `a second source using a different rendering resolves to the same work`() = runTest {
-		val resolver = resolver("Chainsaw Man", "Chainsawman", "チェンソーマン")
+		val resolver = resolver()
 		val first = resolver.resolve(fingerprint("MANGADEX", title = "Chainsaw Man"))
+		// The renderings arrive with enrichment, which is what lets the other spellings land here.
+		enricher("Chainsaw Man", "Chainsawman", "チェンソーマン").drainOnce()
 		val second = resolver.resolve(fingerprint("COMICK", title = "Chainsawman"))
 		val third = resolver.resolve(fingerprint("SOME_JP_SOURCE", title = "チェンソーマン"))
 
@@ -199,19 +189,19 @@ class WorkResolverTest {
 
 	@Test
 	fun `the second visit from the same source is an alias hit`() = runTest {
-		val resolver = resolver("Chainsaw Man")
+		val resolver = resolver()
 		resolver.resolve(fingerprint("MANGADEX", title = "Chainsaw Man"))
 		val again = resolver.resolve(fingerprint("MANGADEX", title = "Chainsaw Man"))
 
 		assertEquals(ResolutionMethod.ALIAS, again.method)
-		assertEquals(1, catalogueCalls.get(), "an alias hit must not touch the catalogue")
+		assertEquals(0, catalogueCalls.get(), "no resolve may touch the catalogue")
 	}
 
 	@Test
 	fun `public aliases require five settled reporters and conflicting titles stay separate`() = runTest {
 		listOf("reporter-a", "reporter-b", "reporter-c", "reporter-d", "reporter-e", "reporter-f")
 			.forEach(::reporter)
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 		val key = "/shared/source-key"
 
 		val first = resolver.resolve(fingerprint("SOURCE", key, "Good Work"), "reporter-a")
@@ -234,7 +224,7 @@ class WorkResolverTest {
 	@Test
 	fun `three fresh accounts cannot promote a public alias`() = runTest {
 		listOf("fresh-a", "fresh-b", "fresh-c").forEach { reporter(it, settled = false) }
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 		val key = "/fresh/source-key"
 
 		listOf("fresh-a", "fresh-b", "fresh-c").forEach {
@@ -248,7 +238,7 @@ class WorkResolverTest {
 	fun `five normal accounts cannot promote a public alias`() = runTest {
 		val reporters = listOf("normal-a", "normal-b", "normal-c", "normal-d", "normal-e")
 		reporters.forEach(::normalReporter)
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 		val key = "/normal/source-key"
 
 		reporters.forEach {
@@ -261,7 +251,7 @@ class WorkResolverTest {
 	@Test
 	fun `one account sees the same exact title as one work across comic sources`() = runTest {
 		reporter("reader", settled = false)
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 
 		val manga = resolver.resolve(
 			fingerprint("SOURCE_A", key = "/manga", title = "Shared Story", contentType = "manga"),
@@ -281,7 +271,7 @@ class WorkResolverTest {
 	fun `one account observation cannot select a work for another account`() = runTest {
 		reporter("reader-a", settled = false)
 		reporter("reader-b", settled = false)
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 
 		val first = resolver.resolve(fingerprint("SOURCE_A", title = "Untrusted Title"), "reader-a")
 		val second = resolver.resolve(fingerprint("SOURCE_B", title = "Untrusted Title"), "reader-b")
@@ -293,7 +283,7 @@ class WorkResolverTest {
 	@Test
 	fun `one account keeps same-title works with incompatible years separate`() = runTest {
 		reporter("reader", settled = false)
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 
 		val old = resolver.resolve(fingerprint("SOURCE_A", title = "Blue", year = 1990), "reader")
 		val remake = resolver.resolve(fingerprint("SOURCE_B", title = "Blue", year = 2025), "reader")
@@ -304,7 +294,7 @@ class WorkResolverTest {
 	@Test
 	fun `one account keeps a novel separate from a comic with the same title`() = runTest {
 		reporter("reader", settled = false)
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 
 		val comic = resolver.resolve(
 			fingerprint("SOURCE_A", title = "Shared Name", contentType = "manhwa"), "reader",
@@ -320,7 +310,7 @@ class WorkResolverTest {
 	fun `a pending observation with the same title but an incompatible year is not reused`() = runTest {
 		reporter("reporter-old")
 		reporter("reporter-new")
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 		val key = "/shared/reused-title"
 
 		val old = resolver.resolve(fingerprint("SOURCE", key, "Blue", year = 1990), "reporter-old")
@@ -334,7 +324,7 @@ class WorkResolverTest {
 	fun `concurrent public discovery of one alias leaves one work`() {
 		reporter("reporter-a")
 		reporter("reporter-b")
-		val resolver = WorkResolver(repository, catalogue = null)
+		val resolver = WorkResolver(repository)
 		val start = CountDownLatch(1)
 		val executor = Executors.newFixedThreadPool(2)
 		try {
@@ -352,102 +342,6 @@ class WorkResolverTest {
 		} finally {
 			executor.shutdownNow()
 		}
-	}
-
-	@Test
-	@OptIn(ExperimentalCoroutinesApi::class)
-	fun `catalogue admission remains bounded independently of local resolution`() = runTest {
-		val release = CompletableDeferred<Unit>()
-		val calls = AtomicInteger()
-		val slowCatalogue = CatalogueLookup(
-			listOf(
-				object : CatalogueProvider {
-					override val name = "slow"
-					override suspend fun lookup(title: String, year: Int?): CatalogueRecord {
-						calls.incrementAndGet()
-						release.await()
-						return CatalogueRecord(
-							provider = name,
-							externalId = title,
-							canonicalTitle = title,
-							titles = listOf(title),
-							year = year,
-							contentType = "manga",
-							nsfw = false,
-							externalIds = emptyMap(),
-						)
-					}
-				},
-			),
-			maxConcurrent = 1,
-			maxQueued = 2,
-		)
-		val resolver = WorkResolver(repository, slowCatalogue, maxConcurrent = 1, maxQueued = 1)
-
-		val first = async { resolver.resolve(fingerprint("QUEUE_A", title = "Queue One")) }
-		runCurrent()
-		val second = async { resolver.resolve(fingerprint("QUEUE_B", title = "Queue Two")) }
-		runCurrent()
-		val third = async { resolver.resolve(fingerprint("QUEUE_C", title = "Queue Three")) }
-		runCurrent()
-		assertEquals(1, calls.get())
-
-		var overloaded = false
-		try {
-			resolver.resolve(fingerprint("QUEUE_D", title = "Queue Four"))
-		} catch (_: WorkResolutionOverloaded) {
-			overloaded = true
-		}
-		assertTrue(overloaded, "a fourth unique catalogue miss must fail before joining an unbounded queue")
-
-		release.complete(Unit)
-		first.await()
-		second.await()
-		third.await()
-	}
-
-	@Test
-	@OptIn(ExperimentalCoroutinesApi::class)
-	fun `catalogue overload does not create a provisional work`() = runTest {
-		val release = CompletableDeferred<Unit>()
-		val slowCatalogue = CatalogueLookup(
-			listOf(
-				object : CatalogueProvider {
-					override val name = "slow"
-					override suspend fun lookup(title: String, year: Int?): CatalogueRecord {
-						release.await()
-						return CatalogueRecord(
-							provider = name,
-							externalId = title,
-							canonicalTitle = title,
-							titles = listOf(title),
-							year = year,
-							contentType = "manga",
-							nsfw = false,
-							externalIds = emptyMap(),
-						)
-					}
-				},
-			),
-			maxConcurrent = 1,
-			maxQueued = 0,
-		)
-		val resolver = WorkResolver(repository, slowCatalogue, maxConcurrent = 2, maxQueued = 0)
-
-		val first = async { resolver.resolve(fingerprint("CATALOGUE_A", title = "Catalogue One")) }
-		runCurrent()
-		var overloaded = false
-		try {
-			resolver.resolve(fingerprint("CATALOGUE_B", title = "Catalogue Two"))
-		} catch (_: WorkResolutionOverloaded) {
-			overloaded = true
-		}
-		assertTrue(overloaded)
-		assertEquals(0L, repository.countWorks(), "overload must not be persisted as a catalogue miss")
-
-		release.complete(Unit)
-		first.await()
-		assertEquals(1L, repository.countWorks())
 	}
 
 	@Test
@@ -671,7 +565,7 @@ class WorkResolverTest {
 			fingerprint("MANGADEX", title = "Chainsaw Man", externalIds = mapOf("mal" to "116778")),
 		)
 		// No catalogue authority on the second request: its client-controlled id must remain a hint.
-		val second = WorkResolver(repository, catalogue = null).resolve(
+		val second = WorkResolver(repository).resolve(
 			fingerprint("WEIRD", title = "CSM RAW v2 [Complete]", externalIds = mapOf("mal" to "116778")),
 		)
 
@@ -769,54 +663,14 @@ class WorkResolverTest {
 
 	@Test
 	fun `the catalogue is consulted once per work, not once per source`() = runTest {
-		val resolver = resolver("Chainsaw Man", "Chainsawman")
+		val resolver = resolver()
 		resolver.resolve(fingerprint("A", key = "/1", title = "Chainsaw Man"))
-		resolver.resolve(fingerprint("B", key = "/2", title = "Chainsawman"))
 		resolver.resolve(fingerprint("C", key = "/3", title = "Chainsaw Man"))
+		enricher("Chainsaw Man", "Chainsawman").drainOnce()
+		resolver.resolve(fingerprint("B", key = "/2", title = "Chainsawman"))
+		enricher("Chainsaw Man", "Chainsawman").drainOnce()
 
 		assertEquals(1, catalogueCalls.get(), "catalogue called ${catalogueCalls.get()} times")
-	}
-
-	@Test
-	fun `a slow catalogue miss does not consume local resolver capacity`() = runTest {
-		val enteredCatalogue = CompletableDeferred<Unit>()
-		val releaseCatalogue = CompletableDeferred<Unit>()
-		val blockingCatalogue = CatalogueLookup(
-			providers = listOf(
-				object : CatalogueProvider {
-					override val name = "blocking"
-					override suspend fun lookup(title: String, year: Int?): CatalogueRecord? {
-						enteredCatalogue.complete(Unit)
-						releaseCatalogue.await()
-						return null
-					}
-				},
-			),
-			maxConcurrent = 1,
-			maxQueued = 0,
-		)
-		val resolver = WorkResolver(repository, blockingCatalogue, maxConcurrent = 1, maxQueued = 0)
-		val slowStripe = Math.floorMod(31 * "MISS".hashCode() + "/slow".hashCode(), WorkResolver.ALIAS_LOCK_STRIPES)
-		val knownSource = generateSequence(0) { it + 1 }
-			.map { "KNOWN_$it" }
-			.first {
-				Math.floorMod(31 * it.hashCode() + "/known".hashCode(), WorkResolver.ALIAS_LOCK_STRIPES) == slowStripe
-			}
-		val knownId = repository.createWork("Known Work", 2018, "manga", false)
-		repository.linkAlias(knownSource, "/known", knownId, 1.0, "test")
-
-		val slow = async { resolver.resolve(fingerprint("MISS", key = "/slow", title = "Never Seen")) }
-		enteredCatalogue.await()
-		try {
-			val local = withTimeout(1_000) {
-				resolver.resolve(fingerprint(knownSource, key = "/known", title = "Known Work"))
-			}
-			assertEquals(knownId, local.workId)
-			assertEquals(ResolutionMethod.ALIAS, local.method)
-		} finally {
-			releaseCatalogue.complete(Unit)
-		}
-		slow.await()
 	}
 
 	// -- user-confirmed links --------------------------------------------------------------------

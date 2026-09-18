@@ -21,7 +21,7 @@ class ResolutionWalkthroughTest {
 
 	private val record by lazy {
 		requireNotNull(
-			KitsuCatalogue(HttpFetcher { _, _ -> null }).parse(fixture("kitsu-chainsaw-man"), "Chainsaw Man"),
+			KitsuCatalogue(HttpFetcher { _, _, _ -> null }).parse(fixture("kitsu-chainsaw-man"), "Chainsaw Man"),
 		)
 	}
 

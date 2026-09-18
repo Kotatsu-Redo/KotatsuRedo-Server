@@ -222,6 +222,19 @@ class ModerationService(
 	}
 
 	/**
+	 * "Looked at it, it stays."
+	 *
+	 * The comment is untouched and its author is told nothing - the only thing that changes is that
+	 * the disliked and flagged queues stop offering it. Without this the queues can only be emptied
+	 * by removing comments that did not deserve removing, so they fill with things nobody can clear
+	 * and stop being read.
+	 */
+	fun dismissComment(actor: Moderator, commentId: Long, reason: String?): Boolean {
+		val existing = comments.find(commentId) ?: return false
+		return moderators.dismissCommentWithAudit(actor.id, commentId, reason, existing.flaggedRule)
+	}
+
+	/**
 	 * Puts a removed comment back, restoring its text from the audit snapshot.
 	 *
 	 * A comment its own author deleted has no snapshot and so cannot be restored - deliberately. A
@@ -346,6 +359,25 @@ class ModerationService(
 			put("into", into)
 		}
 		return true
+	}
+
+	/**
+	 * Hands a batch of never-described works to the enricher, which fills in their titles and ids and
+	 * merges away the ones that turn out to be duplicates of something we already had.
+	 *
+	 * Deliberately a button rather than a background sweep: it is thousands of requests to somebody
+	 * else's free API, and that is a decision a person makes, not something that starts on its own.
+	 *
+	 * @return how many were queued
+	 */
+	fun backfillCatalogue(actor: Moderator, limit: Int): Int {
+		val queued = works.enqueueBackfill(limit)
+		if (queued > 0) {
+			record(actor, ModActions.BACKFILL_CATALOGUE, ModActions.TARGET_SYSTEM, "catalogue", null) {
+				put("queued", queued)
+			}
+		}
+		return queued
 	}
 
 	fun unmergeWorks(actor: Moderator, from: Long, reason: String?): Boolean {

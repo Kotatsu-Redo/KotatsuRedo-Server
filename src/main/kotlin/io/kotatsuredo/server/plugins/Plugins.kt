@@ -1,6 +1,7 @@
 package io.kotatsuredo.server.plugins
 
 import io.kotatsuredo.server.ApiError
+import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.ApiException
 import io.kotatsuredo.server.auth.RateLimiter
 import io.kotatsuredo.server.auth.networkKey
@@ -89,6 +90,8 @@ fun Application.configureLogging() {
 		// Never interpolate headers, query strings with tokens, or bodies into this.
 		format { call ->
 			val status = call.response.status()?.value ?: 0
+			// Counted here because this already runs once per answered request, with the final status.
+			ServerMetrics.recordResponse(status)
 			"${call.request.httpMethod.value} ${call.request.path()} -> $status"
 		}
 	}
@@ -138,8 +141,10 @@ fun Application.configurePreAuthRateLimit(limiter: RateLimiter) {
 				TrustTier.NEW,
 			)
 		) {
-			is RateLimiter.Decision.Limited ->
+			is RateLimiter.Decision.Limited -> {
+				ServerMetrics.recordRateLimited(decision.bucket)
 				throw ApiException(ApiError.RateLimited(decision.retryAfterSeconds, decision.bucket))
+			}
 
 			RateLimiter.Decision.Allowed -> Unit
 		}

@@ -44,6 +44,24 @@ sealed class ApiError {
 		override val status get() = HttpStatusCode.TooManyRequests
 	}
 
+	/**
+	 * The server is briefly out of room for this kind of work - not a quota, and nothing the caller
+	 * did wrong.
+	 *
+	 * Deliberately distinct from [RateLimited] even though both are 429: a quota says "you have had
+	 * your share this hour" and wants a long back-off, this says "try again in a moment". A client
+	 * that cannot tell them apart has to treat the recoverable one like the permanent one, which is
+	 * what made a busy catalogue look like a work with no community data at all.
+	 */
+	@Serializable
+	@SerialName("overloaded")
+	data class Overloaded(
+		@SerialName("retry_after_s") val retryAfterSeconds: Long,
+		val resource: String,
+	) : ApiError() {
+		override val status get() = HttpStatusCode.TooManyRequests
+	}
+
 	/** Two people have already exchanged their three rounds in this chain. */
 	@Serializable
 	@SerialName("chain_depth_exceeded")

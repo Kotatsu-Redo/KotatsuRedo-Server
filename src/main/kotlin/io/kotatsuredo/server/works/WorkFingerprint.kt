@@ -26,6 +26,12 @@ object WorkLimits {
 	const val MAX_YEAR = 3_000
 
 	fun isValidYear(year: Int?): Boolean = year == null || year in MIN_YEAR..MAX_YEAR
+
+	/**
+	 * The app's placeholder sources. Their keys are device file paths or nothing at all, so the same key
+	 * means different things on different phones and a title is a folder name - never a work to resolve.
+	 */
+	val NON_NETWORK_SOURCES = setOf("LOCAL", "UNKNOWN", "TEST")
 }
 
 /** How a work was arrived at. Recorded on the alias so a bad rule can be found and undone later. */

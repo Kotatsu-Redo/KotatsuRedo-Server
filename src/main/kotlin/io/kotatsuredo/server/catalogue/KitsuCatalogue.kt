@@ -1,6 +1,7 @@
 package io.kotatsuredo.server.catalogue
 
 import io.kotatsuredo.server.works.TitleNormalizer
+import io.kotatsuredo.server.works.WorkCompatibility
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -33,17 +34,23 @@ class KitsuCatalogue(
 
 	private val json = Json { ignoreUnknownKeys = true }
 
-	override suspend fun lookup(title: String, year: Int?): CatalogueRecord? {
+	override suspend fun lookup(title: String, year: Int?, contentType: String?): CatalogueRecord? {
 		val query = URLEncoder.encode(title, StandardCharsets.UTF_8)
 		val url = "$baseUrl/manga?filter[text]=$query&page[limit]=$CANDIDATE_LIMIT&include=mappings"
-		val body = fetcher.get(url) ?: return null
+		// JSON:API, not JSON. Asking for the wrong one is a 406 on every single request.
+		val body = fetcher.get(url, ACCEPT_JSON_API) ?: throw CatalogueUnavailable(name)
 
-		return runCatching { parse(body, title, year) }
+		return runCatching { parse(body, title, year, contentType) }
 			.onFailure { log.warn("Failed to parse Kitsu response", it) }
 			.getOrNull()
 	}
 
-	fun parse(body: String, wantedTitle: String, year: Int? = null): CatalogueRecord? {
+	fun parse(
+		body: String,
+		wantedTitle: String,
+		year: Int? = null,
+		contentType: String? = null,
+	): CatalogueRecord? {
 		val root = json.parseToJsonElement(body).jsonObject
 		val data = root["data"]?.jsonArray ?: return null
 		if (data.isEmpty()) return null
@@ -65,7 +72,14 @@ class KitsuCatalogue(
 		// candidate that actually shares a normalized key with what the source called it; only fall
 		// back to the first result when nothing does, and mark that case by requiring the year to
 		// agree if we have one.
-		val candidates = data.mapNotNull { element -> element.jsonObject.toRecord(mappingsById) }
+		val all = data.mapNotNull { element -> element.jsonObject.toRecord(mappingsById) }
+		// Kitsu lists "Past Life Returner" as both a novel and the manhwa drawn from it, novel first.
+		// Handing a comic source the novel makes a work every later comic source is incompatible with,
+		// so a candidate whose subtype cannot be what the source is reading is not a candidate at all.
+		val candidates = all
+			.filter { WorkCompatibility.compatibleContentTypes(it.contentType, contentType) }
+			.ifEmpty { all }
+
 		return candidates.firstOrNull { candidate ->
 			candidate.titles.any { TitleNormalizer.keys(it).any { key -> key in wantedKeys } }
 		} ?: candidates.firstOrNull { candidate ->
@@ -107,7 +121,7 @@ class KitsuCatalogue(
 					when {
 						site.startsWith("myanimelist") -> put("mal", id)
 						site.startsWith("anilist") -> put("anilist", id)
-						site.startsWith("mangaupdates") -> put("mangaupdates", id)
+						site.startsWith("mangaupdates") -> put("mangaupdates", canonicalMangaUpdatesId(id))
 					}
 				}
 			},

@@ -395,3 +395,27 @@ dialog::backdrop { background: rgba(5, 6, 10, .68); backdrop-filter: blur(2px); 
 @media (prefers-reduced-motion: reduce) {
 	*, .gauge-svg .fill { transition: none !important; }
 }
+
+/* -- health view ------------------------------------------------------------------------------ */
+
+.health-block { margin-bottom: 16px; }
+.health-block:last-child { margin-bottom: 0; }
+.health-block h4 {
+	margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .1em;
+	text-transform: uppercase; color: var(--muted);
+}
+
+/* A row per number, so the eye runs down the values instead of hunting across a table. */
+.kv { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 3px 0; }
+.kv .k { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.kv .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* Colour repeats what the number already says: nothing here depends on colour alone. */
+.kv .v.ok, .t-n.ok { color: inherit; }
+.kv .v.warn, .t-n.warn { color: #b7791f; }
+.kv .v.bad, .t-n.bad { color: #c53030; }
+
+@media (prefers-color-scheme: dark) {
+	.kv .v.warn, .t-n.warn { color: #f0b429; }
+	.kv .v.bad, .t-n.bad { color: #fc8181; }
+}

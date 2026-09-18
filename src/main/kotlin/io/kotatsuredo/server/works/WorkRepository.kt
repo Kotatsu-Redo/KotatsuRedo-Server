@@ -29,6 +29,15 @@ data class WorkSeed(
 	val externalIds: Map<String, String>,
 )
 
+/** A work created from a source's own words, still waiting for a catalogue to describe it. */
+data class PendingEnrichment(
+	val workId: Long,
+	val title: String,
+	val year: Int?,
+	val contentType: String?,
+	val attempts: Int,
+)
+
 data class WorkCreationResult(
 	val workId: Long,
 	val created: Boolean,
@@ -910,6 +919,364 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * Checks whatever content tables exist, so it starts returning real answers the moment M3 and M4a
 	 * create `rating` and `comment` - rather than needing to be remembered and updated then.
 	 */
+	// -- catalogue enrichment --------------------------------------------------------------------
+
+	/** Records that this work was created from what a source said and still needs a catalogue. */
+	fun enqueueEnrichment(
+		workId: Long,
+		title: String,
+		year: Int?,
+		contentType: String?,
+		delaySeconds: Long = 0,
+	) {
+		dataSource.connection.use { connection ->
+			enqueueEnrichment(connection, workId, title, year, contentType, delaySeconds)
+		}
+	}
+
+	/** How many entries are due right now, for deciding whether to seed more. */
+	fun dueEnrichmentCount(): Int = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"SELECT count(*) FROM work_enrichment WHERE done_at IS NULL AND next_attempt_at <= now()",
+		).use { statement ->
+			statement.executeQuery().use { rows -> if (rows.next()) rows.getInt(1) else 0 }
+		}
+	}
+
+	private fun enqueueEnrichment(
+		connection: java.sql.Connection,
+		workId: Long,
+		title: String,
+		year: Int?,
+		contentType: String?,
+		delaySeconds: Long = 0,
+	) {
+		connection.prepareStatement(
+			"""
+			INSERT INTO work_enrichment (work_id, title, year, content_type, next_attempt_at)
+			VALUES (?, ?, ?, ?, now() + make_interval(secs => ?)) ON CONFLICT (work_id) DO NOTHING
+			""".trimIndent(),
+		).use { statement ->
+			statement.setLong(1, workId)
+			statement.setString(2, title)
+			year?.takeIf(WorkLimits::isValidYear)?.let { statement.setShort(3, it.toShort()) }
+				?: statement.setNull(3, Types.SMALLINT)
+			statement.setString(4, contentType)
+			statement.setDouble(5, delaySeconds.toDouble())
+			statement.executeUpdate()
+		}
+	}
+
+	/**
+	 * Queues works that no catalogue has ever described, most-read first.
+	 *
+	 * These are the works created while Kitsu answered 406 to every request and nothing but a title
+	 * match could join them, so the duplicates among them are invisible to everything except the ids
+	 * a catalogue can now supply. Bounded per call and idempotent: pressing the button twice queues
+	 * the next batch rather than the same one.
+	 *
+	 * @return how many were queued
+	 */
+	fun enqueueBackfill(limit: Int): Int = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			INSERT INTO work_enrichment (work_id, title, year, content_type)
+			SELECT w.id, w.canonical_title, w.year, w.content_type
+			FROM work w
+			LEFT JOIN work_enrichment e ON e.work_id = w.id
+			LEFT JOIN (SELECT DISTINCT work_id FROM work_external_id) x ON x.work_id = w.id
+			WHERE w.merged_into IS NULL AND e.work_id IS NULL AND x.work_id IS NULL
+			ORDER BY (SELECT count(*) FROM work_alias_observation o WHERE o.work_id = w.id) DESC, w.id
+			LIMIT ?
+			ON CONFLICT (work_id) DO NOTHING
+			""".trimIndent(),
+		).use { statement ->
+			statement.setInt(1, limit)
+			statement.executeUpdate()
+		}
+	}
+
+	/** How many works are still waiting for their first catalogue description. */
+	fun backfillCandidates(): Int = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT count(*) FROM work w
+			LEFT JOIN work_enrichment e ON e.work_id = w.id
+			LEFT JOIN (SELECT DISTINCT work_id FROM work_external_id) x ON x.work_id = w.id
+			WHERE w.merged_into IS NULL AND e.work_id IS NULL AND x.work_id IS NULL
+			""".trimIndent(),
+		).use { statement ->
+			statement.executeQuery().use { rows -> if (rows.next()) rows.getInt(1) else 0 }
+		}
+	}
+
+	/** The oldest due entries. Merged-away works are skipped: their enrichment landed elsewhere. */
+	fun dueEnrichments(limit: Int): List<PendingEnrichment> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT e.work_id, e.title, e.year, e.content_type, e.attempts
+			FROM work_enrichment e
+			JOIN work w ON w.id = e.work_id AND w.merged_into IS NULL
+			WHERE e.done_at IS NULL AND e.next_attempt_at <= now()
+			ORDER BY e.next_attempt_at, e.work_id
+			LIMIT ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setInt(1, limit)
+			statement.executeQuery().use { rows ->
+				buildList {
+					while (rows.next()) {
+						add(
+							PendingEnrichment(
+								workId = rows.getLong(1),
+								title = rows.getString(2),
+								year = rows.getInt(3).takeUnless { rows.wasNull() },
+								contentType = rows.getString(4),
+								attempts = rows.getInt(5),
+							),
+						)
+					}
+				}
+			}
+		}
+	}
+
+	fun finishEnrichment(workId: Long) {
+		dataSource.connection.use { connection -> finishEnrichment(connection, workId) }
+	}
+
+	private fun finishEnrichment(connection: java.sql.Connection, workId: Long) {
+		// Marked rather than deleted: the row is the record that this work has been asked about, and
+		// without it a work nothing lists looks identical to one nobody has ever looked up.
+		connection.prepareStatement(
+			"UPDATE work_enrichment SET done_at = now() WHERE work_id = ? AND done_at IS NULL",
+		).use { statement ->
+			statement.setLong(1, workId)
+			statement.executeUpdate()
+		}
+	}
+
+	/**
+	 * Opens a finished entry again, later. Used when an answer was assembled while one provider was
+	 * unreachable: what came back is already applied, and the rest is worth asking for once it is up.
+	 */
+	fun scheduleRecheck(workId: Long, delaySeconds: Long) {
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"UPDATE work_enrichment SET done_at = NULL, attempts = 0, " +
+					"next_attempt_at = now() + make_interval(secs => ?) WHERE work_id = ?",
+			).use { statement ->
+				statement.setDouble(1, delaySeconds.toDouble())
+				statement.setLong(2, workId)
+				statement.executeUpdate()
+			}
+		}
+	}
+
+	/** A provider that could not answer gets another go later, never a silent drop. */
+	fun retryEnrichmentLater(workId: Long, delaySeconds: Long) {
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"UPDATE work_enrichment SET attempts = attempts + 1, next_attempt_at = now() + " +
+					"make_interval(secs => ?) WHERE work_id = ?",
+			).use { statement ->
+				statement.setDouble(1, delaySeconds.toDouble())
+				statement.setLong(2, workId)
+				statement.executeUpdate()
+			}
+		}
+	}
+
+	/**
+	 * Applies what a catalogue says to a work created from a source's own words, and clears the queue
+	 * entry in the same transaction so a crash between the two cannot lose either.
+	 *
+	 * The canonical title, year and type are only filled in where the work has nothing better: a
+	 * source's rendering is what its readers see, and replacing it wholesale would rename works under
+	 * people mid-session for no gain.
+	 */
+	fun applyCatalogue(
+		workId: Long,
+		canonicalTitle: String,
+		year: Int?,
+		contentType: String?,
+		nsfw: Boolean,
+		titles: List<TitleToStore>,
+		externalIds: Map<String, String>,
+	) = dataSource.connection.use { connection ->
+		connection.autoCommit = false
+		try {
+			connection.prepareStatement(
+				"""
+				UPDATE work SET
+					canonical_title = ?,
+					year = COALESCE(year, ?),
+					content_type = COALESCE(content_type, ?),
+					nsfw = nsfw OR ?
+				WHERE id = ? AND merged_into IS NULL
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, canonicalTitle)
+				year?.takeIf(WorkLimits::isValidYear)?.let { statement.setShort(2, it.toShort()) }
+					?: statement.setNull(2, Types.SMALLINT)
+				statement.setString(3, contentType)
+				statement.setBoolean(4, nsfw)
+				statement.setLong(5, workId)
+				statement.executeUpdate()
+			}
+			storeTitles(connection, workId, titles)
+			storeExternalIds(connection, workId, externalIds)
+			finishEnrichment(connection, workId)
+			connection.commit()
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
+
+	// -- duplicate sweep -------------------------------------------------------------------------
+
+	/** Every active work with what [DuplicateFinder] needs, in a handful of full scans. */
+	fun dedupeSnapshot(): List<DedupeWork> = dataSource.connection.use { connection ->
+		fun <T> query(sql: String, read: (java.sql.ResultSet) -> T): List<T> =
+			connection.prepareStatement(sql).use { statement ->
+				statement.fetchSize = 5_000
+				statement.executeQuery().use { rows -> buildList { while (rows.next()) add(read(rows)) } }
+			}
+
+		val trusted = query(
+			"SELECT DISTINCT t.work_id, t.title_raw FROM work_title t $ACTIVE_WORK " +
+				"WHERE t.weight >= ${WorkResolver.MIN_TRUSTED_TITLE_WEIGHT}",
+		) { it.getLong(1) to it.getString(2) }.groupBy({ it.first }, { it.second })
+		val externals = query(
+			"SELECT e.work_id, e.provider, e.external_id FROM work_external_id e " +
+				"JOIN work w ON w.id = e.work_id AND w.merged_into IS NULL",
+		) { Triple(it.getLong(1), it.getString(2), it.getString(3)) }
+			.groupBy { it.first }
+			.mapValues { (_, rows) -> rows.groupBy({ it.second }, { it.third }).mapValues { it.value.toSet() } }
+		val activity = query(
+			"""
+			SELECT work_id, count(*) FROM (
+				SELECT work_id FROM rating
+				UNION ALL SELECT work_id FROM comment
+				UNION ALL SELECT work_id FROM work_alias_observation
+			) content GROUP BY work_id
+			""".trimIndent(),
+		) { it.getLong(1) to it.getInt(2) }.toMap()
+
+		// A work only a device-local placeholder source ever reported ("Downloads", a folder name) is not
+		// a work anyone else can open, so it takes no part in merging.
+		val placeholderOnly = query(
+			"""
+			SELECT work_id FROM (
+				SELECT work_id, source FROM work_alias_observation
+				UNION ALL SELECT work_id, source FROM work_alias
+			) seen GROUP BY work_id
+			HAVING bool_and(source IN (${WorkLimits.NON_NETWORK_SOURCES.joinToString(",") { "'$it'" }}))
+			""".trimIndent(),
+		) { it.getLong(1) }.toSet()
+
+		query("SELECT id, canonical_title, year, content_type FROM work WHERE merged_into IS NULL") { rows ->
+			val id = rows.getLong(1)
+			DedupeWork(
+				id = id,
+				canonicalTitle = rows.getString(2),
+				year = rows.getInt(3).takeUnless { rows.wasNull() },
+				contentType = rows.getString(4),
+				trustedTitles = trusted[id].orEmpty(),
+				externalIds = externals[id].orEmpty(),
+				activity = activity[id] ?: 0,
+			)
+		}.filterNot { it.id in placeholderOnly }
+	}
+
+	/** Automatic merges still in effect, as (from, into), for re-checking against current guards. */
+	fun activeAutoMerges(reason: String): List<Pair<DedupeWork, DedupeWork>> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT f.id, f.canonical_title, f.year, f.content_type, i.id, i.canonical_title, i.year, i.content_type
+			FROM work_merge_log l
+			JOIN work f ON f.id = l.from_work AND f.merged_into = l.into_work
+			JOIN work i ON i.id = l.into_work
+			WHERE l.reason = ? AND l.undone_at IS NULL
+			""".trimIndent(),
+		).use { statement ->
+			statement.setString(1, reason)
+			statement.executeQuery().use { rows ->
+				fun work(offset: Int) = DedupeWork(
+					id = rows.getLong(offset),
+					canonicalTitle = rows.getString(offset + 1),
+					year = rows.getInt(offset + 2).takeUnless { rows.wasNull() },
+					contentType = rows.getString(offset + 3),
+				)
+				buildList { while (rows.next()) add(work(1) to work(5)) }
+			}
+		}
+	}
+
+	/** Pairs that must never be merged automatically: undone merges and known sequels/side stories. */
+	fun blockedMergePairs(): Set<Pair<Long, Long>> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT from_work, into_work FROM work_merge_log WHERE undone_at IS NOT NULL
+			UNION SELECT from_work, to_work FROM work_relation
+			""".trimIndent(),
+		).use { statement ->
+			statement.executeQuery().use { rows ->
+				buildSet { while (rows.next()) add(rows.getLong(1) to rows.getLong(2)) }
+			}
+		}
+	}
+
+	/**
+	 * Adds the keys the current [TitleNormalizer] produces for stored titles but that are not indexed
+	 * yet. Stale keys are left alone: they can only ever make an exact lookup hit, never miss.
+	 *
+	 * @return the number of key rows added
+	 */
+	fun reindexTitleKeys(): Int = dataSource.connection.use { connection ->
+		data class Title(val workId: Long, val raw: String, val lang: String?, val kind: String)
+
+		val indexed = HashMap<Title, Pair<MutableSet<String>, Double>>()
+		connection.prepareStatement(
+			"SELECT t.work_id, t.title_raw, t.lang, t.kind, t.title_norm, t.weight FROM work_title t $ACTIVE_WORK",
+		).use { statement ->
+			statement.fetchSize = 5_000
+			statement.executeQuery().use { rows ->
+				while (rows.next()) {
+					val title = Title(rows.getLong(1), rows.getString(2), rows.getString(3), rows.getString(4))
+					val (keys, weight) = indexed.getOrPut(title) { mutableSetOf<String>() to rows.getDouble(6) }
+					keys += rows.getString(5)
+					if (rows.getDouble(6) > weight) indexed[title] = keys to rows.getDouble(6)
+				}
+			}
+		}
+		val missing = indexed.flatMap { (title, stored) ->
+			(TitleNormalizer.keys(title.raw) - stored.first).map { key -> Triple(title, key, stored.second) }
+		}
+		if (missing.isEmpty()) return@use 0
+		connection.prepareStatement(
+			"""
+			INSERT INTO work_title (work_id, title_raw, title_norm, lang, kind, weight)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (work_id, title_norm, kind) DO NOTHING
+			""".trimIndent(),
+		).use { statement ->
+			missing.forEach { (title, key, weight) ->
+				statement.setLong(1, title.workId)
+				statement.setString(2, title.raw)
+				statement.setString(3, key)
+				statement.setString(4, title.lang)
+				statement.setString(5, title.kind)
+				statement.setDouble(6, weight)
+				statement.addBatch()
+			}
+			statement.executeBatch().count { it != 0 }
+		}
+	}
+
 	fun hasUserContent(workId: Long): Boolean = dataSource.connection.use { connection ->
 		val present = connection.prepareStatement(
 			"SELECT table_name FROM information_schema.tables " +

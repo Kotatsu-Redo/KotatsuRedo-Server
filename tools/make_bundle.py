@@ -123,12 +123,27 @@ def build_compose(image: str, proxy: str, port: int) -> str:
             f'    ports:\n      - "127.0.0.1:${{API_HOST_PORT:-{port}}}:${{PORT:-{port}}}"\n',
             1,
         )
-        text += "\nvolumes:\n  postgres-data:\n"
+        # Derived, not listed. This used to be a hardcoded `postgres-data:`, so the day the api
+        # gained a log volume the bundle still declared one volume and compose refused the whole
+        # project on the server - after the image had already been built and shipped.
+        named = []
+        for match in re.finditer(r"^\s+- ([a-z0-9][a-z0-9_-]*):/", text, re.M):
+            if match.group(1) not in named:
+                named.append(match.group(1))
+        text += "\nvolumes:\n" + "".join(f"  {name}:\n" for name in named)
         assert "caddy" not in text, "the nginx bundle must not carry a Caddy service"
     else:
         text = text.replace("./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "./Caddyfile:/etc/caddy/Caddyfile:ro", 1)
     # A line, not a substring: the word "rebuild:" inside a comment is not a build directive.
     assert not re.search(r"^\s*build:", text, re.M), "the bundle must not need a build context"
+
+    # Both proxies, one invariant: a volume a service mounts has to be declared, or compose refuses
+    # the project outright - on the server, after the build and the upload, which is a long way to
+    # travel to find out. Cheap to check here.
+    body, _, declared_block = text.partition("\nvolumes:\n")
+    declared = set(re.findall(r"^  ([a-z0-9][a-z0-9_-]*):", declared_block, re.M))
+    mounted = set(re.findall(r"^\s+- ([a-z0-9][a-z0-9_-]*):/", body, re.M))
+    assert not mounted - declared, f"the bundle mounts undeclared volumes: {sorted(mounted - declared)}"
     return text
 
 

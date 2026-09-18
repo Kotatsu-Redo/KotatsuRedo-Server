@@ -1,8 +1,5 @@
 package io.kotatsuredo.server.works
 
-import io.kotatsuredo.server.catalogue.CatalogueLookup
-import io.kotatsuredo.server.catalogue.CatalogueLookupOverloaded
-import io.kotatsuredo.server.catalogue.CatalogueRecord
 import org.slf4j.LoggerFactory
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.Mutex
@@ -23,7 +20,6 @@ private val log = LoggerFactory.getLogger("WorkResolver")
  */
 class WorkResolver(
 	private val repository: WorkRepository,
-	private val catalogue: CatalogueLookup?,
 	private val candidateThreshold: Double = CANDIDATE_THRESHOLD,
 	maxConcurrent: Int = MAX_CONCURRENT_RESOLUTIONS,
 	maxQueued: Int = MAX_QUEUED_RESOLUTIONS,
@@ -38,29 +34,28 @@ class WorkResolver(
 
 	/**
 	 * Bounds JDBC work globally and coalesces concurrent creation attempts for the same source key.
-	 * External catalogue waits have their own capacity pool and never retain a JDBC admission slot.
+	 *
+	 * **No catalogue is consulted here.** A work nothing local recognises is created from what the
+	 * source said and queued for [WorkEnricher], because waiting on a third party inside the request
+	 * made a busy external pool look, to the reader, like a manga with no community data. The
+	 * catalogue's titles and identifiers arrive a moment later, and merge the work away if they turn
+	 * out to name one we already had.
 	 */
 	suspend fun resolve(fingerprint: WorkFingerprint, reporterId: String? = null): Resolution {
 		val lockIndex = Math.floorMod(31 * fingerprint.source.hashCode() + fingerprint.sourceKey.hashCode(), aliasLocks.size)
-		return try {
-			withAliasCapacity(lockIndex) {
-				withResolutionCapacity { resolveLocal(fingerprint, reporterId) }
-			} ?: run {
-				// The provider wait holds neither JDBC nor an alias-stripe permit. Recheck locally after
-				// reacquiring the lock because another source may have created the same work meanwhile.
-				val record = catalogue?.lookup(fingerprint.title, fingerprint.year)
-				withAliasCapacity(lockIndex) {
-					withResolutionCapacity {
-						resolveLocal(fingerprint, reporterId) ?: if (record == null) {
-							createFromFingerprint(fingerprint, reporterId)
-						} else {
-							createFromCatalogue(fingerprint, record, reporterId)
-						}
+		return withAliasCapacity(lockIndex) {
+			withResolutionCapacity {
+				resolveLocal(fingerprint, reporterId) ?: createFromFingerprint(fingerprint, reporterId).also {
+					if (it.created) {
+						repository.enqueueEnrichment(
+							it.workId,
+							fingerprint.title,
+							fingerprint.year,
+							fingerprint.contentType,
+						)
 					}
 				}
 			}
-		} catch (_: CatalogueLookupOverloaded) {
-			throw WorkResolutionOverloaded()
 		}
 	}
 
@@ -89,7 +84,7 @@ class WorkResolver(
 		}
 	}
 
-	/** The local rungs of the ladder. A null result is the only point that may call a catalogue. */
+	/** The local rungs of the ladder. A null result means the work has never been seen here. */
 	private fun resolveLocal(fingerprint: WorkFingerprint, reporterId: String?): Resolution? {
 		// Alternative titles are useful metadata, but are also client-controlled. Only the primary
 		// rendering may select or corroborate a cross-user mapping.
@@ -165,7 +160,7 @@ class WorkResolver(
 			}
 		}
 
-		// Nothing local knows it. The caller releases JDBC capacity before asking the catalogue.
+		// Nothing local knows it: the caller creates it and queues it for enrichment.
 		return null
 	}
 
@@ -239,52 +234,6 @@ class WorkResolver(
 		if (unseen.isNotEmpty()) {
 			repository.addTitles(workId, unseen.map { TitleToStore(it, kind = "source_observed", weight = 0.3) })
 		}
-	}
-
-	private fun createFromCatalogue(
-		fingerprint: WorkFingerprint,
-		record: CatalogueRecord,
-		reporterId: String?,
-	): Resolution {
-		// Catalogue payloads are external input too. Keep the repository strict so no caller can
-		// overflow PostgreSQL SMALLINT, but do not turn one provider''s malformed year into a 500.
-		val year = record.year?.takeIf(WorkLimits::isValidYear) ?: fingerprint.year
-		if (reporterId != null) {
-			return createObserved(
-				fingerprint,
-				reporterId,
-				record.canonicalTitle,
-				year,
-				record.contentType ?: fingerprint.contentType,
-				record.nsfw || fingerprint.nsfw,
-				record.titles.map { TitleToStore(it, kind = "catalogue", weight = 1.0) } +
-					fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed", weight = 0.3) },
-				record.externalIds,
-				ResolutionMethod.CATALOGUE,
-			)
-		}
-		val result = repository.createAndLinkWork(
-			canonicalTitle = record.canonicalTitle,
-			year = year,
-			contentType = record.contentType ?: fingerprint.contentType,
-			nsfw = record.nsfw || fingerprint.nsfw,
-			titles = record.titles.map { TitleToStore(it, kind = "catalogue", weight = 1.0) } +
-				fingerprint.allTitles.map { TitleToStore(it, kind = "source_observed", weight = 0.3) },
-			externalIds = record.externalIds,
-			source = fingerprint.source,
-			sourceKey = fingerprint.sourceKey,
-			confidence = ResolutionMethod.CATALOGUE.confidence,
-			evidence = record.provider,
-			coverPHash = fingerprint.coverPHash,
-		)
-		val method = when {
-			result.aliasAlreadyExisted -> ResolutionMethod.ALIAS
-			else -> ResolutionMethod.CATALOGUE
-		}
-		if (result.created) {
-			log.debug("Created work {} from {} with {} titles", result.workId, record.provider, record.titles.size)
-		}
-		return Resolution(result.workId, method, result.created)
 	}
 
 	private fun createFromFingerprint(fingerprint: WorkFingerprint, reporterId: String?): Resolution {
@@ -365,10 +314,22 @@ class WorkResolver(
 		const val CANDIDATE_THRESHOLD = 0.40
 
 		const val YEAR_TOLERANCE = WorkCompatibility.YEAR_TOLERANCE
+		/**
+		 * Kept at ~80% of the ten-connection pool on purpose: measured on the deployment box, raising
+		 * the pool to 16 or 24 did not improve throughput and 24 made it worse, so the JDBC ceiling is
+		 * the pool and this gate is what keeps resolution from owning all of it.
+		 */
 		const val MAX_CONCURRENT_RESOLUTIONS = 8
-		const val MAX_QUEUED_RESOLUTIONS = 32
+
+		/**
+		 * Queue depth, not capacity. A burst that fits here waits a few milliseconds; the same burst
+		 * against the old depth of 32 was refused outright, which is most of what the client sees as a
+		 * missing rating row. The JDBC path measured ~1,300-2,800 requests a second against a live peak
+		 * of roughly two, so the wait behind this queue is bounded by the gate above, not by hardware.
+		 */
+		const val MAX_QUEUED_RESOLUTIONS = 128
 		const val ALIAS_LOCK_STRIPES = 256
-		const val MAX_QUEUED_PER_ALIAS_STRIPE = 8
+		const val MAX_QUEUED_PER_ALIAS_STRIPE = 32
 
 		fun hammingDistance(a: Long, b: Long): Int = java.lang.Long.bitCount(a xor b)
 	}

@@ -20,7 +20,7 @@ internal object WorkCompatibility {
 		return compatibleContentTypes(candidateType, contentType)
 	}
 
-	private fun compatibleContentTypes(a: String?, b: String?): Boolean {
+	fun compatibleContentTypes(a: String?, b: String?): Boolean {
 		if (a == null || b == null || a.equals(b, ignoreCase = true)) return true
 		val normalizedA = a.lowercase()
 		val normalizedB = b.lowercase()

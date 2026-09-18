@@ -97,6 +97,8 @@ data class ModActionRecord(
 object ModActions {
 	const val REMOVE_COMMENT = "remove_comment"
 	const val RESTORE_COMMENT = "restore_comment"
+	const val DISMISS_COMMENT = "dismiss_comment"
+	const val BACKFILL_CATALOGUE = "backfill_catalogue"
 	const val BAN_USER = "ban_user"
 	const val UNBAN_USER = "unban_user"
 	const val SHADOWBAN_USER = "shadowban_user"
@@ -120,6 +122,7 @@ object ModActions {
 	const val TARGET_FLAG = "flag"
 	const val TARGET_DISPUTE = "dispute"
 	const val TARGET_MODERATOR = "moderator"
+	const val TARGET_SYSTEM = "system"
 	const val TARGET_FILTER = "filter"
 }
 

@@ -90,6 +90,7 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 				WHERE c.created_at > now() - make_interval(hours => ?)
 				  AND c.down >= ?
 				  AND c.state <> 2
+				  AND c.dismissed_at IS NULL
 				ORDER BY c.down DESC, c.score ASC, c.created_at DESC
 				LIMIT ?
 				""".trimIndent(),
@@ -135,7 +136,7 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 	 */
 	fun flagged(limit: Int): List<QueuedComment> = dataSource.connection.use { connection ->
 		connection.prepareStatement(
-			"$COMMENT_SELECT WHERE c.flagged_rule IS NOT NULL AND c.state <> 2 " +
+			"$COMMENT_SELECT WHERE c.flagged_rule IS NOT NULL AND c.state <> 2 AND c.dismissed_at IS NULL " +
 				"ORDER BY c.created_at DESC LIMIT ?",
 		).use { statement ->
 			statement.setInt(1, limit)
@@ -323,11 +324,13 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 			"""
 			SELECT
 				(SELECT count(*) FROM comment
-				 WHERE created_at > now() - make_interval(hours => ?) AND down >= ? AND state <> 2),
+				 WHERE created_at > now() - make_interval(hours => ?) AND down >= ? AND state <> 2
+				   AND dismissed_at IS NULL),
 				(SELECT count(*) FROM ban_evasion_flag WHERE reviewed_at IS NULL),
 				(SELECT count(*) FROM rating_brigade_flag WHERE reviewed_at IS NULL),
 				(SELECT count(*) FROM work_link_dispute WHERE resolved_at IS NULL),
-				(SELECT count(*) FROM comment WHERE flagged_rule IS NOT NULL AND state <> 2),
+				(SELECT count(*) FROM comment WHERE flagged_rule IS NOT NULL AND state <> 2
+				   AND dismissed_at IS NULL),
 				(SELECT count(*) FROM filter_block WHERE reviewed_at IS NULL)
 			""".trimIndent(),
 		).use { statement ->

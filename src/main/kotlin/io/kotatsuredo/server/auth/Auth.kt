@@ -3,12 +3,15 @@ package io.kotatsuredo.server.auth
 import io.kotatsuredo.server.ApiError
 import io.kotatsuredo.server.ApiException
 import io.kotatsuredo.server.identity.Identity
+import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.identity.TrustTier
 import io.ktor.http.HttpHeaders
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.header
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.util.AttributeKey
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -138,12 +141,20 @@ fun ApplicationCall.enforceLimit(
 		limiter.check(bucket, key, tier, commit = false, cost = cost)
 	}
 	when (decision) {
-		is RateLimiter.Decision.Limited ->
+		is RateLimiter.Decision.Limited -> {
+			// Which bucket refused is the one thing the access log cannot show, and without it a quota
+			// and a capacity refusal are the same 429 in the logs. Bucket and path only: no identifier,
+			// no address.
+			limitLog.info("Rate limit {} refused {} {}", decision.bucket, request.httpMethod.value, request.path())
+			ServerMetrics.recordRateLimited(decision.bucket)
 			throw ApiException(ApiError.RateLimited(decision.retryAfterSeconds, decision.bucket))
+		}
 
 		RateLimiter.Decision.Allowed -> Unit
 	}
 }
+
+private val limitLog = org.slf4j.LoggerFactory.getLogger("RateLimit")
 
 fun ApplicationCall.reserveLimits(
 	limiter: RateLimiter,

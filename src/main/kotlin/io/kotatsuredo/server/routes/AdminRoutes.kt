@@ -1,6 +1,7 @@
 package io.kotatsuredo.server.routes
 
 import io.kotatsuredo.server.ApiError
+import io.kotatsuredo.server.SERVER_VERSION
 import io.kotatsuredo.server.ApiException
 import io.kotatsuredo.server.auth.RateLimiter
 import io.kotatsuredo.server.auth.enforceLimit
@@ -14,6 +15,9 @@ import io.kotatsuredo.server.moderation.ModSession
 import io.kotatsuredo.server.moderation.ModerationRules
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
+import io.kotatsuredo.server.ops.OpsRepository
+import io.kotatsuredo.server.works.WorkRepository
+import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.moderation.OverviewRepository
 import io.kotatsuredo.server.moderation.PasswordChangeResult
 import io.kotatsuredo.server.moderation.Moderator
@@ -44,6 +48,9 @@ private val SessionKey = AttributeKey<ModSession>("kotatsuredo.mod-session")
 
 /** The panel is same-origin, so the session rides in a cookie the page's own JavaScript cannot read. */
 const val MOD_SESSION_COOKIE = "kr_mod"
+/** One press is thousands of external requests; the rest of the queue waits for the next one. */
+private const val MAX_BACKFILL_BATCH = 5_000
+
 private const val MAX_LOGIN_USERNAME = 64
 private const val MAX_LOGIN_PASSWORD = 1024
 private const val MAX_LOGIN_CODE = 16
@@ -331,6 +338,10 @@ fun Route.adminRoutes(
 	secureCookies: Boolean,
 	/** Null only in tests that do not exercise the home page. */
 	overviews: OverviewRepository? = null,
+	/** Null only in tests that do not exercise the health view. */
+	ops: OpsRepository? = null,
+	/** Null only in tests that do not exercise the catalogue backfill. */
+	workRepository: WorkRepository? = null,
 	limiter: RateLimiter = RateLimiter(),
 ) =
 	route("/admin/api") {
@@ -462,6 +473,42 @@ fun Route.adminRoutes(
 
 		// -- queues --------------------------------------------------------------------------------
 
+		/**
+		 * The health view. Everything here used to need an ssh session and a grep, which is why a day
+		 * of refused requests went unnoticed and the evidence was gone by the time anyone looked.
+		 */
+		get("/ops") {
+			call.requireEnrolled(moderation)
+			val counters = ops?.counters()
+			call.respond(
+				OpsResponse(
+					uptimeSeconds = ServerMetrics.uptimeSeconds,
+					version = SERVER_VERSION,
+					last5m = ServerMetrics.window(5).toDto(),
+					last60m = ServerMetrics.window(ServerMetrics.WINDOW_MINUTES).toDto(),
+					rateLimitedByBucket = ServerMetrics.refusalsByBucket(),
+					overloadedByResource = ServerMetrics.overloadsByResource(),
+					enrichment = counters?.let {
+						EnrichmentDto(
+							pending = it.enrichmentPending,
+							due = it.enrichmentDue,
+							deferred = it.enrichmentDeferred,
+							oldestSeconds = it.oldestPendingSeconds,
+						)
+					},
+					works = counters?.let {
+						WorksOpsDto(
+							createdDay = it.worksCreatedDay,
+							autoMergesDay = it.autoMergesDay,
+							autoMergesUndone = it.autoMergesUndone,
+							disputesOpen = it.disputesOpen,
+							backfillCandidates = it.backfillCandidates,
+						)
+					},
+				),
+			)
+		}
+
 		get("/overview") {
 			call.requireEnrolled(moderation)
 			val counts = queues.counts(DISLIKE_WINDOW_HOURS, MIN_DISLIKES)
@@ -539,6 +586,16 @@ fun Route.adminRoutes(
 			val session = call.requireEnrolled(moderation)
 			val reason = call.receive<ReasonRequest>().reason
 			call.respondOk(moderation.restoreComment(session.moderator, call.longId(), reason))
+		}
+
+		/**
+		 * "Looked at it, it stays." Clears a comment out of the computed queues without touching the
+		 * comment, so those queues can actually be emptied.
+		 */
+		post("/comments/{id}/dismiss") {
+			val session = call.requireEnrolled(moderation)
+			val reason = call.receive<ReasonRequest>().reason
+			call.respondOk(moderation.dismissComment(session.moderator, call.longId(), reason))
 		}
 
 		// -- user actions --------------------------------------------------------------------------
@@ -660,6 +717,21 @@ fun Route.adminRoutes(
 			call.respondOk(moderation.mergeWorks(session.moderator, from, into, body.reason))
 		}
 
+		/**
+		 * Hands the enricher a batch of works no catalogue has ever described, so their ids arrive and
+		 * the duplicates among them collapse. Admin-only and bounded: it is thousands of requests to
+		 * somebody else's free API.
+		 */
+		post("/works/backfill") {
+			val session = call.requireAdmin(moderation)
+			val requested = call.receive<BackfillRequest>().limit
+			val queued = moderation.backfillCatalogue(
+				session.moderator,
+				requested.coerceIn(1, MAX_BACKFILL_BATCH),
+			)
+			call.respond(BackfillResponse(queued = queued, remaining = workRepository?.backfillCandidates() ?: 0))
+		}
+
 		post("/works/{id}/unmerge") {
 			val session = call.requireAdmin(moderation)
 			val reason = call.receive<ReasonRequest>().reason
@@ -721,3 +793,61 @@ private fun ApplicationCall.requireAdmin(moderation: ModerationService): ModSess
 	if (!session.moderator.role.isAdmin) throw ApiException(ApiError.Forbidden("admin_required"))
 	return session
 }
+
+@Serializable
+data class OpsWindowDto(
+	val minutes: Int,
+	val total: Long,
+	val ok: Long,
+	@SerialName("client_error") val clientError: Long,
+	@SerialName("rate_limited") val rateLimited: Long,
+	val overloaded: Long,
+	@SerialName("server_error") val serverError: Long,
+	@SerialName("refused_share") val refusedShare: Double,
+)
+
+@Serializable
+data class EnrichmentDto(
+	val pending: Int,
+	val due: Int,
+	val deferred: Int,
+	@SerialName("oldest_s") val oldestSeconds: Long?,
+)
+
+@Serializable
+data class WorksOpsDto(
+	@SerialName("created_day") val createdDay: Int,
+	@SerialName("auto_merges_day") val autoMergesDay: Int,
+	@SerialName("auto_merges_undone") val autoMergesUndone: Int,
+	@SerialName("disputes_open") val disputesOpen: Int,
+	@SerialName("backfill_candidates") val backfillCandidates: Int,
+)
+
+@Serializable
+data class OpsResponse(
+	@SerialName("uptime_s") val uptimeSeconds: Long,
+	val version: String,
+	@SerialName("last_5m") val last5m: OpsWindowDto,
+	@SerialName("last_60m") val last60m: OpsWindowDto,
+	@SerialName("rate_limited_by_bucket") val rateLimitedByBucket: Map<String, Long>,
+	@SerialName("overloaded_by_resource") val overloadedByResource: Map<String, Long>,
+	val enrichment: EnrichmentDto?,
+	val works: WorksOpsDto?,
+)
+
+private fun ServerMetrics.Window.toDto() = OpsWindowDto(
+	minutes = minutes,
+	total = total,
+	ok = ok,
+	clientError = clientError,
+	rateLimited = rateLimited,
+	overloaded = overloaded,
+	serverError = serverError,
+	refusedShare = refusedShare,
+)
+
+@Serializable
+data class BackfillRequest(val limit: Int = 1_000)
+
+@Serializable
+data class BackfillResponse(val queued: Int, val remaining: Int)

@@ -47,7 +47,7 @@ class RateLimiter(
 		RATINGS(mapOf(TrustTier.NEW to 30, TrustTier.NORMAL to 100, TrustTier.ESTABLISHED to 200), 3600),
 		HELLO(mapOf(TrustTier.NEW to 5, TrustTier.NORMAL to 5, TrustTier.ESTABLISHED to 5), 3600),
 		// Applied before bearer-token lookup, so random credentials cannot exhaust the DB pool.
-		PRE_AUTH(mapOf(TrustTier.NEW to 60, TrustTier.NORMAL to 60, TrustTier.ESTABLISHED to 60), 60),
+		PRE_AUTH(mapOf(TrustTier.NEW to 600, TrustTier.NORMAL to 600, TrustTier.ESTABLISHED to 600), 60),
 		ADMIN_LOGIN(mapOf(TrustTier.NEW to 5, TrustTier.NORMAL to 5, TrustTier.ESTABLISHED to 5), 900),
 		// Probe rows per day. One normal batch fits for a new account; settled accounts may retry or
 		// report a second device without turning batching into a cardinality multiplier.

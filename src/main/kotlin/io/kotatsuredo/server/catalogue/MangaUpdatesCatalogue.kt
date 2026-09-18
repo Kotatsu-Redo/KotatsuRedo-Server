@@ -1,6 +1,7 @@
 package io.kotatsuredo.server.catalogue
 
 import io.kotatsuredo.server.works.TitleNormalizer
+import io.kotatsuredo.server.works.WorkCompatibility
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -32,15 +33,16 @@ class MangaUpdatesCatalogue(
 
 	private val json = Json { ignoreUnknownKeys = true }
 
-	override suspend fun lookup(title: String, year: Int?): CatalogueRecord? {
+	override suspend fun lookup(title: String, year: Int?, contentType: String?): CatalogueRecord? {
 		val searchBody = """{"search":${quote(title)},"perpage":$CANDIDATE_LIMIT}"""
-		val searchResponse = fetcher.fetch("$baseUrl/series/search", searchBody) ?: return null
+		val searchResponse = fetcher.post("$baseUrl/series/search", searchBody)
+			?: throw CatalogueUnavailable(name)
 
-		val seriesId = runCatching { pickSeries(searchResponse, title, year) }
+		val seriesId = runCatching { pickSeries(searchResponse, title, year, contentType) }
 			.onFailure { log.warn("Failed to parse MangaUpdates search response", it) }
 			.getOrNull() ?: return null
 
-		val detail = fetcher.get("$baseUrl/series/$seriesId") ?: return null
+		val detail = fetcher.get("$baseUrl/series/$seriesId") ?: throw CatalogueUnavailable(name)
 		return runCatching { parseSeries(detail) }
 			.onFailure { log.warn("Failed to parse MangaUpdates series {}", seriesId, it) }
 			.getOrNull()
@@ -50,11 +52,16 @@ class MangaUpdatesCatalogue(
 	 * The search endpoint only exposes the primary title, so candidate selection has to work from
 	 * that alone. A normalized-key hit is required; a year match is accepted as a weaker fallback.
 	 */
-	fun pickSeries(body: String, wantedTitle: String, year: Int?): String? {
+	fun pickSeries(body: String, wantedTitle: String, year: Int?, contentType: String? = null): String? {
 		val results = json.parseToJsonElement(body).jsonObject["results"]?.jsonArray ?: return null
 		val wantedKeys = TitleNormalizer.keys(wantedTitle)
 
-		val records = results.mapNotNull { it.jsonObject["record"]?.jsonObject }
+		val all = results.mapNotNull { it.jsonObject["record"]?.jsonObject }
+		// Same reason as Kitsu: the novel and the comic share a title, and only one of them is what
+		// this source is showing.
+		val records = all
+			.filter { WorkCompatibility.compatibleContentTypes(it.str("type"), contentType) }
+			.ifEmpty { all }
 		val exact = records.firstOrNull { record ->
 			record.str("title")?.let { TitleNormalizer.keys(it).any { key -> key in wantedKeys } } == true
 		}

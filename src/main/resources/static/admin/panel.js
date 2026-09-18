@@ -58,6 +58,11 @@ const VIEWS = {
 		hint: 'What the instance looks like right now, and what is waiting for you.',
 		load: () => api('/overview').then(overviewPage),
 	},
+	health: {
+		title: 'Health',
+		hint: 'What the server is doing right now. Refusals, queues, and whether anything is piling up.',
+		load: () => api('/ops').then(healthPage),
+	},
 	disliked: {
 		title: 'Most disliked',
 		hint: 'The report queue. There is no report button — dislikes are the signal.',
@@ -201,6 +206,20 @@ function commentCard(comment) {
 			await api('/comments/' + comment.id + '/remove', { method: 'POST', body: JSON.stringify({ reason }) });
 			return true;
 		});
+		// Only where the queue is computed. Elsewhere there is nothing to dismiss it from, and a
+		// button that appears to do nothing is worse than no button.
+		if (current === 'disliked' || current === 'flagged') {
+			add('Ignore', '', async () => {
+				const reason = await askReason(
+					'Ignore this comment',
+					'Leaves the comment exactly as it is and takes it out of this queue.',
+					false,
+				);
+				if (reason === null) return false;
+				await api('/comments/' + comment.id + '/dismiss', { method: 'POST', body: JSON.stringify({ reason }) });
+				return true;
+			});
+		}
 	}
 
 	add(comment.author_shadowbanned ? 'Un-shadowban' : 'Shadowban', '', async () => {
@@ -673,7 +692,7 @@ async function refreshCounts() {
 
 function buildNav() {
 	const queueKeys = ['overview', 'disliked', 'recent', 'flagged', 'blocked', 'ban-evasion', 'brigades', 'disputes'];
-	const adminKeys = ['filter-stats', 'actions', 'account', 'devices', 'moderators'];
+	const adminKeys = ['health', 'filter-stats', 'actions', 'account', 'devices', 'moderators'];
 	const countKeys = {
 		disliked: 'disliked',
 		flagged: 'flagged',
@@ -1107,3 +1126,181 @@ function totalsStrip(totals) {
 	});
 	return strip;
 }
+
+
+// -- health ------------------------------------------------------------------------------------
+
+let healthTimer = null;
+
+/**
+ * The view that exists because none of this was visible.
+ *
+ * A day of refused resolutions, a nickname that never reached the server, and a catalogue quietly
+ * inventing duplicate works all went unnoticed, because seeing any of them meant an ssh session and
+ * a grep - and the logs were gone by the next deploy. The numbers were always there; nothing showed
+ * them.
+ */
+function healthPage(data) {
+	const page = element('<div class="overview"></div>');
+	const hour = data.last_60m;
+	const recent = data.last_5m;
+
+	page.appendChild(healthStrip(data, hour));
+	page.appendChild(trafficPanel(recent, hour));
+
+	const lower = element('<section class="split"></section>');
+	lower.appendChild(refusalPanel(data));
+	lower.appendChild(pipelinePanel(data));
+	page.appendChild(lower);
+
+	// Meant to be left open on a second screen, so it keeps itself current.
+	if (healthTimer) clearTimeout(healthTimer);
+	healthTimer = setTimeout(() => { if (current === 'health') render(); }, 30000);
+	return page;
+}
+
+/** ok | warn | bad, so the colour says the same thing the number does. */
+function grade(value, warn, bad) {
+	if (value >= bad) return 'bad';
+	if (value >= warn) return 'warn';
+	return 'ok';
+}
+
+function duration(seconds) {
+	if (seconds === null || seconds === undefined) return '\u2014';
+	if (seconds < 90) return Math.round(seconds) + 's';
+	if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+	if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+	return Math.round(seconds / 86400) + 'd';
+}
+
+function healthStrip(data, hour) {
+	const refused = hour.refused_share * 100;
+	const strip = element('<section class="totals"></section>');
+	[
+		['Requests / h', hour.total, 'ok'],
+		['Refused', refused.toFixed(1) + '%', grade(refused, 1, 5)],
+		['Rate limited', hour.rate_limited, grade(hour.rate_limited, 1, 50)],
+		['Overloaded', hour.overloaded, grade(hour.overloaded, 1, 20)],
+		['Server errors', hour.server_error, grade(hour.server_error, 1, 1)],
+		['Uptime', duration(data.uptime_s), 'ok'],
+	].forEach(([name, value, state]) => {
+		strip.appendChild(element(
+			'<div class="t-cell"><span class="t-n ' + state + '">' + escapeHtml(String(value)) +
+			'</span><span class="t-l">' + escapeHtml(name) + '</span></div>',
+		));
+	});
+	return strip;
+}
+
+function statRow(label, value, state) {
+	return '<div class="kv"><span class="k">' + escapeHtml(label) + '</span>' +
+		'<span class="v ' + (state || '') + '">' + escapeHtml(String(value)) + '</span></div>';
+}
+
+function trafficPanel(recent, hour) {
+	const panel = element('<section class="panel"></section>');
+	panel.appendChild(element(
+		'<div class="panel-head"><h3>Traffic</h3>' +
+		'<span class="sub">counters restart with the server</span></div>',
+	));
+	[['Last 5 minutes', recent], ['Last hour', hour]].forEach(([label, window]) => {
+		const share = window.refused_share * 100;
+		panel.appendChild(element(
+			'<div class="health-block"><h4>' + escapeHtml(label) + '</h4>' +
+			statRow('Answered', window.ok) +
+			statRow('Rate limited', window.rate_limited, grade(window.rate_limited, 1, 50)) +
+			statRow('Overloaded', window.overloaded, grade(window.overloaded, 1, 20)) +
+			statRow('Client errors', window.client_error) +
+			statRow('Server errors', window.server_error, grade(window.server_error, 1, 1)) +
+			statRow('Refused', share.toFixed(1) + '%', grade(share, 1, 5)) +
+			'</div>',
+		));
+	});
+	return panel;
+}
+
+function refusalPanel(data) {
+	const panel = element('<section class="panel"></section>');
+	panel.appendChild(element(
+		'<div class="panel-head"><h3>Why requests were refused</h3>' +
+		'<span class="sub">since restart</span></div>',
+	));
+	const buckets = Object.entries(data.rate_limited_by_bucket || {}).sort((a, b) => b[1] - a[1]);
+	const resources = Object.entries(data.overloaded_by_resource || {}).sort((a, b) => b[1] - a[1]);
+
+	if (!buckets.length && !resources.length) {
+		panel.appendChild(empty('Nothing has been turned away.'));
+		return panel;
+	}
+	// Two different things wear the same 429: a quota says "your share, for now", capacity says "try
+	// again in a moment". Only the second one is the server's own problem.
+	if (buckets.length) {
+		panel.appendChild(element(
+			'<div class="health-block"><h4>Quota</h4>' +
+			buckets.map(([name, count]) => statRow(name, count)).join('') + '</div>',
+		));
+	}
+	if (resources.length) {
+		panel.appendChild(element(
+			'<div class="health-block"><h4>Capacity</h4>' +
+			resources.map(([name, count]) => statRow(name, count, grade(count, 1, 100))).join('') + '</div>',
+		));
+	}
+	return panel;
+}
+
+function pipelinePanel(data) {
+	const panel = element('<section class="panel"></section>');
+	panel.appendChild(element(
+		'<div class="panel-head"><h3>Work pipeline</h3><span class="sub">catalogue and merges</span></div>',
+	));
+	const enrichment = data.enrichment;
+	const works = data.works;
+	if (!enrichment || !works) {
+		panel.appendChild(empty('Not available on this deployment.'));
+		return panel;
+	}
+	panel.appendChild(element(
+		'<div class="health-block"><h4>Waiting for a catalogue</h4>' +
+		statRow('Queued', enrichment.pending, grade(enrichment.pending, 200, 2000)) +
+		statRow('Due now', enrichment.due, grade(enrichment.due, 200, 2000)) +
+		// Entries that have already failed are the shape of a catalogue being unreachable.
+		statRow('Retrying', enrichment.deferred, grade(enrichment.deferred, 20, 200)) +
+		statRow('Oldest', duration(enrichment.oldest_s), grade(enrichment.oldest_s || 0, 3600, 86400)) +
+		'</div>',
+	));
+	panel.appendChild(element(
+		'<div class="health-block"><h4>Works</h4>' +
+		statRow('Created today', works.created_day) +
+		statRow('Merged automatically today', works.auto_merges_day) +
+		statRow('Merges undone', works.auto_merges_undone, grade(works.auto_merges_undone, 1, 10)) +
+		statRow('Open disputes', works.disputes_open, grade(works.disputes_open, 1, 10)) +
+		statRow('Never described by a catalogue', works.backfill_candidates) +
+		'</div>',
+	));
+
+	// A button rather than a sweep that starts itself: this is thousands of requests to somebody
+	// else's free API, which is a decision a person makes.
+	if (works.backfill_candidates > 0) {
+		const actions = element('<div class="actions"></div>');
+		const button = element('<button>Look these up (' + BACKFILL_BATCH + ' at a time)</button>');
+		button.onclick = () => run(async () => {
+			const note = await askReason(
+				'Look up works no catalogue has described',
+				'Queues ' + BACKFILL_BATCH + ' of them, most-read first. They are looked up slowly in the ' +
+					'background, and any that turn out to be duplicates of a work we already have are merged.',
+				false,
+			);
+			if (note === null) return false;
+			await api('/works/backfill', { method: 'POST', body: JSON.stringify({ limit: BACKFILL_BATCH }) });
+			// Returning true re-renders the view, so the queue and remaining counts show the result.
+			return true;
+		}, button);
+		actions.appendChild(button);
+		panel.appendChild(actions);
+	}
+	return panel;
+}
+
+const BACKFILL_BATCH = 1000;

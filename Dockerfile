@@ -21,6 +21,8 @@ WORKDIR /app
 RUN useradd --system --uid 10001 --create-home kotatsu
 COPY --from=build --chown=kotatsu:kotatsu /app/build/install/kotatsuredo-server ./
 
+RUN mkdir -p /var/log/kotatsuredo && chown kotatsu:kotatsu /var/log/kotatsuredo
+
 USER kotatsu
 
 # Overridden by the runtime environment; EXPOSE is metadata, the healthcheck below is not.

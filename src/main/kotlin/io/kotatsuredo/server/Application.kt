@@ -34,6 +34,7 @@ import io.kotatsuredo.server.filter.WordFilter
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
 import io.kotatsuredo.server.moderation.OverviewRepository
+import io.kotatsuredo.server.ops.OpsRepository
 import io.kotatsuredo.server.moderation.ModeratorRepository
 import io.kotatsuredo.server.moderation.TotpSecretCipher
 import io.kotatsuredo.server.routes.adminRoutes
@@ -45,10 +46,13 @@ import io.kotatsuredo.server.routes.commentRoutes
 import io.kotatsuredo.server.catalogue.CatalogueLookup
 import io.kotatsuredo.server.catalogue.JdkHttpFetcher
 import io.kotatsuredo.server.catalogue.KitsuCatalogue
+import io.kotatsuredo.server.catalogue.MangaDexCatalogue
 import io.kotatsuredo.server.catalogue.MangaUpdatesCatalogue
 import io.kotatsuredo.server.telemetry.TelemetryRepository
 import io.kotatsuredo.server.telemetry.TelemetryRetention
 import io.kotatsuredo.server.telemetry.TelemetryService
+import io.kotatsuredo.server.works.WorkDeduplicator
+import io.kotatsuredo.server.works.WorkEnricher
 import io.kotatsuredo.server.works.WorkLinker
 import io.kotatsuredo.server.works.WorkRepository
 import io.kotatsuredo.server.works.WorkResolver
@@ -102,10 +106,12 @@ fun main(args: Array<String>) {
 	// PLAN.md §2.3 for why there is no bulk seed.
 	val fetcher = JdkHttpFetcher()
 	val workRepository = WorkRepository(database.source)
-	val resolver = WorkResolver(
-		repository = workRepository,
-		catalogue = CatalogueLookup(listOf(KitsuCatalogue(fetcher), MangaUpdatesCatalogue(fetcher))),
+	// MangaDex first: one request returns a work's MyAnimeList, AniList, Kitsu and MangaUpdates ids,
+	// and those ids are what let duplicates found by different sources turn out to be one work.
+	val catalogue = CatalogueLookup(
+		listOf(MangaDexCatalogue(fetcher), KitsuCatalogue(fetcher), MangaUpdatesCatalogue(fetcher)),
 	)
+	val resolver = WorkResolver(repository = workRepository)
 	val queues = ModerationQueueRepository(database.source)
 	// A pair the resolver refuses to merge is filed for a human instead of dropped (§2.7).
 	val linker = WorkLinker(workRepository) { a, b, evidence ->
@@ -145,6 +151,10 @@ fun main(args: Array<String>) {
 	scoring.schedule(jobs)
 	// Forgets the text behind old blocks, and demotes rules that keep being wrong.
 	filters.schedule(jobs)
+	// Merges works that were split across sources, so nobody has to find them by hand.
+	WorkDeduplicator(workRepository, ratings).schedule(jobs)
+	// Describes newly seen works after the fact, so no reader waits on Kitsu or MangaUpdates.
+	WorkEnricher(workRepository, catalogue, ratings).schedule(jobs)
 	jobs.launch(Dispatchers.IO) {
 		while (isActive) {
 			delay(60 * 60 * 1000L)
@@ -174,6 +184,7 @@ fun main(args: Array<String>) {
 			moderation = moderation,
 			queues = queues,
 			overviews = OverviewRepository(database.source),
+			ops = OpsRepository(database.source),
 			filters = filterRepository,
 			filterService = filters,
 			limiter = limiter,
@@ -210,6 +221,7 @@ fun Application.module(
 	trustProxyHeaders: Boolean = false,
 	blockingParallelism: Int = 16,
 	overviews: OverviewRepository? = null,
+	ops: OpsRepository? = null,
 	rulesUrl: String = "/rules",
 	secureCookies: Boolean = true,
 ) {
@@ -260,7 +272,7 @@ fun Application.module(
 		// Outside /v1 deliberately: a different audience, a different auth model, and nothing an app
 		// client holds should be able to reach it.
 		if (moderation != null && queues != null) {
-			adminRoutes(moderation, queues, secureCookies, overviews, limiter)
+			adminRoutes(moderation, queues, secureCookies, overviews, ops, works, limiter)
 			if (filters != null && filterService != null) {
 				filterAdminRoutes(moderation, filters, filterService)
 			}
