@@ -65,12 +65,12 @@ const VIEWS = {
 	},
 	disliked: {
 		title: 'Most disliked',
-		hint: 'The report queue. There is no report button — dislikes are the signal.',
+		hint: 'The report queue. There is no report button — dislikes are the signal. Shadowbanned authors’ newer comments are not listed: nobody can see them.',
 		load: () => api('/queues/disliked').then((page) => commentList(page.comments, 'Nothing has been downvoted lately.')),
 	},
 	recent: {
 		title: 'Recent comments',
-		hint: 'Everything, newest first. The safety net for what nobody happened to downvote.',
+		hint: 'Everything, newest first, including what is shadowed or removed. The safety net for what nobody happened to downvote.',
 		load: () => api('/queues/recent').then((page) => commentList(page.comments, 'No comments yet.')),
 	},
 	flagged: {
@@ -96,13 +96,18 @@ const VIEWS = {
 	},
 	brigades: {
 		title: 'Rating brigades',
-		hint: 'A spike of extreme ratings from new accounts. Nothing was reverted automatically.',
+		hint: 'A spike of extreme ratings against the work’s usual lean, from new accounts. Nothing was reverted automatically.',
 		load: () => api('/queues/brigades').then(brigadeList),
 	},
 	disputes: {
 		title: 'Work disputes',
 		hint: 'Two works that may be one, or one that may be two.',
 		load: () => api('/queues/disputes').then(disputeList),
+	},
+	sanctions: {
+		title: 'Sanctions',
+		hint: 'Everyone banned or shadowbanned, and the decision that put them there. Lifting one is done here.',
+		load: () => api('/sanctions').then(sanctionList),
 	},
 	devices: {
 		title: 'Banned devices',
@@ -160,7 +165,11 @@ function commentCard(comment) {
 	const stateTag = comment.state === 'visible' ? '' :
 		'<span class="tag ' + comment.state + '">' + comment.state + '</span>';
 	const bannedTag = comment.author_banned ? '<span class="tag banned">author banned</span>' : '';
-	const shadowTag = comment.author_shadowbanned ? '<span class="tag shadowed">author shadowed</span>' : '';
+	// The author's standing, which persists across every view they appear in: a moderator looking at
+	// a comment should never have to go and check whether this person is already dealt with.
+	const shadowTag = comment.author_shadowbanned
+		? '<span class="tag shadowed" title="Their comments are visible only to them">author shadowbanned</span>'
+		: '';
 	const flagTag = comment.flagged_rule
 		? '<span class="tag shadowed">flagged: ' + escapeHtml(comment.flagged_rule) + '</span>'
 		: '';
@@ -413,7 +422,7 @@ function banEvasionList(flags) {
 function brigadeList(flags) {
 	if (!flags.length) return empty('No brigades flagged.');
 	const table = element(
-		'<table><thead><tr><th>Work</th><th>Recent</th><th>Baseline/day</th><th>Extreme</th><th>New accounts</th>' +
+		'<table><thead><tr><th>Work</th><th>Recent</th><th>Baseline/day</th><th>Against lean</th><th>New accounts</th>' +
 		'<th>Detected</th><th></th></tr></thead><tbody></tbody></table>',
 	);
 	const body = table.querySelector('tbody');
@@ -692,7 +701,7 @@ async function refreshCounts() {
 
 function buildNav() {
 	const queueKeys = ['overview', 'disliked', 'recent', 'flagged', 'blocked', 'ban-evasion', 'brigades', 'disputes'];
-	const adminKeys = ['health', 'filter-stats', 'actions', 'account', 'devices', 'moderators'];
+	const adminKeys = ['health', 'sanctions', 'filter-stats', 'actions', 'account', 'devices', 'moderators'];
 	const countKeys = {
 		disliked: 'disliked',
 		flagged: 'flagged',
@@ -1304,3 +1313,68 @@ function pipelinePanel(data) {
 }
 
 const BACKFILL_BATCH = 1000;
+
+
+function sanctionList(users) {
+	if (!users.length) return empty('Nobody is under sanction.');
+	const table = element(
+		'<table><thead><tr><th>User</th><th>Sanction</th><th>Reason</th><th>By</th><th>Applied</th>' +
+		'<th>Comments</th><th></th></tr></thead><tbody></tbody></table>',
+	);
+	const body = table.querySelector('tbody');
+
+	users.forEach((user) => {
+		// Both at once is possible and worth seeing as such: a shadowban that was later escalated.
+		const marks = [];
+		if (user.banned) marks.push('<span class="tag banned">banned</span>');
+		if (user.shadowbanned) marks.push('<span class="tag shadowed">shadowbanned</span>');
+
+		const row = element(
+			'<tr>' +
+				'<td>' + escapeHtml(user.user) + '</td>' +
+				'<td>' + marks.join(' ') + '</td>' +
+				'<td>' + escapeHtml(user.reason || '') + '</td>' +
+				'<td>' + escapeHtml(user.by_moderator || '') + '</td>' +
+				'<td>' + (user.sanctioned_at ? when(user.sanctioned_at) : '') + '</td>' +
+				'<td>' + user.comments + (user.removed_comments ? ' (' + user.removed_comments + ' removed)' : '') +
+				'</td>' +
+				'<td class="actions"></td>' +
+			'</tr>',
+		);
+		const actions = row.querySelector('.actions');
+		const add = (label, handler) => {
+			const button = element('<button>' + label + '</button>');
+			button.onclick = () => run(handler, button);
+			actions.appendChild(button);
+		};
+
+		if (user.banned) {
+			add('Unban', async () => {
+				const reason = await askReason('Lift the ban', 'They get their account back, comments and all.', false);
+				if (reason === null) return false;
+				await api('/users/' + user.user_id + '/unban', { method: 'POST', body: JSON.stringify({ reason }) });
+				return true;
+			});
+		}
+		if (user.shadowbanned) {
+			add('Un-shadowban', async () => {
+				const reason = await askReason(
+					'Lift the shadowban',
+					'Anything they write from now on is visible again. What they wrote while shadowed stays hidden.',
+					false,
+				);
+				if (reason === null) return false;
+				await api('/users/' + user.user_id + '/unshadowban', { method: 'POST', body: JSON.stringify({ reason }) });
+				return true;
+			});
+		}
+		add('Their comments', async () => {
+			const page = await api('/users/' + user.user_id + '/comments');
+			show('Comments by ' + user.user, 'Everything they wrote, including what is shadowed or removed.',
+				commentList(page.comments, 'Nothing from this account.'));
+			return false;
+		});
+		body.appendChild(row);
+	});
+	return table;
+}

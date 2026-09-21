@@ -236,6 +236,69 @@ class CatalogueTest {
 		assertNull(record, "matched the wrong work: ${record?.canonicalTitle}")
 	}
 
+	/**
+	 * MangaDex writes an absent map as `null` or `[]`. Reading either as an object threw, and the
+	 * throw discarded every other candidate in the response along with the odd one.
+	 */
+	@Test
+	fun `mangadex reads a work with no links and ignores an unreadable neighbour`() {
+		val body = """
+			{"data": [
+				{"id": "broken", "attributes": {"title": [], "altTitles": null, "links": null}},
+				{"id": "bare-1", "attributes": {
+					"title": {"en": "The Knight of Balance"},
+					"altTitles": [{"ko": null}, {"ja": "均衡の騎士"}],
+					"links": null, "year": null, "originalLanguage": "ko", "contentRating": "safe"
+				}},
+				{"id": "bare-2", "attributes": {"title": {"en": "Unrelated"}, "links": []}}
+			]}
+		""".trimIndent()
+
+		val record = MangaDexCatalogue(fetcherReturning()).parse(body, "The Knight of Balance")
+
+		assertNotNull(record)
+		assertEquals("bare-1", record.externalId)
+		assertEquals(mapOf("mangadex" to "bare-1"), record.externalIds)
+		assertEquals("manhwa", record.contentType)
+		assertTrue("均衡の騎士" in record.titles)
+	}
+
+	/** A source that packs every alternate name into the title is searched by its main one. */
+	@Test
+	fun `a title carrying its whole alternate-name list is searched by the main title`() {
+		assertEquals(
+			"Isekai Saikou no Kizoku, Harem wo Fuyasu Hodo Tsuyoku Naru",
+			CatalogueLookup.searchTitle(
+				"Isekai Saikou no Kizoku, Harem wo Fuyasu Hodo Tsuyoku Naru (異世界最高の貴族、ハーレムを増やすほど" +
+					"強くなる/ The Strongest Harem of Nobles/ Лучший дворянин в другом мире/ Isekai Saikou no Kiz",
+			),
+		)
+		// A parenthesis that is not a list, and a slash that is part of the name, are left alone.
+		assertEquals("Chainsaw Man (Official)", CatalogueLookup.searchTitle("Chainsaw Man (Official)"))
+		assertEquals("Fate/Zero (2011)", CatalogueLookup.searchTitle("Fate/Zero (2011)"))
+		assertEquals("(A/B)", CatalogueLookup.searchTitle("(A/B)"))
+	}
+
+	@Test
+	fun `providers are asked about the main title and matched against it`() = runTest {
+		val asked = mutableListOf<String>()
+		val lookup = CatalogueLookup(
+			listOf(
+				object : CatalogueProvider {
+					override val name = "fake"
+					override suspend fun lookup(title: String, year: Int?, contentType: String?): CatalogueRecord? {
+						asked += title
+						return null
+					}
+				},
+			),
+		)
+
+		lookup.lookupOutcome("I Tamed a Tyrant and Ran Away (폭군을 길들이고 도망쳐버렸다/ The Taming of the Tyrant/ Ich")
+
+		assertEquals(listOf("I Tamed a Tyrant and Ran Away"), asked)
+	}
+
 	/** An unreachable MangaDex must never look like a title nothing lists. */
 	@Test
 	fun `mangadex reports a failed request as unavailable`() = runTest {

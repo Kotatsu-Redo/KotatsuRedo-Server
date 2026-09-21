@@ -60,9 +60,13 @@ class RatingService(private val repository: RatingRepository) {
 	 *
 	 * Together they are coordination. Nothing is reverted - a flag goes to the panel and a human
 	 * decides, because being wrong here means deleting real people's opinions.
+	 *
+	 * Only extremes *against* the work's existing lean count. Fans of a well-liked series giving it
+	 * five stars are extreme, new and bursty all at once, and are the opposite of an attack; this
+	 * was the first false positive in production (a popular manhwa on a week-old instance).
 	 */
 	fun detectBrigade(workId: Long): Boolean {
-		val stats = repository.brigadeStats(workId, WINDOW_HOURS, EXTREME_LOW, EXTREME_HIGH)
+		val stats = repository.brigadeStats(workId, WINDOW_HOURS, BASELINE_DAYS.toInt(), EXTREME_LOW, EXTREME_HIGH)
 		if (stats.recentCount < MIN_RATINGS_TO_FLAG) return false
 
 		// A work with no history cannot be spiking. Without this guard the baseline is zero, every
@@ -70,10 +74,14 @@ class RatingService(private val repository: RatingRepository) {
 		// exactly like an attack - which on a young instance is every work.
 		if (stats.olderCount < MIN_HISTORY_TO_COMPARE) return false
 
-		val baseline = stats.olderCount.toDouble() / BASELINE_DAYS
+		// Spread the baseline over the time it actually covers. Thirty ratings from yesterday are
+		// thirty a day, not one; dividing by a fixed thirty days turned a work's second day into a
+		// thirtyfold spike. Floored at a day so a burst just before the window is not a huge rate.
+		val baselineDays = stats.baselineSpanDays.coerceIn(1.0, BASELINE_DAYS)
+		val baseline = stats.baselineCount / baselineDays
 		if (stats.recentCount < baseline * SPIKE_MULTIPLE) return false
 
-		val extremeShare = stats.extremeShare
+		val extremeShare = if (stats.olderMean >= RATING_MIDPOINT) stats.lowShare else stats.highShare
 		if (extremeShare < EXTREME_SHARE_THRESHOLD) return false
 
 		val newUserShare = stats.newUserShare
@@ -115,6 +123,9 @@ class RatingService(private val repository: RatingRepository) {
 		const val SPIKE_MULTIPLE = 5.0
 		const val EXTREME_LOW = 2
 		const val EXTREME_HIGH = 9
+
+		/** Middle of the 1..10 scale: a work whose history averages at or above it leans positive. */
+		const val RATING_MIDPOINT = (RatingScale.MIN + RatingScale.MAX) / 2.0
 		const val EXTREME_SHARE_THRESHOLD = 0.80
 		const val NEW_USER_SHARE_THRESHOLD = 0.60
 	}

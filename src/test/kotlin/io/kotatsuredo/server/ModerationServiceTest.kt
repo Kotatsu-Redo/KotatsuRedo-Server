@@ -519,6 +519,50 @@ class ModerationServiceTest {
 		assertNotNull(root)
 	}
 
+	/**
+	 * A shadowban is a decision already made. Everything the account writes afterwards is invisible
+	 * to every reader, so listing it again as something flagged asks a moderator to rule on a comment
+	 * nobody can see - and the queue fills with work that has already been done.
+	 *
+	 * What they wrote *before* is still public, so it stays.
+	 */
+	@Test
+	fun `a shadowed comment stops being raised as something to decide`() {
+		enrolledAdmin()
+		val workId = work()
+		val troll = user("troll")
+		val whilePublic = comment(workId, troll, "Posted while still in good standing.")
+		identityRepository.setShadowbanned(troll.id, true)
+		val whileShadowed = comment(
+			workId,
+			assertNotNull(identityRepository.findById(troll.id)),
+			"Posted after the shadowban, seen by nobody.",
+		)
+		// The word filter runs for a shadowbanned author exactly as it does for anyone else, so a
+		// shadowed comment can absolutely carry a flag. Set one on each without depending on the
+		// wordlist a test happens to be built with.
+		flag(whilePublic)
+		flag(whileShadowed)
+
+		val flagged = queues.flagged(10).map { it.id }
+		assertTrue(whilePublic in flagged, "their still-public comment remains a moderator's business")
+		assertFalse(whileShadowed in flagged, "already invisible to everyone: nothing left to decide")
+		assertEquals(1, queues.counts(72, 1)["flagged"], "the nav badge has to agree with the queue")
+
+		// Still in the one queue that shows everything, so nothing is hidden from a moderator looking.
+		assertTrue(queues.firehose(null, 10).any { it.id == whileShadowed })
+	}
+
+	private fun flag(commentId: Long) {
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement("UPDATE comment SET flagged_rule = 'watched-term' WHERE id = ?")
+				.use { statement ->
+					statement.setLong(1, commentId)
+					statement.executeUpdate()
+				}
+		}
+	}
+
 	@Test
 	fun `the firehose shows shadowed comments, which every user-facing path hides`() {
 		enrolledAdmin()

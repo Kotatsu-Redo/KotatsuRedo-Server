@@ -158,16 +158,69 @@ class WorkEnricherTest {
 		assertEquals(0, repository.backfillCandidates(), "nothing should be left undescribed")
 	}
 
-	/** Seeding waits for the queue to drain, so the pace stays whatever the enricher can manage. */
+	/**
+	 * A busy queue still gets a trickle of backfill. Waiting for the queue to drain meant waiting
+	 * forever once readers created works as fast as the enricher could describe them.
+	 */
 	@Test
-	fun `seeding is skipped while there is still a queue to work through`() = runTest {
+	fun `a busy queue still takes a trickle of the backfill`() = runTest {
 		repeat(3) { repository.createWork("Never Described $it", 2020, "manga", false) }
 		repeat(25) { queued("Queued $it") }
 
 		val report = WorkEnricher(repository, catalogue { null }, batchSize = 1).drainOnce()
 
+		assertEquals(2, report.seeded, "a small share, not the whole batch")
+		assertEquals(1, repository.backfillCandidates(), "the rest wait their turn")
+	}
+
+	/** No catalogue lists hentai, so asking about it only spends the pool on certain misses. */
+	@Test
+	fun `hentai is never queued and never looked up`() = runTest {
+		val fresh = repository.createWork("Some Patreon Set (40p)", 2024, "hentai", false)
+		repository.enqueueEnrichment(fresh, "Some Patreon Set (40p)", 2024, "hentai")
+		repository.createWork("Old Doujin", 2019, "Hentai", false)
+
+		assertEquals(0, queueSize(), "a new hentai work should not be queued")
+		assertEquals(0, repository.backfillCandidates(), "nor picked up by the backfill")
+
+		val report = WorkEnricher(repository, catalogue { record(it) }).drainOnce()
 		assertEquals(0, report.seeded)
-		assertEquals(3, repository.backfillCandidates(), "they wait their turn")
+		assertEquals(0, calls.get(), "no provider should have been asked")
+	}
+
+	/** Entries queued before the rule existed are closed without a request. */
+	@Test
+	fun `a hentai entry already queued is closed without asking anyone`() = runTest {
+		val id = repository.createWork("Queued Earlier", 2024, "hentai", false)
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"INSERT INTO work_enrichment (work_id, title, content_type) VALUES (?, 'Queued Earlier', 'hentai')",
+			).use { it.setLong(1, id); it.executeUpdate() }
+		}
+
+		val report = WorkEnricher(repository, catalogue { record(it) }).drainOnce()
+
+		assertEquals(1, report.unlisted)
+		assertEquals(0, calls.get())
+		assertEquals(0, queueSize())
+	}
+
+	/**
+	 * A merged work's entry can never be worked again - every enrichment query requires a work that
+	 * is still its own - so an open entry on one is pending forever. The duplicate sweep merges works
+	 * without going anywhere near this queue, and the entries it stranded were invisible until the
+	 * oldest-waiting figure on the health view kept climbing.
+	 */
+	@Test
+	fun `merging a work closes the queue entry it can no longer work`() = runTest {
+		val survivor = repository.createWork("Chainsaw Man", 2018, "manga", false)
+		val duplicate = queued("Chainsawman")
+		assertEquals(1, queueSize())
+
+		repository.mergeWorks(from = duplicate, into = survivor, reason = "auto_dedupe")
+
+		assertEquals(0, queueSize(), "a merged work must not sit in the queue forever")
+		assertTrue(repository.dueEnrichments(10).none { it.workId == duplicate })
 	}
 
 	@Test

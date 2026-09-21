@@ -20,6 +20,7 @@ import java.net.http.HttpResponse
 import java.io.InputStream
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.resume
 
 private val log = LoggerFactory.getLogger("CatalogueLookup")
@@ -69,10 +70,11 @@ class CatalogueLookup(
 		year: Int? = null,
 		contentType: String? = null,
 	): CatalogueOutcome = coroutineScope {
+		val query = searchTitle(title)
 		// The content type is part of the question, not a filter on the answer: the same title asked
 		// about as a novel and as a manhwa can have two different right answers, and one must not
 		// negative-cache or share an in-flight lookup with the other.
-		val key = TitleNormalizer.normalize(title).let { normalized ->
+		val key = TitleNormalizer.normalize(query).let { normalized ->
 			if (normalized.isEmpty()) normalized else "$normalized|${contentType?.lowercase().orEmpty()}"
 		}
 		if (key.isEmpty() || key in misses) return@coroutineScope CatalogueOutcome.NotListed
@@ -86,7 +88,7 @@ class CatalogueLookup(
 			// the exact split a slow provider used to cause - so it refuses instead, which costs the
 			// caller one retry and nothing permanent.
 			withTimeoutOrNull(LOOKUP_DEADLINE_MS) {
-				lookupOnce(key, title, year, contentType)
+				lookupOnce(key, query, year, contentType)
 			} ?: throw CatalogueLookupOverloaded()
 		}
 		val active = inFlight.putIfAbsent(key, mine) ?: mine
@@ -123,6 +125,9 @@ class CatalogueLookup(
 			providers.forEach { provider ->
 				val record = runCatching { provider.lookup(title, year, contentType) }
 					.onFailure { error ->
+						// The deadline above ran out. That is not this provider failing, and carrying
+						// on would only start the next one inside a coroutine already cancelled.
+						if (error is CancellationException) throw error
 						// A provider that could not answer has said nothing about this title. Counting
 						// that as "not in any catalogue" is how an outage turns into a permanent
 						// provisional work that no other source can ever match.
@@ -173,12 +178,31 @@ class CatalogueLookup(
 		)
 	}
 
-	private companion object {
+	companion object {
+		/**
+		 * The part of a title worth searching for.
+		 *
+		 * Some sources write every name a work has into its title - `Main (異世界…/ Alt Two/ Alt
+		 * Three/ …)`, often cut off mid-list. No catalogue search matches that, no candidate's title
+		 * normalizes to it, and asking every provider to try made these lookups run into the deadline
+		 * until the enricher gave up on them. A parenthesis holding a `/`-separated list is that list;
+		 * one without a slash (`Title (Official)`, `Fate/Zero (2011)`) is left alone.
+		 */
+		fun searchTitle(title: String): String {
+			val open = title.indexOf('(')
+			if (open <= 0) return title
+			if ('/' !in title.substring(open + 1).substringBefore(')')) return title
+			val main = title.substring(0, open).trim()
+			return if (main.length >= MIN_SEARCH_TITLE) main else title
+		}
+
+		private const val MIN_SEARCH_TITLE = 2
+
 		/**
 		 * Politeness to catalogues that are doing us a favour by being open and unauthenticated. This
 		 * is a courtesy to someone else's server, so it is deliberately not scaled to our hardware.
 		 */
-		const val MAX_CONCURRENT = 4
+		private const val MAX_CONCURRENT = 4
 
 		/**
 		 * Where the 429s came from: this pool, not the database. Refusing a queued lookup turns an
@@ -187,9 +211,9 @@ class CatalogueLookup(
 		 * and about a second each, roughly 120 lookups fit in the deadline, so 96 waits rather than
 		 * times out.
 		 */
-		const val MAX_QUEUED = 96
-		const val MAX_NEGATIVE_CACHE = 50_000
-		const val LOOKUP_DEADLINE_MS = 30_000L
+		private const val MAX_QUEUED = 96
+		private const val MAX_NEGATIVE_CACHE = 50_000
+		private const val LOOKUP_DEADLINE_MS = 30_000L
 	}
 }
 

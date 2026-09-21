@@ -175,6 +175,62 @@ class RatingServiceTest {
 		assertEquals(0, repository.unreviewedFlags())
 	}
 
+	/** Moves every rating the work has so far out of the detection window, spread over [days]. */
+	private fun age(workId: Long, days: Double) {
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				UPDATE rating SET updated_at = now() - interval '1 day'
+					- make_interval(secs => ? * 86400 * random())
+				WHERE work_id = ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setDouble(1, days)
+				statement.setLong(2, workId)
+				statement.executeUpdate()
+			}
+		}
+	}
+
+	/** A liked work with three weeks of history: thirty 8s, roughly 1.4 ratings a day. */
+	private fun establishedWork(): Long {
+		val workId = work()
+		repeat(30) { index -> service.rate(workId, user("old$index"), 8) }
+		age(workId, days = 21.0)
+		return workId
+	}
+
+	@Test
+	fun `a burst of new accounts rating against the work's lean is flagged`() {
+		val workId = establishedWork()
+		repeat(12) { index -> service.rate(workId, user("bomb$index"), 1) }
+
+		assertEquals(1, repository.unreviewedFlags())
+	}
+
+	/**
+	 * The production false positive: fans of a well-liked work rating it 5 stars are extreme, new
+	 * and bursty, and still not an attack.
+	 */
+	@Test
+	fun `fans piling five stars onto a liked work are not flagged`() {
+		val workId = establishedWork()
+		repeat(12) { index -> service.rate(workId, user("fan$index"), 10) }
+
+		assertEquals(0, repository.unreviewedFlags())
+	}
+
+	/** Thirty ratings from yesterday are thirty a day, not one a day spread over a month. */
+	@Test
+	fun `a young work's history is not stretched over the full baseline period`() {
+		val workId = work()
+		repeat(32) { index -> service.rate(workId, user("day1-$index"), 8) }
+		age(workId, days = 0.5)
+		repeat(13) { index -> service.rate(workId, user("day2-$index"), 1) }
+
+		assertEquals(0, repository.unreviewedFlags())
+	}
+
 	// -- merge redirect ----------------------------------------------------------------------------
 
 	/** Clients cache work ids forever, so a merged work has to be able to say where it went. */

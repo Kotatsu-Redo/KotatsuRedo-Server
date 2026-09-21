@@ -31,8 +31,11 @@ class OpsRepository(private val dataSource: DataSource) {
 			statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else 0L }
 		}
 
+		// Every one of these is about work still outstanding. Counting finished entries made the
+		// panel report a queue of 149 where 25 were actually waiting, and an oldest-entry age that
+		// only ever grew - a health view whose numbers drift from reality is worse than none.
 		val oldest = connection.prepareStatement(
-			"SELECT EXTRACT(EPOCH FROM now() - min(created_at)) FROM work_enrichment",
+			"SELECT EXTRACT(EPOCH FROM now() - min(created_at)) FROM work_enrichment WHERE done_at IS NULL",
 		).use { statement ->
 			statement.executeQuery().use { rows ->
 				if (rows.next()) rows.getLong(1).takeUnless { rows.wasNull() } else null
@@ -40,9 +43,13 @@ class OpsRepository(private val dataSource: DataSource) {
 		}
 
 		OpsCounters(
-			enrichmentPending = scalar("SELECT count(*) FROM work_enrichment").toInt(),
-			enrichmentDue = scalar("SELECT count(*) FROM work_enrichment WHERE next_attempt_at <= now()").toInt(),
-			enrichmentDeferred = scalar("SELECT count(*) FROM work_enrichment WHERE attempts > 0").toInt(),
+			enrichmentPending = scalar("SELECT count(*) FROM work_enrichment WHERE done_at IS NULL").toInt(),
+			enrichmentDue = scalar(
+				"SELECT count(*) FROM work_enrichment WHERE done_at IS NULL AND next_attempt_at <= now()",
+			).toInt(),
+			enrichmentDeferred = scalar(
+				"SELECT count(*) FROM work_enrichment WHERE done_at IS NULL AND attempts > 0",
+			).toInt(),
 			oldestPendingSeconds = oldest,
 			worksCreatedDay = scalar("SELECT count(*) FROM work WHERE created_at > now() - interval '24 hours'").toInt(),
 			autoMergesDay = scalar(

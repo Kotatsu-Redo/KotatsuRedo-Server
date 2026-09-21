@@ -72,8 +72,9 @@ fi
 say "backing up the database first"
 # Migrations run at startup, so the dump has to predate the new image rather than follow it.
 ssh "$HOST" "cd '$DIR' && mkdir -p backups && \
-	docker compose exec -T postgres pg_dump -U kotatsuredo kotatsuredo | gzip > backups/pre-deploy-\$(date +%F-%H%M).sql.gz && \
-	ls -lh backups | tail -1"
+	dump=backups/pre-deploy-\$(date +%F-%H%M).sql.gz && \
+	docker compose exec -T postgres pg_dump -U kotatsuredo kotatsuredo | gzip > \"\$dump\" && \
+	ls -lh \"\$dump\""
 
 say "streaming the image over ($(docker image inspect "$IMAGE" --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1000000}') uncompressed)"
 docker save "$IMAGE" | gzip -1 | ssh "$HOST" "gunzip | docker load"

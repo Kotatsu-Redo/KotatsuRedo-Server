@@ -6,12 +6,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import org.slf4j.LoggerFactory
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -79,11 +79,16 @@ class MangaDexCatalogue(
 		contentType: String? = null,
 	): CatalogueRecord? {
 		val root = json.parseToJsonElement(body).jsonObject
-		val data = root["data"]?.jsonArray ?: return null
+		val data = root["data"] as? JsonArray ?: return null
 		if (data.isEmpty()) return null
 
 		val wantedKeys = TitleNormalizer.keys(wantedTitle)
-		val all = data.mapNotNull { it.jsonObject.toRecord() }
+		// One candidate at a time: a single odd entry in five must not throw the other four away.
+		val all = data.mapNotNull { entry ->
+			runCatching { (entry as? JsonObject)?.toRecord() }
+				.onFailure { log.debug("Skipping unreadable MangaDex candidate", it) }
+				.getOrNull()
+		}
 		val candidates = all
 			.filter { WorkCompatibility.compatibleContentTypes(it.contentType, contentType) }
 			.ifEmpty { all }
@@ -101,29 +106,32 @@ class MangaDexCatalogue(
 
 	private fun JsonObject.toRecord(): CatalogueRecord? {
 		val id = str("id") ?: return null
-		val attributes = this["attributes"]?.jsonObject ?: return null
+		val attributes = this["attributes"] as? JsonObject ?: return null
 
+		// MangaDex writes an absent map as `null` or `[]` rather than leaving the key out, so every
+		// nested read is a safe cast: `?.jsonObject` on a JsonNull throws, and did, on every work
+		// without links.
 		val titles = buildList {
-			attributes["title"]?.jsonObject?.values?.forEach { value ->
-				value.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() }?.let(::add)
+			(attributes["title"] as? JsonObject)?.values?.forEach { value ->
+				(value as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }?.let(::add)
 			}
 			// Every language MangaDex knows the work by, which is the richest title source anywhere
 			// and the reason a Korean source and a French one land on the same work.
-			attributes["altTitles"]?.jsonArray?.forEach { entry ->
-				entry.jsonObject.values.forEach { value ->
-					value.jsonPrimitive.contentOrNull?.takeIf { it.isNotBlank() }?.let(::add)
+			(attributes["altTitles"] as? JsonArray)?.forEach { entry ->
+				(entry as? JsonObject)?.values?.forEach { value ->
+					(value as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }?.let(::add)
 				}
 			}
 		}.distinct()
 		val canonical = titles.firstOrNull() ?: return null
 
-		val links = attributes["links"]?.jsonObject
+		val links = attributes["links"] as? JsonObject
 		return CatalogueRecord(
 			provider = PROVIDER,
 			externalId = id,
 			canonicalTitle = canonical,
 			titles = titles,
-			year = attributes["year"]?.jsonPrimitive?.intOrNull,
+			year = (attributes["year"] as? JsonPrimitive)?.intOrNull,
 			contentType = attributes.str("originalLanguage")?.let(::contentTypeOf),
 			nsfw = attributes.str("contentRating") in ADULT_RATINGS,
 			externalIds = buildMap {
@@ -147,7 +155,7 @@ class MangaDexCatalogue(
 		else -> null
 	}
 
-	private fun JsonObject.str(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull
+	private fun JsonObject.str(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
 	private companion object {
 		const val PROVIDER = "mangadex"

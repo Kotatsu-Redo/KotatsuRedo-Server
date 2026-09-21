@@ -37,8 +37,16 @@ data class RatingAggregate(
 
 data class BrigadeStats(
 	val recentCount: Int,
+	/** Every rating from before the window, however old. */
 	val olderCount: Int,
-	val extremeShare: Double,
+	/** Mean of those older ratings: the direction the work's existing audience leans. */
+	val olderMean: Double,
+	/** Older ratings inside the baseline period, the numerator of the per-day rate. */
+	val baselineCount: Int,
+	/** Days the baseline ratings actually cover, from the oldest of them to the window start. */
+	val baselineSpanDays: Double,
+	val lowShare: Double,
+	val highShare: Double,
 	val newUserShare: Double,
 )
 
@@ -364,27 +372,63 @@ class RatingRepository(private val dataSource: DataSource) {
 		}
 	}
 
-	fun brigadeStats(workId: Long, hours: Int, extremeLow: Int, extremeHigh: Int): BrigadeStats =
+	/**
+	 * Only the recent side joins `user_trust`: the view counts active days per user, and a popular
+	 * work's full history is far larger than one day's window.
+	 */
+	fun brigadeStats(
+		workId: Long,
+		hours: Int,
+		baselineDays: Int,
+		extremeLow: Int,
+		extremeHigh: Int,
+	): BrigadeStats =
 		dataSource.connection.use { connection ->
 			connection.prepareStatement(
 				"""
-				SELECT count(*),
-					GREATEST(COALESCE((SELECT count FROM work_rating_agg WHERE work_id = ?), 0) - count(*), 0),
-					COALESCE(avg(CASE WHEN r.value <= ? OR r.value >= ? THEN 1.0 ELSE 0.0 END), 0),
-					COALESCE(avg(CASE WHEN t.tier = 0 THEN 1.0 ELSE 0.0 END), 0)
-				FROM rating r
-				JOIN user_trust t ON t.user_id = r.user_id
-				WHERE r.work_id = ? AND r.updated_at > now() - make_interval(hours => ?)
+				WITH cutoff AS (SELECT now() - make_interval(hours => ?) AS at),
+				older AS (
+					SELECT count(*) AS n,
+						COALESCE(avg(r.value), 0) AS mean,
+						count(*) FILTER (WHERE r.updated_at > c.at - make_interval(days => ?)) AS in_baseline,
+						min(r.updated_at) FILTER (WHERE r.updated_at > c.at - make_interval(days => ?)) AS since
+					FROM rating r, cutoff c
+					WHERE r.work_id = ? AND r.updated_at <= c.at
+				),
+				recent AS (
+					SELECT count(*) AS n,
+						COALESCE(avg(CASE WHEN r.value <= ? THEN 1.0 ELSE 0.0 END), 0) AS low,
+						COALESCE(avg(CASE WHEN r.value >= ? THEN 1.0 ELSE 0.0 END), 0) AS high,
+						COALESCE(avg(CASE WHEN t.tier = 0 THEN 1.0 ELSE 0.0 END), 0) AS fresh
+					FROM rating r
+					JOIN user_trust t ON t.user_id = r.user_id, cutoff c
+					WHERE r.work_id = ? AND r.updated_at > c.at
+				)
+				SELECT recent.n, older.n, older.mean, older.in_baseline,
+					COALESCE(EXTRACT(EPOCH FROM (cutoff.at - older.since)) / 86400.0, 0),
+					recent.low, recent.high, recent.fresh
+				FROM cutoff, older, recent
 				""".trimIndent(),
 			).use { statement ->
-				statement.setLong(1, workId)
-				statement.setInt(2, extremeLow)
-				statement.setInt(3, extremeHigh)
+				statement.setInt(1, hours)
+				statement.setInt(2, baselineDays)
+				statement.setInt(3, baselineDays)
 				statement.setLong(4, workId)
-				statement.setInt(5, hours)
+				statement.setInt(5, extremeLow)
+				statement.setInt(6, extremeHigh)
+				statement.setLong(7, workId)
 				statement.executeQuery().use { rows ->
 					rows.next()
-					BrigadeStats(rows.getInt(1), rows.getInt(2), rows.getDouble(3), rows.getDouble(4))
+					BrigadeStats(
+						recentCount = rows.getInt(1),
+						olderCount = rows.getInt(2),
+						olderMean = rows.getDouble(3),
+						baselineCount = rows.getInt(4),
+						baselineSpanDays = rows.getDouble(5),
+						lowShare = rows.getDouble(6),
+						highShare = rows.getDouble(7),
+						newUserShare = rows.getDouble(8),
+					)
 				}
 			}
 		}

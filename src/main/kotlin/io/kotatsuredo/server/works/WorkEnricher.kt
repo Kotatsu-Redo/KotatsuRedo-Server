@@ -16,6 +16,20 @@ import kotlin.time.Duration.Companion.seconds
 private val log = LoggerFactory.getLogger("WorkEnricher")
 
 /**
+ * What the catalogues cover.
+ *
+ * Hentai is not in them - doujinshi, Patreon sets and fan parodies are listed by none of MangaDex,
+ * Kitsu or MangaUpdates - and it was most of what the enricher asked about: four in five of its
+ * "not listed" answers, each one a full round of requests out of a pool kept deliberately small.
+ * Those works are never queued, and one already queued is closed without a request.
+ */
+object CatalogueCoverage {
+	const val UNCATALOGUED_TYPE = "hentai"
+
+	fun isCatalogued(contentType: String?): Boolean = !contentType.equals(UNCATALOGUED_TYPE, ignoreCase = true)
+}
+
+/**
  * Describes works after the fact, so no reader ever waits on a catalogue.
  *
  * Resolution used to consult Kitsu or MangaUpdates while the request was open. That put a third
@@ -50,7 +64,11 @@ class WorkEnricher(
 
 	suspend fun drainOnce(): Report {
 		if (catalogue == null) return Report(0, 0, 0, 0)
-		val seeded = topUpBackfill()
+		// The backfill is housekeeping. Whatever goes wrong with it must not stop new works being
+		// described, which is what happened when its query ran past the statement timeout.
+		val seeded = runCatching { topUpBackfill() }
+			.onFailure { log.warn("Backfill top-up failed", it) }
+			.getOrDefault(0)
 		var enriched = 0
 		var merged = 0
 		var unlisted = 0
@@ -58,6 +76,12 @@ class WorkEnricher(
 		var partial = 0
 
 		repository.dueEnrichments(batchSize).forEach { pending ->
+			// Queued before the catalogues' coverage was known. Nothing to ask anyone.
+			if (!CatalogueCoverage.isCatalogued(pending.contentType)) {
+				repository.finishEnrichment(pending.workId)
+				unlisted++
+				return@forEach
+			}
 			val outcome = try {
 				catalogue.lookupOutcome(pending.title, pending.year, pending.contentType)
 			} catch (_: CatalogueLookupOverloaded) {
@@ -143,15 +167,25 @@ class WorkEnricher(
 	 * Keeps the queue fed from the works that predate any catalogue ever answering.
 	 *
 	 * Those works are the ones nobody else's source can match, so seeding them is not a one-off
-	 * cleanup - it runs until there are none left and then costs a single count per sweep. Topping up
-	 * only when the queue has drained keeps the pace at whatever the enricher can actually do, which
-	 * is what keeps this polite: the providers see the same steady trickle either way.
+	 * cleanup - it runs until there are none left and then costs a single count per sweep. A drained
+	 * queue gets a large batch; a busy one still gets a trickle every sweep.
+	 *
+	 * The trickle is what keeps the backfill alive at all. Topping up only once the queue had drained
+	 * meant never, once readers were creating works about as fast as the enricher could describe
+	 * them: sixteen thousand works sat undescribed through a whole day with nothing queued. The
+	 * trickle takes a fixed share of each sweep instead, and stops when the queue is genuinely
+	 * behind so new works are not held up further.
 	 */
 	private fun topUpBackfill(): Int {
 		if (!seedOldWorks) return 0
-		if (repository.dueEnrichmentCount() > TOP_UP_BELOW) return 0
-		val queued = repository.enqueueBackfill(TOP_UP_BATCH)
-		if (queued > 0) log.info("Queued {} works that no catalogue has described yet", queued)
+		val due = repository.dueEnrichmentCount()
+		val limit = when {
+			due <= TOP_UP_BELOW -> TOP_UP_BATCH
+			due <= TRICKLE_BELOW -> BACKFILL_TRICKLE
+			else -> return 0
+		}
+		val queued = repository.enqueueBackfill(limit)
+		if (limit == TOP_UP_BATCH && queued > 0) log.info("Queued {} works that no catalogue has described yet", queued)
 		return queued
 	}
 
@@ -194,6 +228,15 @@ class WorkEnricher(
 		/** Top up only once the queue has drained, so the pace stays the enricher's own. */
 		const val TOP_UP_BELOW = 20
 		const val TOP_UP_BATCH = 200
+
+		/**
+		 * Backfill works added every sweep while the queue is busy: two of every [BATCH_SIZE] lookups,
+		 * about 290 an hour at the current pace.
+		 */
+		const val BACKFILL_TRICKLE = 2
+
+		/** Past this the queue is genuinely behind (about twenty minutes of work) and new works come first. */
+		const val TRICKLE_BELOW = 500
 		val INTERVAL = 30.seconds
 		val IDLE_GAP = 1.seconds
 	}

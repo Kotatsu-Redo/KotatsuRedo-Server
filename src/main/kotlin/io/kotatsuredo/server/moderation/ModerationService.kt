@@ -344,6 +344,16 @@ class ModerationService(
 	fun bannedDevices(): List<io.kotatsuredo.server.identity.BannedDevice> =
 		identities.bannedDevices(MAX_DEVICE_BANS)
 
+	/**
+	 * Everyone currently under sanction.
+	 *
+	 * Neither sanction is visible anywhere else: a ban shows up only as an absence, and a shadowban is
+	 * invisible by design - including to the person it was applied to. Without this, "who have we
+	 * acted against" means reading the audit log line by line, and lifting one has nowhere to be done
+	 * from.
+	 */
+	fun sanctionedUsers(): List<SanctionedUser> = queues.sanctioned(MAX_SANCTIONS)
+
 	// -- works -----------------------------------------------------------------------------------
 
 	fun mergeWorks(actor: Moderator, from: Long, into: Long, reason: String): Boolean {
@@ -481,6 +491,7 @@ class ModerationService(
 	private companion object {
 		/** Enough to list every ban a small instance will ever have, and a bound if that is wrong. */
 		const val MAX_DEVICE_BANS = 1000
+		const val MAX_SANCTIONS = 500
 		const val FINGERPRINT_LENGTH = 16
 
 		/** Roughly a day of used TOTP steps. Older ones cannot be replayed anyway. */

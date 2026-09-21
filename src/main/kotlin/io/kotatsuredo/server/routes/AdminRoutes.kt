@@ -26,6 +26,7 @@ import io.kotatsuredo.server.moderation.QueuedBanEvasion
 import io.kotatsuredo.server.moderation.QueuedBrigade
 import io.kotatsuredo.server.moderation.QueuedComment
 import io.kotatsuredo.server.moderation.QueuedDispute
+import io.kotatsuredo.server.moderation.SanctionedUser
 import io.ktor.http.CookieEncoding
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
@@ -574,6 +575,12 @@ fun Route.adminRoutes(
 			call.respond(CommentQueueResponse(queues.byAuthor(userId, call.pageSize()).map { it.toDto() }))
 		}
 
+		/** Everyone banned or shadowbanned, and the decision that put them there. */
+		get("/sanctions") {
+			call.requireEnrolled(moderation)
+			call.respond(moderation.sanctionedUsers().map { it.toDto() })
+		}
+
 		// -- comment actions -----------------------------------------------------------------------
 
 		post("/comments/{id}/remove") {
@@ -851,3 +858,31 @@ data class BackfillRequest(val limit: Int = 1_000)
 
 @Serializable
 data class BackfillResponse(val queued: Int, val remaining: Int)
+
+@Serializable
+data class SanctionDto(
+	@SerialName("user_id") val userId: String,
+	val user: String,
+	val banned: Boolean,
+	val shadowbanned: Boolean,
+	@SerialName("sanctioned_at") val sanctionedAt: String? = null,
+	@SerialName("by_moderator") val byModerator: String? = null,
+	val reason: String? = null,
+	val comments: Int,
+	@SerialName("removed_comments") val removedComments: Int,
+	@SerialName("last_seen_at") val lastSeenAt: String,
+)
+
+private fun SanctionedUser.toDto() = SanctionDto(
+	userId = userId,
+	user = displayName,
+	banned = banned,
+	shadowbanned = shadowbanned,
+	sanctionedAt = sanctionedAt?.iso(),
+	byModerator = byModerator,
+	// The ban reason is kept on the account too; either way it is the moderator's own words.
+	reason = reason ?: banReason,
+	comments = comments,
+	removedComments = removedComments,
+	lastSeenAt = lastSeenAt.iso(),
+)

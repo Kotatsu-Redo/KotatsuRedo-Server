@@ -43,6 +43,29 @@ data class QueuedBanEvasion(
 	val userCommentCount: Int,
 )
 
+/**
+ * An account under sanction, with the decision that put it there.
+ *
+ * Both sanctions are otherwise invisible: a ban is only apparent from the outside by its absence, and
+ * a shadowban is deliberately invisible to everyone including the account itself. So without a list,
+ * "who have we acted against, and why" is only answerable by reading the audit log line by line - and
+ * an unban has no obvious place to be done from.
+ */
+data class SanctionedUser(
+	val userId: String,
+	val displayName: String,
+	val banned: Boolean,
+	val shadowbanned: Boolean,
+	val banReason: String?,
+	/** When the most recent of the two sanctions was applied, from the audit log. */
+	val sanctionedAt: OffsetDateTime?,
+	val byModerator: String?,
+	val reason: String?,
+	val comments: Int,
+	val removedComments: Int,
+	val lastSeenAt: OffsetDateTime,
+)
+
 data class QueuedBrigade(
 	val id: Long,
 	val workId: Long,
@@ -90,6 +113,10 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 				WHERE c.created_at > now() - make_interval(hours => ?)
 				  AND c.down >= ?
 				  AND c.state <> 2
+				  -- A shadowed comment is already invisible to everyone but its author, so raising it
+				  -- here asks a moderator to handle something that has been handled. Their *earlier*
+				  -- comments are still public and still belong in this queue.
+				  AND c.state <> 1
 				  AND c.dismissed_at IS NULL
 				ORDER BY c.down DESC, c.score ASC, c.created_at DESC
 				LIMIT ?
@@ -136,12 +163,69 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 	 */
 	fun flagged(limit: Int): List<QueuedComment> = dataSource.connection.use { connection ->
 		connection.prepareStatement(
-			"$COMMENT_SELECT WHERE c.flagged_rule IS NOT NULL AND c.state <> 2 AND c.dismissed_at IS NULL " +
+			// A shadowed comment is already invisible to everyone, so it is not news.
+			"$COMMENT_SELECT WHERE c.flagged_rule IS NOT NULL AND c.state NOT IN (1, 2) " +
+				"AND c.dismissed_at IS NULL " +
 				"ORDER BY c.created_at DESC LIMIT ?",
 		).use { statement ->
 			statement.setInt(1, limit)
 			statement.executeQuery().use { rows ->
 				buildList { while (rows.next()) add(rows.toQueuedComment()) }
+			}
+		}
+	}
+
+	/**
+	 * Everyone currently banned or shadowbanned, newest decision first.
+	 *
+	 * The reason and the moderator come from the audit log rather than a column on the account,
+	 * because that is where the decision actually lives - and it means an entry can never disagree
+	 * with the record of how it got there.
+	 */
+	fun sanctioned(limit: Int): List<SanctionedUser> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT u.id, u.nickname, u.is_banned, u.is_shadowbanned, u.ban_reason, u.last_seen_at,
+			       (SELECT count(*) FROM comment c WHERE c.user_id = u.id) AS comments,
+			       (SELECT count(*) FROM comment c WHERE c.user_id = u.id AND c.state = 2) AS removed,
+			       action.created_at, action.reason, m.username
+			FROM app_user u
+			LEFT JOIN LATERAL (
+			    SELECT a.created_at, a.reason, a.moderator_id
+			    FROM mod_action a
+			    WHERE a.target_type = 'user' AND a.target_id = u.id
+			      AND a.action IN ('ban_user', 'shadowban_user')
+			    ORDER BY a.created_at DESC
+			    LIMIT 1
+			) action ON TRUE
+			LEFT JOIN moderator m ON m.id = action.moderator_id
+			WHERE u.is_banned OR u.is_shadowbanned
+			ORDER BY action.created_at DESC NULLS LAST, u.last_seen_at DESC
+			LIMIT ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setInt(1, limit)
+			statement.executeQuery().use { rows ->
+				buildList {
+					while (rows.next()) {
+						val id = rows.getString(1)
+						add(
+							SanctionedUser(
+								userId = id,
+								displayName = Nicknames.display(rows.getString(2), id),
+								banned = rows.getBoolean(3),
+								shadowbanned = rows.getBoolean(4),
+								banReason = rows.getString(5),
+								lastSeenAt = rows.getObject(6, OffsetDateTime::class.java),
+								comments = rows.getInt(7),
+								removedComments = rows.getInt(8),
+								sanctionedAt = rows.getObject(9, OffsetDateTime::class.java),
+								reason = rows.getString(10),
+								byModerator = rows.getString(11),
+							),
+						)
+					}
+				}
 			}
 		}
 	}
@@ -324,12 +408,12 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 			"""
 			SELECT
 				(SELECT count(*) FROM comment
-				 WHERE created_at > now() - make_interval(hours => ?) AND down >= ? AND state <> 2
+				 WHERE created_at > now() - make_interval(hours => ?) AND down >= ? AND state NOT IN (1, 2)
 				   AND dismissed_at IS NULL),
 				(SELECT count(*) FROM ban_evasion_flag WHERE reviewed_at IS NULL),
 				(SELECT count(*) FROM rating_brigade_flag WHERE reviewed_at IS NULL),
 				(SELECT count(*) FROM work_link_dispute WHERE resolved_at IS NULL),
-				(SELECT count(*) FROM comment WHERE flagged_rule IS NOT NULL AND state <> 2
+				(SELECT count(*) FROM comment WHERE flagged_rule IS NOT NULL AND state NOT IN (1, 2)
 				   AND dismissed_at IS NULL),
 				(SELECT count(*) FROM filter_block WHERE reviewed_at IS NULL)
 			""".trimIndent(),

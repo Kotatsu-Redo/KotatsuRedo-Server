@@ -951,6 +951,7 @@ class WorkRepository(private val dataSource: DataSource) {
 		contentType: String?,
 		delaySeconds: Long = 0,
 	) {
+		if (!CatalogueCoverage.isCatalogued(contentType)) return
 		connection.prepareStatement(
 			"""
 			INSERT INTO work_enrichment (work_id, title, year, content_type, next_attempt_at)
@@ -967,6 +968,14 @@ class WorkRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	/** A work still its own, never queued, never described by any catalogue, and one they cover. */
+	private val backfillCandidate = """
+		w.merged_into IS NULL
+		AND lower(coalesce(w.content_type, '')) <> '${CatalogueCoverage.UNCATALOGUED_TYPE}'
+		AND NOT EXISTS (SELECT 1 FROM work_enrichment e WHERE e.work_id = w.id)
+		AND NOT EXISTS (SELECT 1 FROM work_external_id x WHERE x.work_id = w.id)
+	""".trimIndent()
+
 	/**
 	 * Queues works that no catalogue has ever described, most-read first.
 	 *
@@ -974,6 +983,10 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * match could join them, so the duplicates among them are invisible to everything except the ids
 	 * a catalogue can now supply. Bounded per call and idempotent: pressing the button twice queues
 	 * the next batch rather than the same one.
+	 *
+	 * Readership is counted in one grouped pass. It used to be a count per candidate, and with no
+	 * index on `work_alias_observation.work_id` that was a full scan of the table for each of sixteen
+	 * thousand works: past the statement timeout every time, which failed the sweep it ran in.
 	 *
 	 * @return how many were queued
 	 */
@@ -983,10 +996,10 @@ class WorkRepository(private val dataSource: DataSource) {
 			INSERT INTO work_enrichment (work_id, title, year, content_type)
 			SELECT w.id, w.canonical_title, w.year, w.content_type
 			FROM work w
-			LEFT JOIN work_enrichment e ON e.work_id = w.id
-			LEFT JOIN (SELECT DISTINCT work_id FROM work_external_id) x ON x.work_id = w.id
-			WHERE w.merged_into IS NULL AND e.work_id IS NULL AND x.work_id IS NULL
-			ORDER BY (SELECT count(*) FROM work_alias_observation o WHERE o.work_id = w.id) DESC, w.id
+			LEFT JOIN (SELECT work_id, count(*) AS n FROM work_alias_observation GROUP BY work_id) o
+				ON o.work_id = w.id
+			WHERE $backfillCandidate
+			ORDER BY coalesce(o.n, 0) DESC, w.id
 			LIMIT ?
 			ON CONFLICT (work_id) DO NOTHING
 			""".trimIndent(),
@@ -1000,10 +1013,7 @@ class WorkRepository(private val dataSource: DataSource) {
 	fun backfillCandidates(): Int = dataSource.connection.use { connection ->
 		connection.prepareStatement(
 			"""
-			SELECT count(*) FROM work w
-			LEFT JOIN work_enrichment e ON e.work_id = w.id
-			LEFT JOIN (SELECT DISTINCT work_id FROM work_external_id) x ON x.work_id = w.id
-			WHERE w.merged_into IS NULL AND e.work_id IS NULL AND x.work_id IS NULL
+			SELECT count(*) FROM work w WHERE $backfillCandidate
 			""".trimIndent(),
 		).use { statement ->
 			statement.executeQuery().use { rows -> if (rows.next()) rows.getInt(1) else 0 }
@@ -1386,6 +1396,11 @@ class WorkRepository(private val dataSource: DataSource) {
 					statement.setLong(2, from)
 					statement.executeUpdate()
 				}
+				// The loser's queue entry can never be worked again - every enrichment query requires a
+				// work that is still its own - so leaving it open makes it pending forever. Done here,
+				// in the merge itself, because that is the one path every merge goes through: the
+				// duplicate sweep, the enricher and a moderator pressing the button.
+				finishEnrichment(connection, from)
 				connection.commit()
 			} catch (e: Exception) {
 				connection.rollback()
