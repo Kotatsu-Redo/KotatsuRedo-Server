@@ -1,6 +1,6 @@
 # Build stage. Dependency resolution is its own layer so a source-only change does not re-download
 # the world on every build.
-FROM eclipse-temurin:17-jdk@sha256:36d9a76dc231587873b103c68a789b85d91b41d314dda69730d6bc43a777f2a9 AS build
+FROM eclipse-temurin:24-jdk@sha256:7493205ffe6caa8074fa8a06a276bb1c5ac41d3dd0fd43a0db66d7f776e80b3e AS build
 WORKDIR /app
 
 COPY gradle gradle
@@ -15,7 +15,7 @@ COPY legal legal
 RUN ./gradlew --no-daemon --quiet installDist
 
 # Runtime stage. JRE only, non-root, no build tooling.
-FROM eclipse-temurin:17-jre@sha256:c6f2875c05ea10f16398bdc5f73405c384991506f2f1ead8bcc6582ae8adea79
+FROM eclipse-temurin:24-jre@sha256:8cb2387a28af84cf0db0948d9c67d4480192f4e567027a3963f145d218e8b4f2
 WORKDIR /app
 
 RUN useradd --system --uid 10001 --create-home kotatsu
