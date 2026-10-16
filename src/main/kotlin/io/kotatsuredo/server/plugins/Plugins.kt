@@ -16,7 +16,10 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
+import io.ktor.server.application.createApplicationPlugin
+import io.ktor.server.application.hooks.ResponseSent
 import io.ktor.server.application.install
+import io.ktor.util.AttributeKey
 import io.ktor.server.plugins.callid.CallId
 import io.ktor.server.plugins.callid.callIdMdc
 import io.ktor.server.plugins.calllogging.CallLogging
@@ -70,16 +73,38 @@ fun Application.configureBlockingCalls(parallelism: Int) {
 private const val MAX_REQUEST_BODY_BYTES = 256L * 1024L
 
 /**
+ * Counts and times every answered request.
+ *
+ * The counting used to live in the log format, which runs once per request but knows nothing about
+ * when that request began. Timing needs both ends, and "is it slow?" is half of what the health view
+ * exists to answer - the other half being "is it refusing?".
+ */
+val RequestMetrics = createApplicationPlugin("RequestMetrics") {
+	val startedAt = AttributeKey<Long>("requestStartedAtNanos")
+
+	onCall { call -> call.attributes.put(startedAt, System.nanoTime()) }
+
+	on(ResponseSent) { call ->
+		val started = call.attributes.getOrNull(startedAt)
+		ServerMetrics.recordResponse(
+			status = call.response.status()?.value ?: 0,
+			durationMs = started?.let { (System.nanoTime() - it) / 1_000_000 } ?: -1,
+		)
+	}
+}
+
+/**
  * Request logging that cannot leak a credential.
  *
  * The bearer secret *is* the identity (PLAN.md §1), so a single log line containing an
- * `Authorization` header would hand out accounts. The format below is an allow-list of four fields -
- * method, path, status, duration - rather than a redaction pass over something richer, because an
+ * `Authorization` header would hand out accounts. The format below is an allow-list of three fields -
+ * method, path and status - rather than a redaction pass over something richer, because an
  * allow-list cannot be defeated by a header nobody thought to redact.
  *
  * `LoggingRedactionTest` asserts this and will fail the build if it regresses.
  */
 fun Application.configureLogging() {
+	install(RequestMetrics)
 	install(CallId) {
 		generate { UUID.randomUUID().toString().take(8) }
 		verify { it.isNotBlank() }
@@ -89,10 +114,7 @@ fun Application.configureLogging() {
 		callIdMdc("call-id")
 		// Never interpolate headers, query strings with tokens, or bodies into this.
 		format { call ->
-			val status = call.response.status()?.value ?: 0
-			// Counted here because this already runs once per answered request, with the final status.
-			ServerMetrics.recordResponse(status)
-			"${call.request.httpMethod.value} ${call.request.path()} -> $status"
+			"${call.request.httpMethod.value} ${call.request.path()} -> ${call.response.status()?.value ?: 0}"
 		}
 	}
 	install(DefaultHeaders) {

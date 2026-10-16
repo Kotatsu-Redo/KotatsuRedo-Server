@@ -35,6 +35,7 @@ import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
 import io.kotatsuredo.server.moderation.OverviewRepository
 import io.kotatsuredo.server.ops.OpsRepository
+import io.kotatsuredo.server.ops.ResourceUsage
 import io.kotatsuredo.server.moderation.ModeratorRepository
 import io.kotatsuredo.server.moderation.TotpSecretCipher
 import io.kotatsuredo.server.routes.adminRoutes
@@ -82,6 +83,8 @@ fun main(args: Array<String>) {
 
 	val config = Config.fromEnv()
 	val database = Database.connect(config.database)
+	// The health view reads the pool through this rather than being handed the datasource.
+	ResourceUsage.poolStats = database::poolStats
 
 	// Built before identity, because nicknames run through the same filter as comments.
 	val filterRepository = FilterRepository(database.source)
@@ -247,17 +250,17 @@ fun Application.module(
 				if (telemetry != null) {
 					telemetryRoutes(identities, telemetry, limiter)
 				}
-				if (resolver != null && linker != null) {
-					workRoutes(identities, resolver, linker, limiter, queues)
+				if (resolver != null && linker != null && works != null) {
+					workRoutes(identities, resolver, linker, limiter, works, queues)
 				}
 				if (ratings != null && works != null) {
 					ratingRoutes(identities, ratings, works, limiter)
 				}
-				if (ratings != null && commentsRepository != null) {
+				if (ratings != null && commentsRepository != null && works != null) {
 					// "Give me a copy of everything you hold about me", self-service: the key is the
 					// only proof of identity this server has, and it is the same proof the delete
 					// button already accepts.
-					exportRoutes(identities, commentsRepository, ratings, limiter)
+					exportRoutes(identities, commentsRepository, ratings, works, limiter)
 				}
 				if (comments != null && works != null) {
 					commentRoutes(identities, comments, works, limiter, rulesUrl, filters)

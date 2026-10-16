@@ -76,6 +76,51 @@ class PolicyClaimsTest {
 		assertEquals(7L, TelemetryRetention.RETENTION_DAYS)
 	}
 
+	/**
+	 * "each day's totals per source ... with no pseudonym in them."
+	 *
+	 * The rollup outlives the raw rows, so it is the table that must never grow a way back to a reporter.
+	 */
+	@Test
+	fun `the daily telemetry totals hold no pseudonym`() {
+		val daily = columns().filter { it.first == "source_probe_daily" }.map { it.second }.toSet()
+		assertTrue(daily.isNotEmpty(), "source_probe_daily is gone - check legal/PRIVACY.md")
+		assertTrue(
+			daily.none { it.contains("reporter_day") || it.contains("user") || it.contains("pseudonym") },
+			"source_probe_daily gained a per-reporter column: $daily",
+		)
+	}
+
+	/**
+	 * "They are in your export, and they are deleted with your account."
+	 *
+	 * The notes of what an account opened are the most personal thing the server holds after the
+	 * comments themselves, so deleting the account must take them too - by the database, not by code
+	 * somebody has to remember to call.
+	 */
+	@Test
+	fun `notes of the manga an account opened are deleted with it`() {
+		val rules = PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT k.table_name, rc.delete_rule
+				FROM information_schema.referential_constraints rc
+				JOIN information_schema.key_column_usage k ON k.constraint_name = rc.constraint_name
+				WHERE k.column_name = 'user_id'
+				  AND k.table_name IN ('work_alias_observation', 'work_genre_observation')
+				""".trimIndent(),
+			).use { statement ->
+				statement.executeQuery().use { rows ->
+					buildMap { while (rows.next()) put(rows.getString(1), rows.getString(2)) }
+				}
+			}
+		}
+		assertEquals(
+			mapOf("work_alias_observation" to "CASCADE", "work_genre_observation" to "CASCADE"),
+			rules,
+		)
+	}
+
 	/** "That text is kept for 30 days and then erased." */
 	@Test
 	fun `blocked text retention is what the notice says`() {

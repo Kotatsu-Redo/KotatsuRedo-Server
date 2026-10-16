@@ -17,3 +17,6 @@ out/
 tools/.cache/
 tools/.corpus/
 .deploy-sync/
+
+# Local server logs
+logs/

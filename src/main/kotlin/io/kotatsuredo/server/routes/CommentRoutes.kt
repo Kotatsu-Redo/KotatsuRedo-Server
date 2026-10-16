@@ -105,6 +105,11 @@ data class EditCommentRequest(
 data class VoteRequest(
 	/** +1, -1, or 0 to withdraw. */
 	val value: Int,
+	/**
+	 * With `value` 0: put back the vote this one replaced (like, dislike, un-dislike leaves the
+	 * like) instead of clearing it. Absent from older clients, which mean "no vote" by 0.
+	 */
+	@SerialName("restore_previous") val restorePrevious: Boolean = false,
 )
 
 @Serializable
@@ -305,10 +310,10 @@ fun Route.commentRoutes(
 			val caller = call.requireCaller(identities)
 			call.enforceLimit(limiter, RateLimiter.Bucket.VOTES, caller.tier, caller.identity.id)
 
-			val value = call.receive<VoteRequest>().value
-			if (value !in -1..1) throw ApiException(ApiError.BadRequest("value"))
+			val request = call.receive<VoteRequest>()
+			if (request.value !in -1..1) throw ApiException(ApiError.BadRequest("value"))
 
-			val view = comments.vote(call.commentId(), caller.identity, value)
+			val view = comments.vote(call.commentId(), caller.identity, request.value, request.restorePrevious)
 				?: throw ApiException(ApiError.NotFound)
 			call.respond(view.toDto())
 		}

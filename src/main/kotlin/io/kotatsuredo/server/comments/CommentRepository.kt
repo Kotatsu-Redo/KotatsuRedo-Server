@@ -389,8 +389,17 @@ class CommentRepository(private val dataSource: DataSource) {
 	/**
 	 * Serializes vote changes per comment and refreshes its counters in the same transaction, so two
 	 * concurrent recounts cannot overwrite a newer result with an older snapshot.
+	 *
+	 * @param restorePrevious when [value] is 0, put back the vote this one replaced instead of
+	 *  clearing it. Opt-in, because a client that predates it sends 0 meaning "no vote" and renders
+	 *  whatever comes back.
 	 */
-	fun setVoteAndRecount(commentId: Long, userId: String, value: Int): Triple<Int, Int, Double> =
+	fun setVoteAndRecount(
+		commentId: Long,
+		userId: String,
+		value: Int,
+		restorePrevious: Boolean = false,
+	): Triple<Int, Int, Double> =
 		dataSource.connection.use { connection ->
 			connection.autoCommit = false
 			try {
@@ -415,16 +424,31 @@ class CommentRepository(private val dataSource: DataSource) {
 						it.getInt(1) to it.getInt(2)
 					}
 				}
-				val oldValue = connection.prepareStatement(
-					"SELECT value FROM comment_vote WHERE comment_id = ? AND user_id = ?",
+				val (oldValue, previousValue) = connection.prepareStatement(
+					"SELECT value, previous_value FROM comment_vote WHERE comment_id = ? AND user_id = ?",
 				).use { statement ->
 					statement.setLong(1, commentId)
 					statement.setString(2, userId)
-					statement.executeQuery().use {
-						if (it.next()) it.getInt(1) else null
+					statement.executeQuery().use { rows ->
+						if (!rows.next()) return@use null to null
+						val current = rows.getInt(1)
+						val previous = rows.getInt(2)
+						current to (if (rows.wasNull()) null else previous)
 					}
 				}
-				if (value == 0) {
+				// Withdrawing a vote that replaced the opposite one can roll back to that one - like,
+				// dislike, un-dislike leaves the like standing - but only for a client that asks.
+				val newValue = when {
+					value != 0 -> value
+					restorePrevious -> previousValue ?: 0
+					else -> 0
+				}
+				val newPrevious = when {
+					value == 0 -> null
+					oldValue == value -> previousValue
+					else -> oldValue
+				}
+				if (newValue == 0) {
 					connection.prepareStatement(
 						"DELETE FROM comment_vote WHERE comment_id = ? AND user_id = ?",
 					).use { statement ->
@@ -432,16 +456,22 @@ class CommentRepository(private val dataSource: DataSource) {
 						statement.setString(2, userId)
 						statement.executeUpdate()
 					}
-				} else {
+				} else if (newValue != oldValue || newPrevious != previousValue) {
 					connection.prepareStatement(
 						"""
-						INSERT INTO comment_vote (comment_id, user_id, value) VALUES (?, ?, ?)
-						ON CONFLICT (comment_id, user_id) DO UPDATE SET value = EXCLUDED.value
+						INSERT INTO comment_vote (comment_id, user_id, value, previous_value) VALUES (?, ?, ?, ?)
+						ON CONFLICT (comment_id, user_id)
+						DO UPDATE SET value = EXCLUDED.value, previous_value = EXCLUDED.previous_value
 						""".trimIndent(),
 					).use { statement ->
 						statement.setLong(1, commentId)
 						statement.setString(2, userId)
-						statement.setInt(3, value)
+						statement.setInt(3, newValue)
+						if (newPrevious == null) {
+							statement.setNull(4, java.sql.Types.SMALLINT)
+						} else {
+							statement.setInt(4, newPrevious)
+						}
 						statement.executeUpdate()
 					}
 				}
@@ -452,7 +482,7 @@ class CommentRepository(private val dataSource: DataSource) {
 						1 -> up--
 						-1 -> down--
 					}
-					when (value) {
+					when (newValue) {
 						1 -> up++
 						-1 -> down++
 					}

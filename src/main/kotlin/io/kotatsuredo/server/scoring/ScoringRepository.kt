@@ -4,10 +4,16 @@ import java.sql.Types
 import java.time.OffsetDateTime
 import javax.sql.DataSource
 
-/** One source in one region, after decay has been applied but before scoring. */
+/**
+ * One source in one region, after decay has been applied but before scoring.
+ *
+ * [op] is null for the blended figure over every operation, and set when the row describes one
+ * operation on its own.
+ */
 data class SourceAggregate(
 	val source: String,
 	val region: String,
+	val op: Short? = null,
 	val okWeighted: Double,
 	val failWeighted: Double,
 	val emptyWeighted: Double,
@@ -26,6 +32,15 @@ data class SourceScore(
 	val sampleSize: Int,
 )
 
+/** Stability for one operation of one source, beside the blended [SourceScore]. */
+data class SourceOpScore(
+	val source: String,
+	val region: String,
+	val op: Short,
+	val stability: Double,
+	val sampleSize: Int,
+)
+
 class ScoringRepository(private val dataSource: DataSource) {
 
 	/**
@@ -33,8 +48,21 @@ class ScoringRepository(private val dataSource: DataSource) {
 	 * the scoring maths stays in Kotlin where it can be tested. This is the only place the two meet.
 	 */
 	fun aggregate(windowDays: Int = WINDOW_DAYS, halfLifeDays: Double = 7.0): List<SourceAggregate> =
+		aggregate(AGGREGATE, byOp = false, windowDays = windowDays, halfLifeDays = halfLifeDays)
+
+	/**
+	 * The same aggregation, split by operation.
+	 *
+	 * Device health stays whole-device across operations: a phone that is failing everything is
+	 * failing it at every operation, and deciding that per operation would let a broken device look
+	 * healthy on whichever one it happened to attempt least.
+	 */
+	fun aggregateByOp(windowDays: Int = WINDOW_DAYS, halfLifeDays: Double = 7.0): List<SourceAggregate> =
+		aggregate(AGGREGATE_BY_OP, byOp = true, windowDays = windowDays, halfLifeDays = halfLifeDays)
+
+	private fun aggregate(sql: String, byOp: Boolean, windowDays: Int, halfLifeDays: Double): List<SourceAggregate> =
 		dataSource.connection.use { connection ->
-			connection.prepareStatement(AGGREGATE).use { statement ->
+			connection.prepareStatement(sql).use { statement ->
 				// Order matters and matches AGGREGATE: half-life first (inside power), window second.
 				statement.setDouble(1, halfLifeDays)
 				statement.setInt(2, windowDays)
@@ -45,6 +73,7 @@ class ScoringRepository(private val dataSource: DataSource) {
 								SourceAggregate(
 									source = rows.getString("source"),
 									region = rows.getString("region"),
+									op = if (byOp) rows.getShort("op") else null,
 									okWeighted = rows.getDouble("ok_w"),
 									failWeighted = rows.getDouble("fail_w"),
 									emptyWeighted = rows.getDouble("empty_w"),
@@ -103,6 +132,79 @@ class ScoringRepository(private val dataSource: DataSource) {
 			connection.autoCommit = true
 		}
 	}
+
+	/**
+	 * Replaces the per-operation rows for every region in [scores].
+	 *
+	 * Runs after [replace], because a per-operation row has nowhere to hang until its blended row
+	 * exists. Deleting the region first is what retires an operation a source has stopped serving:
+	 * an upsert alone would leave its last figure in place forever.
+	 */
+	fun replaceOpScores(scores: List<SourceOpScore>, now: OffsetDateTime): Int =
+		dataSource.connection.use { connection ->
+			connection.autoCommit = false
+			try {
+				scores.map { it.region }.distinct().forEach { region ->
+					connection.prepareStatement("DELETE FROM source_score_op WHERE region = ?").use { statement ->
+						statement.setString(1, region)
+						statement.executeUpdate()
+					}
+				}
+				val applied = if (scores.isEmpty()) 0 else connection.prepareStatement(UPSERT_OP).use { statement ->
+					scores.forEach { score ->
+						statement.setString(1, score.source)
+						statement.setString(2, score.region)
+						statement.setShort(3, score.op)
+						statement.setFloat(4, score.stability.toFloat())
+						statement.setInt(5, score.sampleSize)
+						statement.setObject(6, now, Types.TIMESTAMP_WITH_TIMEZONE)
+						statement.addBatch()
+					}
+					statement.executeBatch().sum()
+				}
+				connection.commit()
+				applied
+			} catch (error: Exception) {
+				connection.rollback()
+				throw error
+			} finally {
+				connection.autoCommit = true
+			}
+		}
+
+	/** Per-operation stability for one region, keyed by source. */
+	fun opScoresFor(region: String): Map<String, List<SourceOpScore>> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT o.source, o.region, o.op, o.stability, o.sample_size
+				FROM source_score_op o
+				JOIN source_score s USING (source, region)
+				WHERE o.region = ?
+				ORDER BY s.composite DESC, o.source, o.op
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, region)
+				// Three operations per source, over the same source budget the blended list uses.
+				statement.setInt(2, MAX_SCORES_PER_REGION * 3)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							add(
+								SourceOpScore(
+									source = rows.getString(1),
+									region = rows.getString(2),
+									op = rows.getShort(3),
+									stability = rows.getDouble(4),
+									sampleSize = rows.getInt(5),
+								),
+							)
+						}
+					}.groupBy { it.source }
+				}
+			}
+		}
 
 	fun pruneStale(now: OffsetDateTime): Int = dataSource.connection.use { connection ->
 		connection.prepareStatement("DELETE FROM source_score WHERE updated_at < ?").use { statement ->
@@ -181,9 +283,16 @@ class ScoringRepository(private val dataSource: DataSource) {
 		 * a real outage everywhere must still show, and discarding it all would score the source as zero.
 		 * Popularity and sample size still count every reporter: a broken device still used the source.
 		 */
-		val AGGREGATE = """
+		/**
+		 * One query, two groupings. `byOp` adds the operation to every grouping that describes a
+		 * source's behaviour, and leaves device health - which is about the phone, not the source -
+		 * grouped across operations exactly as before.
+		 */
+		private fun aggregateSql(byOp: Boolean): String {
+			val op = if (byOp) ", op" else ""
+			return """
 			WITH decayed AS (
-				SELECT source, region, day, reporter_day, tier,
+				SELECT source, region, op, day, reporter_day, tier,
 				       ok, fail, empty, cf_blocked, latency_p50_ms,
 				       power(
 				         0.5,
@@ -193,7 +302,7 @@ class ScoringRepository(private val dataSource: DataSource) {
 				WHERE day >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - ?::int
 			),
 			reporter_samples AS (
-				SELECT source, region, day, reporter_day, MAX(tier) AS tier, MAX(w) AS w,
+				SELECT source, region$op, day, reporter_day, MAX(tier) AS tier, MAX(w) AS w,
 				       SUM(ok)::numeric AS ok,
 				       SUM(fail)::numeric AS fail,
 				       SUM(empty)::numeric AS empty,
@@ -203,6 +312,12 @@ class ScoringRepository(private val dataSource: DataSource) {
 				         0
 				       ) AS latency
 				FROM decayed
+				GROUP BY source, region$op, day, reporter_day
+			),
+			device_samples AS (
+				SELECT source, region, day, reporter_day,
+				       SUM(ok)::numeric AS ok, SUM(fail)::numeric AS fail
+				FROM decayed
 				GROUP BY source, region, day, reporter_day
 			),
 			device_health AS (
@@ -211,12 +326,12 @@ class ScoringRepository(private val dataSource: DataSource) {
 				         COUNT(*) >= $DEVICE_FAILURE_MIN_SOURCES
 				         AND COUNT(*) FILTER (WHERE fail > ok) >= $DEVICE_FAILURE_SHARE * COUNT(*)
 				       ) AS healthy
-				FROM reporter_samples
+				FROM device_samples
 				WHERE ok + fail > 0
 				GROUP BY region, day, reporter_day
 			),
 			weighted AS (
-				SELECT s.source, s.region, s.ok, s.fail, s.empty, s.cf_blocked, s.latency,
+				SELECT s.source, s.region$op, s.ok, s.fail, s.empty, s.cf_blocked, s.latency,
 				       s.w * (0.5 + s.tier * 0.25) AS trust_w,
 				       LEAST(s.ok + s.fail, $MAX_EVIDENCE_PER_SAMPLE) AS evidence,
 				       COALESCE(h.healthy, TRUE) AS healthy
@@ -225,11 +340,11 @@ class ScoringRepository(private val dataSource: DataSource) {
 			),
 			selected AS (
 				SELECT *,
-				       healthy OR NOT bool_or(healthy) OVER (PARTITION BY source, region) AS counted
+				       healthy OR NOT bool_or(healthy) OVER (PARTITION BY source, region$op) AS counted
 				FROM weighted
 			),
 			aggregated AS (
-				SELECT source, region,
+				SELECT source, region$op,
 				       SUM((ok / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS ok_w,
 				       SUM((fail / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS fail_w,
 				       SUM((empty / NULLIF(ok + fail, 0)) * trust_w * evidence) FILTER (WHERE counted) AS empty_w,
@@ -238,9 +353,9 @@ class ScoringRepository(private val dataSource: DataSource) {
 				       SUM(trust_w * evidence) FILTER (WHERE counted) AS lat_den,
 				       SUM(trust_w)                 AS weight,
 				       COUNT(*)                     AS sample_size
-				FROM selected GROUP BY source, region
+				FROM selected GROUP BY source, region$op
 			)
-			SELECT source, region,
+			SELECT source, region$op,
 			       COALESCE(ok_w, 0)::float8    AS ok_w,
 			       COALESCE(fail_w, 0)::float8  AS fail_w,
 			       COALESCE(empty_w, 0)::float8 AS empty_w,
@@ -249,6 +364,19 @@ class ScoringRepository(private val dataSource: DataSource) {
 			       weight::float8 AS reporter_w,
 			       sample_size
 			FROM aggregated
+			""".trimIndent()
+		}
+
+		val AGGREGATE = aggregateSql(byOp = false)
+		val AGGREGATE_BY_OP = aggregateSql(byOp = true)
+
+		val UPSERT_OP = """
+			INSERT INTO source_score_op (source, region, op, stability, sample_size, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (source, region, op) DO UPDATE SET
+				stability   = EXCLUDED.stability,
+				sample_size = EXCLUDED.sample_size,
+				updated_at  = EXCLUDED.updated_at
 		""".trimIndent()
 
 		val UPSERT = """

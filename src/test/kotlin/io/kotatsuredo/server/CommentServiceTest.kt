@@ -227,8 +227,43 @@ class CommentServiceTest {
 		assertEquals(0, changed.comment.up)
 		assertEquals(1, changed.comment.down)
 
+		// A client that does not ask for the rollback means "no vote" by 0, whatever came before.
 		val withdrawn = service.vote(root.id, voter, 0)
 		assertNotNull(withdrawn)
+		assertEquals(0, withdrawn.comment.up)
+		assertEquals(0, withdrawn.comment.down)
+		assertEquals(0, withdrawn.myVote)
+	}
+
+	@Test
+	fun `withdrawing a switched vote restores the one it replaced when asked`() {
+		val workId = work()
+		val root = assertIs<PostResult.Posted>(post(workId, user("a"))).view.comment
+		val voter = user("b")
+
+		service.vote(root.id, voter, 1)
+		service.vote(root.id, voter, -1)
+
+		val rolledBack = assertNotNull(service.vote(root.id, voter, 0, restorePrevious = true))
+		assertEquals(1, rolledBack.comment.up)
+		assertEquals(0, rolledBack.comment.down)
+		assertEquals(1, rolledBack.myVote)
+
+		// The restored like replaced nothing, so withdrawing it clears it even when asked.
+		val withdrawn = assertNotNull(service.vote(root.id, voter, 0, restorePrevious = true))
+		assertEquals(0, withdrawn.comment.up)
+		assertEquals(0, withdrawn.comment.down)
+		assertEquals(0, withdrawn.myVote)
+	}
+
+	@Test
+	fun `withdrawing a vote that replaced nothing clears it`() {
+		val workId = work()
+		val root = assertIs<PostResult.Posted>(post(workId, user("a"))).view.comment
+		val voter = user("b")
+
+		service.vote(root.id, voter, -1)
+		val withdrawn = assertNotNull(service.vote(root.id, voter, 0))
 		assertEquals(0, withdrawn.comment.up)
 		assertEquals(0, withdrawn.comment.down)
 		assertEquals(0, withdrawn.myVote)

@@ -19,6 +19,8 @@ data class CatalogueRecord(
 	/** provider -> id, e.g. `myanimelist` -> `116778`. Anchors for scrobbler-linked clients. */
 	val externalIds: Map<String, String>,
 	val relations: List<CatalogueRelation> = emptyList(),
+	/** Raw genre labels as the catalogue writes them; the server maps them onto its vocabulary. */
+	val genres: List<String> = emptyList(),
 )
 
 data class CatalogueRelation(val type: String, val targetTitle: String?, val targetId: String?)

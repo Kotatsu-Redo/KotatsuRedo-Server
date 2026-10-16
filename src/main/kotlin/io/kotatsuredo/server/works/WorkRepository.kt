@@ -2,6 +2,7 @@ package io.kotatsuredo.server.works
 
 import java.sql.Statement
 import java.sql.Types
+import java.time.LocalDate
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.add
@@ -43,6 +44,48 @@ data class WorkCreationResult(
 	val created: Boolean,
 	/** True when another request had already claimed this exact source alias. */
 	val aliasAlreadyExisted: Boolean,
+)
+
+/** A work that shares genres with another, as [WorkRepository.similarTo] reports it. */
+data class SimilarWork(
+	val workId: Long,
+	val title: String,
+	val year: Int?,
+	val contentType: String?,
+	val nsfw: Boolean,
+	/** Sum of the shared genres' rarity weights. Comparable within one response, not across works. */
+	val score: Double,
+	val sharedGenres: Int,
+)
+
+/** One account's record of a source entry it asked about, as the data export reports it. */
+data class AliasObservation(
+	val source: String,
+	val sourceKey: String,
+	val workId: Long,
+	/** The normalized title keys the entry was matched on - not the raw titles. */
+	val titleKeys: List<String>,
+	val createdAt: java.time.OffsetDateTime,
+	val updatedAt: java.time.OffsetDateTime,
+)
+
+/** One account's genre report for a work, as the data export reports it. */
+data class GenreObservation(
+	val workId: Long,
+	val genre: String,
+	val createdAt: java.time.OffsetDateTime,
+)
+
+/** One source known to carry a work, as [WorkRepository.sourcesFor] reports it. */
+data class WorkSource(
+	val source: String,
+	val sourceKey: String,
+	/** Distinct accounts that have seen this work on this source. Never fewer than two. */
+	val reporters: Int,
+	/** Day the work was last seen there, so a source that dropped it can fall down the list. */
+	val lastSeen: LocalDate,
+	/** True once the alias passed the resolver's own quorum. */
+	val verified: Boolean,
 )
 
 class WorkRepository(private val dataSource: DataSource) {
@@ -919,6 +962,254 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * Checks whatever content tables exist, so it starts returning real answers the moment M3 and M4a
 	 * create `rating` and `comment` - rather than needing to be remembered and updated then.
 	 */
+	// -- genres ------------------------------------------------------------------------------------
+
+	/**
+	 * Records one account's genres for a work and publishes those enough accounts now agree on.
+	 *
+	 * Terms are mapped onto the closed vocabulary before anything is stored, so an unrecognised
+	 * label never reaches the database, let alone a reader. Agreement is what makes the rest safe:
+	 * one person's source calling everything "action" moves nothing.
+	 *
+	 * @return the genres published by this call
+	 */
+	fun observeGenres(workId: Long, userId: String, genres: Collection<String>): List<String> {
+		val recognised = Genres.parseAll(genres)
+		if (recognised.isEmpty()) return emptyList()
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				INSERT INTO work_genre_observation (work_id, genre, user_id)
+				VALUES (?, ?, ?) ON CONFLICT DO NOTHING
+				""".trimIndent(),
+			).use { statement ->
+				recognised.forEach { genre ->
+					statement.setLong(1, workId)
+					statement.setString(2, genre)
+					statement.setString(3, userId)
+					statement.addBatch()
+				}
+				statement.executeBatch()
+			}
+			connection.prepareStatement(
+				"""
+				INSERT INTO work_genre (work_id, genre, origin, reporters)
+				SELECT observation.work_id, observation.genre, 'readers', count(*)
+				FROM work_genre_observation observation
+				JOIN app_user account ON account.id = observation.user_id
+				WHERE observation.work_id = ? AND observation.genre = ANY(?)
+				  AND NOT account.is_banned AND NOT account.is_shadowbanned
+				GROUP BY observation.work_id, observation.genre
+				HAVING count(*) >= ?
+				ON CONFLICT (work_id, genre) DO UPDATE SET reporters = EXCLUDED.reporters
+				RETURNING genre
+				""".trimIndent(),
+			).use { statement ->
+				statement.setLong(1, workId)
+				statement.setArray(2, connection.createArrayOf("text", recognised.toTypedArray()))
+				statement.setInt(3, GENRE_AGREEMENT_REQUIRED)
+				statement.executeQuery().use { rows ->
+					buildList { while (rows.next()) add(rows.getString(1)) }
+				}
+			}
+		}
+	}
+
+	/**
+	 * Genres from a catalogue, which are curated upstream and need no quorum.
+	 *
+	 * A genre both sides know is marked as the catalogue's, because that is the stronger claim.
+	 */
+	fun applyCatalogueGenres(workId: Long, genres: Collection<String>) {
+		val recognised = Genres.parseAll(genres)
+		if (recognised.isEmpty()) return
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				INSERT INTO work_genre (work_id, genre, origin, reporters)
+				VALUES (?, ?, 'catalogue', 0)
+				ON CONFLICT (work_id, genre) DO UPDATE SET origin = 'catalogue'
+				""".trimIndent(),
+			).use { statement ->
+				recognised.forEach { genre ->
+					statement.setLong(1, workId)
+					statement.setString(2, genre)
+					statement.addBatch()
+				}
+				statement.executeBatch()
+			}
+		}
+	}
+
+	/** The published genres of a work, catalogue-backed ones first. */
+	fun genresOf(workId: Long): List<String> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			SELECT genre FROM work_genre WHERE work_id = ?
+			ORDER BY origin = 'catalogue' DESC, reporters DESC, genre
+			""".trimIndent(),
+		).use { statement ->
+			statement.setLong(1, workId)
+			statement.executeQuery().use { rows ->
+				buildList { while (rows.next()) add(rows.getString(1)) }
+			}
+		}
+	}
+
+	/**
+	 * Works that share this one's genres, rarest genre first.
+	 *
+	 * The weighting is the whole idea: two works both tagged `action` have said almost nothing about
+	 * each other, while two tagged `villainess` have said a great deal. Each shared genre is worth
+	 * the log of how much rarer it is than the commonest genre this work has, so agreement on
+	 * something specific outweighs agreement on something universal.
+	 *
+	 * Candidates come from the work's rarest genres rather than all of them, because `action` alone
+	 * would sweep in tens of thousands of works to score and throw away.
+	 */
+	fun similarTo(workId: Long, limit: Int = MAX_SIMILAR): List<SimilarWork> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				WITH target AS (SELECT genre FROM work_genre WHERE work_id = ?),
+				stats AS (
+					SELECT g.genre, count(*)::float8 AS works
+					FROM work_genre g JOIN target t ON t.genre = g.genre
+					GROUP BY g.genre
+				),
+				commonest AS (SELECT max(works) AS works FROM stats),
+				rare AS (SELECT genre FROM stats ORDER BY works LIMIT $SIMILAR_SEED_GENRES),
+				candidates AS (
+					SELECT DISTINCT wg.work_id
+					FROM work_genre wg JOIN rare r ON r.genre = wg.genre
+					WHERE wg.work_id <> ?
+					LIMIT $SIMILAR_CANDIDATES
+				),
+				scored AS (
+					SELECT c.work_id,
+					       sum(ln(1 + (SELECT works FROM commonest) / s.works)) AS score,
+					       count(*) AS shared
+					FROM candidates c
+					JOIN work_genre wg ON wg.work_id = c.work_id
+					JOIN stats s ON s.genre = wg.genre
+					GROUP BY c.work_id
+					HAVING count(*) >= $SIMILAR_SHARED_REQUIRED
+				)
+				SELECT w.id, w.canonical_title, w.year, w.content_type, w.nsfw, scored.score, scored.shared
+				FROM scored
+				JOIN work w ON w.id = scored.work_id AND w.merged_into IS NULL
+				WHERE w.content_type IS NULL
+				   OR w.content_type = (SELECT content_type FROM work WHERE id = ?)
+				   OR (SELECT content_type FROM work WHERE id = ?) IS NULL
+				ORDER BY scored.score DESC, scored.shared DESC, w.id
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setLong(1, workId)
+				statement.setLong(2, workId)
+				statement.setLong(3, workId)
+				statement.setLong(4, workId)
+				statement.setInt(5, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							add(
+								SimilarWork(
+									workId = rows.getLong(1),
+									title = rows.getString(2),
+									year = rows.getInt(3).takeUnless { rows.wasNull() },
+									contentType = rows.getString(4),
+									nsfw = rows.getBoolean(5),
+									score = rows.getDouble(6),
+									sharedGenres = rows.getInt(7),
+								),
+							)
+						}
+					}
+				}
+			}
+		}
+
+	// -- per-account records, for the data export ---------------------------------------------
+
+	/**
+	 * The source entries this account asked about, ordered by (source, key) so the export can page
+	 * through them without holding a whole library in memory.
+	 *
+	 * @param after the last (source, key) of the previous page, or null for the first
+	 */
+	fun aliasObservationsByPage(userId: String, after: Pair<String, String>?, limit: Int): List<AliasObservation> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT source, source_key, work_id, title_keys, created_at, updated_at
+				FROM work_alias_observation
+				WHERE user_id = ? AND (source, source_key) > (?, ?)
+				ORDER BY source, source_key
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setString(2, after?.first.orEmpty())
+				statement.setString(3, after?.second.orEmpty())
+				statement.setInt(4, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							@Suppress("UNCHECKED_CAST")
+							val keys = (rows.getArray(4)?.array as? Array<String>)?.toList().orEmpty()
+							add(
+								AliasObservation(
+									source = rows.getString(1),
+									sourceKey = rows.getString(2),
+									workId = rows.getLong(3),
+									titleKeys = keys,
+									createdAt = rows.getObject(5, java.time.OffsetDateTime::class.java),
+									updatedAt = rows.getObject(6, java.time.OffsetDateTime::class.java),
+								),
+							)
+						}
+					}
+				}
+			}
+		}
+
+	/**
+	 * The genres this account reported, ordered by (work, genre) for paging like [aliasObservationsByPage].
+	 *
+	 * @param after the last (work, genre) of the previous page, or null for the first
+	 */
+	fun genreObservationsByPage(userId: String, after: Pair<Long, String>?, limit: Int): List<GenreObservation> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT work_id, genre, created_at
+				FROM work_genre_observation
+				WHERE user_id = ? AND (work_id, genre) > (?, ?)
+				ORDER BY work_id, genre
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setLong(2, after?.first ?: Long.MIN_VALUE)
+				statement.setString(3, after?.second.orEmpty())
+				statement.setInt(4, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							add(
+								GenreObservation(
+									workId = rows.getLong(1),
+									genre = rows.getString(2),
+									createdAt = rows.getObject(3, java.time.OffsetDateTime::class.java),
+								),
+							)
+						}
+					}
+				}
+			}
+		}
+
 	// -- catalogue enrichment --------------------------------------------------------------------
 
 	/** Records that this work was created from what a source said and still needs a catalogue. */
@@ -968,6 +1259,68 @@ class WorkRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	/**
+	 * Which sources carry this work, and how well corroborated each one is.
+	 *
+	 * Built from observations the resolver already writes, so it collects nothing new. What it adds
+	 * is the question ranking could never answer before: not "is this source good" but "does this
+	 * source have this manga, and is it still there". The client ranks the answer by its own
+	 * per-operation scores.
+	 *
+	 * Two rules keep it aggregate. A source needs [SOURCE_CORROBORATION_REQUIRED] distinct accounts
+	 * before it appears, so the endpoint can never read back one person's library; and sanctioned
+	 * accounts are excluded, exactly as alias verification excludes them.
+	 */
+	fun sourcesFor(workId: Long, limit: Int = MAX_SOURCES_PER_WORK): List<WorkSource> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT observation.source,
+				       (array_agg(observation.source_key ORDER BY observation.updated_at DESC))[1] AS source_key,
+				       count(DISTINCT observation.user_id) AS reporters,
+				       max(observation.updated_at)::date AS last_seen,
+				       bool_or(alias.is_verified) AS verified
+				FROM work_alias_observation observation
+				JOIN app_user account ON account.id = observation.user_id
+				LEFT JOIN work_alias alias
+				       ON alias.source = observation.source AND alias.source_key = observation.source_key
+				WHERE observation.work_id = ?
+				  AND NOT account.is_banned AND NOT account.is_shadowbanned
+				GROUP BY observation.source
+				HAVING count(DISTINCT observation.user_id) >= ?
+				-- Corroboration, faded by how long ago the work was last seen there. A source that
+				-- carried it for a year and dropped it last month should not outrank one carrying it
+				-- now; a thirty-day half-life is slow enough that a quiet series does not vanish.
+				ORDER BY count(DISTINCT observation.user_id) *
+				         power(
+				           0.5,
+				           EXTRACT(EPOCH FROM now() - max(observation.updated_at)) / 86400.0 / $COVERAGE_HALF_LIFE_DAYS
+				         ) DESC,
+				         reporters DESC, observation.source
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setLong(1, workId)
+				statement.setInt(2, SOURCE_CORROBORATION_REQUIRED)
+				statement.setInt(3, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							add(
+								WorkSource(
+									source = rows.getString(1),
+									sourceKey = rows.getString(2),
+									reporters = rows.getInt(3),
+									lastSeen = rows.getObject(4, LocalDate::class.java),
+									verified = rows.getBoolean(5),
+								),
+							)
+						}
+					}
+				}
+			}
+		}
+
 	/** A work still its own, never queued, never described by any catalogue, and one they cover. */
 	private val backfillCandidate = """
 		w.merged_into IS NULL
@@ -1006,6 +1359,51 @@ class WorkRepository(private val dataSource: DataSource) {
 		).use { statement ->
 			statement.setInt(1, limit)
 			statement.executeUpdate()
+		}
+	}
+
+	/**
+	 * Reopens works a catalogue described before its genres were kept, most-read first.
+	 *
+	 * Only works some catalogue did describe - an external id is the evidence - since one that no
+	 * catalogue lists has no genres to offer. Each is reopened at most once, marked by
+	 * `genres_rechecked_at`, so a work whose catalogue lists no genres is not asked about forever.
+	 * The lookup that follows is the ordinary enrichment one, exactly as a partial answer is rechecked.
+	 *
+	 * @return how many were reopened
+	 */
+	fun reopenForGenres(limit: Int): Int = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"""
+			UPDATE work_enrichment SET done_at = NULL, attempts = 0, next_attempt_at = now(),
+				genres_rechecked_at = now()
+			WHERE work_id IN (
+				SELECT e.work_id
+				FROM work_enrichment e
+				JOIN work w ON w.id = e.work_id AND w.merged_into IS NULL
+				WHERE e.done_at IS NOT NULL AND e.genres_rechecked_at IS NULL
+				  AND lower(coalesce(w.content_type, '')) <> '${CatalogueCoverage.UNCATALOGUED_TYPE}'
+				  AND EXISTS (SELECT 1 FROM work_external_id x WHERE x.work_id = w.id)
+				  AND NOT EXISTS (SELECT 1 FROM work_genre g WHERE g.work_id = w.id AND g.origin = 'catalogue')
+				ORDER BY (SELECT count(*) FROM work_alias_observation o WHERE o.work_id = w.id) DESC, e.work_id
+				LIMIT ?
+			)
+			""".trimIndent(),
+		).use { statement ->
+			statement.setInt(1, limit)
+			statement.executeUpdate()
+		}
+	}
+
+	/** Records that this work's catalogue answer was read with genres kept, so [reopenForGenres] skips it. */
+	fun markGenresChecked(workId: Long) {
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"UPDATE work_enrichment SET genres_rechecked_at = now() WHERE work_id = ? AND genres_rechecked_at IS NULL",
+			).use { statement ->
+				statement.setLong(1, workId)
+				statement.executeUpdate()
+			}
 		}
 	}
 
@@ -1333,6 +1731,14 @@ class WorkRepository(private val dataSource: DataSource) {
 				listOf(
 					"UPDATE work_alias SET work_id = ? WHERE work_id = ?",
 					"UPDATE work_alias_observation SET work_id = ? WHERE work_id = ?",
+					// Genres belong to the work, so they follow it into the survivor. Keyed by
+					// (work_id, genre), so whatever the survivor already knows wins.
+					"INSERT INTO work_genre_observation (work_id, genre, user_id) " +
+						"SELECT ?, genre, user_id FROM work_genre_observation WHERE work_id = ? " +
+						"ON CONFLICT DO NOTHING",
+					"INSERT INTO work_genre (work_id, genre, origin, reporters) " +
+						"SELECT ?, genre, origin, reporters FROM work_genre WHERE work_id = ? " +
+						"ON CONFLICT DO NOTHING",
 					"UPDATE work_external_id SET work_id = ? WHERE work_id = ?",
 					"UPDATE comment SET work_id = ? WHERE work_id = ?",
 				).forEach { sql ->
@@ -1643,6 +2049,40 @@ class WorkRepository(private val dataSource: DataSource) {
 
 	private companion object {
 		const val ALIAS_AGREEMENT_REQUIRED = 5
+
+		/**
+		 * Accounts that must have seen a work on a source before it is reported as carrying it.
+		 * Lower than [ALIAS_AGREEMENT_REQUIRED], which decides what the *resolver* trusts; this only
+		 * decides what is worth suggesting. Never one, because one observation is one person's
+		 * library and nothing aggregate about it.
+		 */
+		const val SOURCE_CORROBORATION_REQUIRED = 2
+
+		/**
+		 * Accounts that must independently report a genre before it is published. A wrong genre is
+		 * a worse suggestion rather than the wrong manga, so this is lower than the alias quorum -
+		 * but never one, because one account is not agreement.
+		 */
+		const val GENRE_AGREEMENT_REQUIRED = 3
+
+		/** A reader picks from a handful; the rest is a list nobody scrolls and a bigger response. */
+		const val MAX_SOURCES_PER_WORK = 40
+
+		/** A screenful of suggestions per seed work; the app blends several seeds of its own. */
+		const val MAX_SIMILAR = 20
+
+		/** Genres that seed the candidate set, rarest first - see [similarTo]. */
+		const val SIMILAR_SEED_GENRES = 3
+
+		/** Ceiling on works scored for one request, so a common genre cannot make it unbounded. */
+		const val SIMILAR_CANDIDATES = 4_000
+
+		/** One genre in common is a coincidence. */
+		const val SIMILAR_SHARED_REQUIRED = 2
+
+		/** Half-life on coverage freshness. Slower than the score's seven days: a source keeping a
+		 * finished series is still carrying it, it just has nothing new to report. */
+		const val COVERAGE_HALF_LIFE_DAYS = 30.0
 		/** Stable, application-specific lock id; held only while committing a newly discovered work. */
 		const val WORK_CREATION_LOCK = 0x4B52574FL
 		/** Joined into every title lookup: a merged work is a redirect, not a candidate. */

@@ -22,6 +22,17 @@ class Database(private val dataSource: HikariDataSource) : HealthProbe, AutoClos
 
 	val source: DataSource get() = dataSource
 
+	/**
+	 * Connections in use, idle, and callers waiting for one.
+	 *
+	 * Waiting is the figure that matters: a request queueing for a connection is a request the box
+	 * is not slow at, it is a request the pool is too small for, and the two look identical from a
+	 * latency graph alone.
+	 */
+	fun poolStats(): Triple<Int, Int, Int> = dataSource.hikariPoolMXBean.let {
+		Triple(it.activeConnections, it.idleConnections, it.threadsAwaitingConnection)
+	}
+
 	/** Exposed binding over the same pool. Migrations remain Flyway's job, not Exposed's. */
 	val exposed: ExposedDatabase by lazy { ExposedDatabase.connect(dataSource) }
 

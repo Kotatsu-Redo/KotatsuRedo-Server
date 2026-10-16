@@ -107,6 +107,12 @@ class MangaUpdatesCatalogue(
 			},
 			externalIds = mapOf(PROVIDER to seriesId),
 			relations = relations,
+			// Already in the series response, so they cost no extra request. `Mature` is left out:
+			// MangaUpdates means violence and dark themes by it, not sexual content - which is why it
+			// is not in ADULT_GENRES either - and the vocabulary would otherwise read it as `adult`.
+			genres = record["genres"]?.jsonArray.orEmpty()
+				.mapNotNull { it.jsonObject.str("genre") }
+				.filterNot { it.equals(NON_ADULT_MATURE, ignoreCase = true) },
 		)
 	}
 
@@ -131,5 +137,6 @@ class MangaUpdatesCatalogue(
 		const val PROVIDER = "mangaupdates"
 		const val CANDIDATE_LIMIT = 5
 		val ADULT_GENRES = setOf("adult", "hentai", "smut")
+		const val NON_ADULT_MATURE = "mature"
 	}
 }

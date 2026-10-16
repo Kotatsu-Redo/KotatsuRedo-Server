@@ -72,21 +72,60 @@ class ScoringService(
 		}
 
 		val written = repository.replace(scores, now)
+		val opsWritten = repository.replaceOpScores(opScores(scores), now)
 		snapshotCache.clear()
-		log.info("Recomputed {} source score(s) across {} region(s)", written, maxReporterWeightByRegion.size)
+		log.info(
+			"Recomputed {} source score(s) and {} per-operation score(s) across {} region(s)",
+			written, opsWritten, maxReporterWeightByRegion.size,
+		)
 		return written
+	}
+
+	/**
+	 * Stability per operation, for the sources that made the region's budget.
+	 *
+	 * Scoped to those sources so the two tables cannot disagree about who exists, and because a
+	 * per-operation figure for a source the client is never told about is not worth storing.
+	 */
+	private fun opScores(kept: List<SourceScore>): List<SourceOpScore> {
+		val keptKeys = kept.mapTo(HashSet()) { it.source to it.region }
+		return repository.aggregateByOp()
+			.filter { (it.source to it.region) in keptKeys }
+			.mapNotNull { aggregate ->
+				val op = aggregate.op ?: return@mapNotNull null
+				SourceOpScore(
+					source = aggregate.source,
+					region = aggregate.region,
+					op = op,
+					stability = Scoring.stability(
+						okWeighted = aggregate.okWeighted,
+						failWeighted = aggregate.failWeighted,
+						emptyWeighted = aggregate.emptyWeighted,
+						cfBlockedWeighted = aggregate.cfBlockedWeighted,
+						latencyP50Ms = aggregate.latencyP50Ms,
+					),
+					sampleSize = aggregate.sampleSize,
+				)
+			}
 	}
 
 	fun scores(region: String): ScoreSnapshot = snapshotCache.computeIfAbsent(region, ::loadScores)
 
 	private fun loadScores(region: String): ScoreSnapshot {
 		val scores = repository.scoresFor(region)
+		val ops = repository.opScoresFor(region)
 		return ScoreSnapshot(
 			region = region,
 			generatedAt = repository.lastUpdated(region),
 			scores = scores,
 			medianComposite = scores.map { it.composite }.median(),
 			medianStability = scores.map { it.stability }.median(),
+			ops = ops,
+			// A per-operation sample is a slice of the blended one, so thin figures are commoner
+			// here and the prior matters more: an unproven operation sits at its own median rather
+			// than at the blended one, which would flatter a source broken at exactly that job.
+			medianStabilityByOp = ops.values.flatten().groupBy { it.op }
+				.mapValues { (_, rows) -> rows.map { it.stability }.median() },
 		)
 	}
 
@@ -122,4 +161,8 @@ data class ScoreSnapshot(
 	val scores: List<SourceScore>,
 	val medianComposite: Double,
 	val medianStability: Double,
+	/** Per-operation stability, keyed by source. Empty for a source with no operation data yet. */
+	val ops: Map<String, List<SourceOpScore>> = emptyMap(),
+	/** The optimistic prior, per operation - see [loadScores]. */
+	val medianStabilityByOp: Map<Short, Double> = emptyMap(),
 )

@@ -45,16 +45,25 @@ class WorkResolver(
 		val lockIndex = Math.floorMod(31 * fingerprint.source.hashCode() + fingerprint.sourceKey.hashCode(), aliasLocks.size)
 		return withAliasCapacity(lockIndex) {
 			withResolutionCapacity {
-				resolveLocal(fingerprint, reporterId) ?: createFromFingerprint(fingerprint, reporterId).also {
-					if (it.created) {
-						repository.enqueueEnrichment(
-							it.workId,
-							fingerprint.title,
-							fingerprint.year,
-							fingerprint.contentType,
-						)
+				val resolution = resolveLocal(fingerprint, reporterId)
+					?: createFromFingerprint(fingerprint, reporterId).also {
+						if (it.created) {
+							repository.enqueueEnrichment(
+								it.workId,
+								fingerprint.title,
+								fingerprint.year,
+								fingerprint.contentType,
+							)
+						}
 					}
+				// Every path converges here, so the genres the source showed this reader are recorded
+				// once, whichever way the work was found. Recognised terms only, and published only
+				// once other accounts have said the same - see WorkRepository.observeGenres.
+				if (reporterId != null && fingerprint.genres.isNotEmpty()) {
+					runCatching { repository.observeGenres(resolution.workId, reporterId, fingerprint.genres) }
+						.onFailure { log.warn("Failed to record genres for work {}", resolution.workId, it) }
 				}
+				resolution
 			}
 		}
 	}

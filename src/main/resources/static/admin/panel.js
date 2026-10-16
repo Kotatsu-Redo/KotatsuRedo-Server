@@ -1157,10 +1157,12 @@ function healthPage(data) {
 	page.appendChild(healthStrip(data, hour));
 	page.appendChild(trafficPanel(recent, hour));
 
-	const lower = element('<section class="split"></section>');
-	lower.appendChild(refusalPanel(data));
-	lower.appendChild(pipelinePanel(data));
-	page.appendChild(lower);
+	const middle = element('<section class="split"></section>');
+	middle.appendChild(resourcePanel(data.resources));
+	middle.appendChild(refusalPanel(data));
+	page.appendChild(middle);
+
+	page.appendChild(pipelinePanel(data));
 
 	// Meant to be left open on a second screen, so it keeps itself current.
 	if (healthTimer) clearTimeout(healthTimer);
@@ -1202,6 +1204,56 @@ function healthStrip(data, hour) {
 	return strip;
 }
 
+/** A percentile is the bucket it landed in, so it reads as a ceiling rather than a measurement. */
+function latency(ms) {
+	if (ms === null || ms === undefined) return '-';
+	if (ms >= 9007199254740991) return 'over 12.8s';
+	return ms >= 1000 ? '≤' + (ms / 1000).toFixed(1) + 's' : '≤' + ms + 'ms';
+}
+
+function resourcePanel(resources) {
+	const panel = element('<section class="panel"></section>');
+	panel.appendChild(element(
+		'<div class="panel-head"><h3>Resources</h3><span class="sub">sampled just now</span></div>',
+	));
+	if (!resources) {
+		panel.appendChild(empty('Not available on this deployment.'));
+		return panel;
+	}
+	const heapShare = (resources.heap_percent || 0) * 100;
+	let rows =
+		statRow('Heap', resources.heap_used_mb + ' / ' + resources.heap_max_mb + ' MB',
+			grade(heapShare, 75, 90)) +
+		statRow('Heap used', heapShare.toFixed(0) + '%', grade(heapShare, 75, 90));
+	if (resources.rss_mb !== null && resources.rss_mb !== undefined) {
+		// What the container is charged for, and what an OOM kill counts - the heap is only part of it.
+		rows += statRow('Resident', resources.rss_mb + ' MB');
+	}
+	if (resources.cpu_process !== null && resources.cpu_process !== undefined) {
+		const cpu = resources.cpu_process * 100;
+		rows += statRow('CPU (server)', cpu.toFixed(0) + '%', grade(cpu, 70, 90));
+	}
+	if (resources.cpu_system !== null && resources.cpu_system !== undefined) {
+		// Separate from ours, so a noisy neighbour on the box is not mistaken for our own load.
+		rows += statRow('CPU (machine)', (resources.cpu_system * 100).toFixed(0) + '%');
+	}
+	rows += statRow('Threads', resources.threads);
+	rows += statRow('Cores', resources.processors);
+	panel.appendChild(element('<div class="health-block"><h4>Process</h4>' + rows + '</div>'));
+
+	if (resources.db_active !== null && resources.db_active !== undefined) {
+		panel.appendChild(element(
+			'<div class="health-block"><h4>Database pool</h4>' +
+			statRow('In use', resources.db_active) +
+			statRow('Idle', resources.db_idle) +
+			// Anyone waiting means the pool is the limit, which a latency graph alone cannot show.
+			statRow('Waiting', resources.db_waiting, grade(resources.db_waiting || 0, 1, 5)) +
+			'</div>',
+		));
+	}
+	return panel;
+}
+
 function statRow(label, value, state) {
 	return '<div class="kv"><span class="k">' + escapeHtml(label) + '</span>' +
 		'<span class="v ' + (state || '') + '">' + escapeHtml(String(value)) + '</span></div>';
@@ -1223,6 +1275,10 @@ function trafficPanel(recent, hour) {
 			statRow('Client errors', window.client_error) +
 			statRow('Server errors', window.server_error, grade(window.server_error, 1, 1)) +
 			statRow('Refused', share.toFixed(1) + '%', grade(share, 1, 5)) +
+			// How a request felt, not just whether it was answered. p95 is the one to watch: the
+			// median stays flat long after the slow tail has started hurting people.
+			statRow('Median', latency(window.p50_ms), grade(window.p50_ms || 0, 200, 800)) +
+			statRow('Slowest 5%', latency(window.p95_ms), grade(window.p95_ms || 0, 800, 3200)) +
 			'</div>',
 		));
 	});

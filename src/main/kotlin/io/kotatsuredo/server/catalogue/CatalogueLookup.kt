@@ -175,6 +175,7 @@ class CatalogueLookup(
 			// Any catalogue calling it adult is enough; none of them mark it by accident.
 			nsfw = records.any { it.nsfw },
 			relations = records.flatMap { it.relations }.distinct(),
+			genres = records.flatMap { it.genres }.distinct(),
 		)
 	}
 

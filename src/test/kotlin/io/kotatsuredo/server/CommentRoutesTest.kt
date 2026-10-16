@@ -255,6 +255,39 @@ class CommentRoutesTest {
 	}
 
 	@Test
+	fun `withdrawing a switched vote clears it unless the client asks to restore`() = testApplication {
+		setup()
+		val client = jsonClient()
+		val workId = works.createWork("Some Manga", 2018, "manga", nsfw = false)
+		val id = client.postComment(workId, secret("author"), text).body<CommentDto>().id
+		val voter = secret("voter")
+		suspend fun vote(body: String): CommentDto {
+			val response = client.put("/v1/comments/$id/vote") {
+				header(HttpHeaders.Authorization, "Bearer $voter")
+				contentType(ContentType.Application.Json)
+				setBody(body)
+			}
+			assertEquals(HttpStatusCode.OK, response.status)
+			return response.body<CommentDto>()
+		}
+
+		// The body a client from before the flag sends: 0 means no vote.
+		vote("{\"value\":1}")
+		vote("{\"value\":-1}")
+		val cleared = vote("{\"value\":0}")
+		assertEquals(0, cleared.myVote)
+		assertEquals(0, cleared.up)
+		assertEquals(0, cleared.down)
+
+		vote("{\"value\":1}")
+		vote("{\"value\":-1}")
+		val restored = vote("{\"value\":0,\"restore_previous\":true}")
+		assertEquals(1, restored.myVote)
+		assertEquals(1, restored.up)
+		assertEquals(0, restored.down)
+	}
+
+	@Test
 	fun `deleting your own comment empties it without removing it from the thread`() = testApplication {
 		setup()
 		val client = jsonClient()

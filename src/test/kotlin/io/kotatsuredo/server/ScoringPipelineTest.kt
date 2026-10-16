@@ -14,6 +14,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /** Probes in, scores out, against a real database. */
@@ -28,18 +29,29 @@ class ScoringPipelineTest {
 	fun clean() {
 		PostgresTestBase.requireDatabase()
 		PostgresTestBase.database.source.connection.use { connection ->
-			connection.createStatement().use { it.execute("TRUNCATE source_probe_raw, source_score") }
+			connection.createStatement().use { it.execute("TRUNCATE source_probe_raw, source_score, source_score_op") }
 		}
 	}
 
-	private fun report(secret: String, source: String, ok: Int, fail: Int, empty: Int = 0, p50: Int = 700) {
+	private fun report(
+		secret: String,
+		source: String,
+		ok: Int,
+		fail: Int,
+		empty: Int = 0,
+		p50: Int = 700,
+		op: ProbeOp = ProbeOp.SEARCH,
+	) {
 		telemetry.record(
 			secret,
 			TrustTier.ESTABLISHED,
 			Region.EU,
-			listOf(Probe(source, ProbeOp.SEARCH, ok, fail, empty, 0, p50, p50 * 2)),
+			listOf(Probe(source, op, ok, fail, empty, 0, p50, p50 * 2)),
 		)
 	}
+
+	private fun opStability(source: String, op: ProbeOp): Double? =
+		scoring.scores(Region.EU.name).ops[source]?.firstOrNull { it.op == op.code }?.stability
 
 	@Test
 	fun `a healthy source outranks a failing one`() {
@@ -261,6 +273,71 @@ class ScoringPipelineTest {
 		scoring.recompute()
 
 		assertEquals(1_200, scoring.scores(Region.EU.name).scores.size)
+	}
+
+	/**
+	 * The case a single blended figure cannot express, and the reason operations are scored apart: a
+	 * source whose search works perfectly and whose page parser is broken scores mid-range overall,
+	 * which is high enough to keep being offered for reading.
+	 */
+	@Test
+	fun `a source that searches well but cannot serve pages is scored apart`() {
+		report("reporter-1", "HALF_BROKEN", ok = 300, fail = 2, op = ProbeOp.SEARCH)
+		report("reporter-1", "HALF_BROKEN", ok = 4, fail = 280, op = ProbeOp.PAGES)
+
+		scoring.recompute()
+
+		val search = assertNotNull(opStability("HALF_BROKEN", ProbeOp.SEARCH))
+		val pages = assertNotNull(opStability("HALF_BROKEN", ProbeOp.PAGES))
+		assertTrue(search > 0.7, "search should stand on its own record: $search")
+		// A source that fails fast keeps the latency quarter of the formula - 0.25/0.80 of it, about
+		// 0.31 - however badly it serves. What matters here is that pages is not rescued by search.
+		assertTrue(pages < 0.35, "pages should not be rescued by a healthy search: $pages")
+		assertTrue(search - pages > 0.4, "the two operations should be far apart: $search vs $pages")
+
+		val blended = scoring.scores(Region.EU.name).scores.single { it.source == "HALF_BROKEN" }.stability
+		assertTrue(blended in pages..search, "the blended figure sits between the two: $blended")
+	}
+
+	@Test
+	fun `an operation nobody probed is absent rather than zero`() {
+		report("reporter-1", "SEARCH_ONLY", ok = 50, fail = 1, op = ProbeOp.SEARCH)
+
+		scoring.recompute()
+
+		assertNotNull(opStability("SEARCH_ONLY", ProbeOp.SEARCH))
+		assertNull(opStability("SEARCH_ONLY", ProbeOp.PAGES), "never probed is not the same as broken")
+	}
+
+	/** The per-operation prior: an unproven operation sits at its own median, not the blended one. */
+	@Test
+	fun `the snapshot exposes a median per operation`() {
+		report("reporter-1", "A", ok = 200, fail = 2, op = ProbeOp.SEARCH)
+		report("reporter-2", "B", ok = 5, fail = 200, op = ProbeOp.PAGES)
+
+		scoring.recompute()
+		val snapshot = scoring.scores(Region.EU.name)
+
+		val searchMedian = assertNotNull(snapshot.medianStabilityByOp[ProbeOp.SEARCH.code])
+		val pagesMedian = assertNotNull(snapshot.medianStabilityByOp[ProbeOp.PAGES.code])
+		assertTrue(searchMedian > pagesMedian, "search $searchMedian should beat pages $pagesMedian")
+	}
+
+	/** Per-operation rows hang off the blended ones, so a retired source cannot leave them behind. */
+	@Test
+	fun `per-operation rows disappear with the source they describe`() {
+		report("reporter-1", "GONE_TOMORROW", ok = 30, fail = 1, op = ProbeOp.DETAILS)
+		scoring.recompute()
+		assertNotNull(opStability("GONE_TOMORROW", ProbeOp.DETAILS))
+
+		PostgresTestBase.database.source.connection.use { connection ->
+			connection.createStatement().use { it.execute("TRUNCATE source_probe_raw") }
+		}
+		report("reporter-1", "STILL_HERE", ok = 30, fail = 1, op = ProbeOp.DETAILS)
+		scoring.recompute()
+
+		assertNull(opStability("GONE_TOMORROW", ProbeOp.DETAILS))
+		assertNotNull(opStability("STILL_HERE", ProbeOp.DETAILS))
 	}
 
 	private fun insertProbeOn(day: LocalDate, source: String, ok: Int, fail: Int) {

@@ -2,6 +2,7 @@ package io.kotatsuredo.server.ops
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 
 /**
  * What the server is doing right now, for the panel's health view.
@@ -18,6 +19,15 @@ import java.util.concurrent.atomic.AtomicLong
 object ServerMetrics {
 
 	const val WINDOW_MINUTES = 60
+
+	/**
+	 * Latency bucket upper bounds in milliseconds.
+	 *
+	 * A histogram rather than the samples themselves: percentiles over a minute of traffic cost
+	 * thirteen counters instead of one entry per request, and the bounds are where the answers
+	 * change - a request is fine at 50ms, worth looking at by 800, and broken by 6400.
+	 */
+	private val LATENCY_BOUNDS_MS = longArrayOf(5, 10, 25, 50, 100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800)
 
 	private val startedAtMillis = System.currentTimeMillis()
 	private val minutes = Array(WINDOW_MINUTES) { Minute() }
@@ -36,6 +46,9 @@ object ServerMetrics {
 		val overloaded = AtomicLong()
 		val serverError = AtomicLong()
 
+		/** One counter per bucket, plus a final one for everything slower than the last bound. */
+		val latency = AtomicLongArray(LATENCY_BOUNDS_MS.size + 1)
+
 		/** Zeroes the slot the first time this minute lands on it, an hour after its last use. */
 		fun rollTo(minute: Long) {
 			if (stamp == minute) return
@@ -44,6 +57,7 @@ object ServerMetrics {
 				stamp = minute
 				total.set(0); ok.set(0); clientError.set(0)
 				rateLimited.set(0); overloaded.set(0); serverError.set(0)
+				for (index in 0 until latency.length()) latency.set(index, 0)
 			}
 		}
 	}
@@ -57,9 +71,10 @@ object ServerMetrics {
 	 * Every answered request. A 429 only lands in [total] here: which kind of 429 it was is recorded
 	 * where it is decided, because the status code alone cannot tell a quota from a busy pool.
 	 */
-	fun recordResponse(status: Int) {
+	fun recordResponse(status: Int, durationMs: Long = -1) {
 		val slot = slot(currentMinute())
 		slot.total.incrementAndGet()
+		if (durationMs >= 0) slot.latency.incrementAndGet(bucketOf(durationMs))
 		when {
 			status in 200..399 -> slot.ok.incrementAndGet()
 			status == 429 -> Unit
@@ -80,6 +95,11 @@ object ServerMetrics {
 		overloadsByResource.computeIfAbsent(resource) { AtomicLong() }.incrementAndGet()
 	}
 
+	private fun bucketOf(durationMs: Long): Int {
+		LATENCY_BOUNDS_MS.forEachIndexed { index, bound -> if (durationMs <= bound) return index }
+		return LATENCY_BOUNDS_MS.size
+	}
+
 	data class Window(
 		val minutes: Int,
 		val total: Long,
@@ -88,6 +108,10 @@ object ServerMetrics {
 		val rateLimited: Long,
 		val overloaded: Long,
 		val serverError: Long,
+		/** Median request time in milliseconds, or null before anything has been timed. */
+		val latencyP50Ms: Long? = null,
+		/** The slow tail - what a request feels like on a bad afternoon. */
+		val latencyP95Ms: Long? = null,
 	) {
 		/** Share of requests turned away for any reason, which is the number worth watching. */
 		val refusedShare: Double
@@ -97,6 +121,7 @@ object ServerMetrics {
 	fun window(minutes: Int): Window {
 		val now = currentMinute()
 		var total = 0L; var ok = 0L; var client = 0L; var limited = 0L; var over = 0L; var server = 0L
+		val latency = LongArray(LATENCY_BOUNDS_MS.size + 1)
 		for (offset in 0 until minutes.coerceIn(1, WINDOW_MINUTES)) {
 			val minute = now - offset
 			val slot = this.minutes[(minute % WINDOW_MINUTES + WINDOW_MINUTES).toInt() % WINDOW_MINUTES]
@@ -104,8 +129,33 @@ object ServerMetrics {
 			if (slot.stamp != minute) continue
 			total += slot.total.get(); ok += slot.ok.get(); client += slot.clientError.get()
 			limited += slot.rateLimited.get(); over += slot.overloaded.get(); server += slot.serverError.get()
+			for (index in latency.indices) latency[index] += slot.latency.get(index)
 		}
-		return Window(minutes, total, ok, client, limited, over, server)
+		return Window(
+			minutes, total, ok, client, limited, over, server,
+			latencyP50Ms = percentile(latency, 0.50),
+			latencyP95Ms = percentile(latency, 0.95),
+		)
+	}
+
+	/**
+	 * The bucket the given share of requests falls inside, reported as that bucket's upper bound.
+	 *
+	 * Approximate by construction - "p95 is 800ms" here means "95% finished within 800ms" - which is
+	 * the resolution an operator needs and all a histogram can honestly give.
+	 */
+	private fun percentile(buckets: LongArray, share: Double): Long? {
+		val timed = buckets.sum()
+		if (timed == 0L) return null
+		val target = (timed * share).toLong().coerceAtLeast(1)
+		var seen = 0L
+		buckets.forEachIndexed { index, count ->
+			seen += count
+			if (seen >= target) {
+				return if (index < LATENCY_BOUNDS_MS.size) LATENCY_BOUNDS_MS[index] else Long.MAX_VALUE
+			}
+		}
+		return Long.MAX_VALUE
 	}
 
 	fun refusalsByBucket(): Map<String, Long> = refusalsByBucket.mapValues { it.value.get() }

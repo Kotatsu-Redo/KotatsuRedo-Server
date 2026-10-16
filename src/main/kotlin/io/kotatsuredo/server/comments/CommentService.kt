@@ -213,9 +213,10 @@ class CommentService(
 
 	/**
 	 * @param value +1, -1, or 0 to withdraw.
+	 * @param restorePrevious withdrawing restores the vote this one replaced, if any.
 	 * @return the comment as the voter now sees it, or null if there is nothing to vote on.
 	 */
-	fun vote(commentId: Long, voter: Identity, value: Int): CommentView? {
+	fun vote(commentId: Long, voter: Identity, value: Int, restorePrevious: Boolean = false): CommentView? {
 		require(value in -1..1) { "vote out of range: $value" }
 		val comment = repository.find(commentId) ?: return null
 		if (comment.state == CommentState.REMOVED) return null
@@ -226,7 +227,7 @@ class CommentService(
 		// faith - and answering at all would confirm it exists.
 		if (comment.state == CommentState.SHADOWED) return null
 
-		repository.setVoteAndRecount(commentId, voter.id, value)
+		repository.setVoteAndRecount(commentId, voter.id, value, restorePrevious)
 		return view(commentId, voter)
 	}
 

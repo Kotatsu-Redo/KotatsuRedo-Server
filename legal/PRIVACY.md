@@ -1,6 +1,6 @@
 # Privacy notice
 
-**Kotatsu-Redo community server** · last updated 11 September 2026
+**Kotatsu-Redo community server** · last updated 16 October 2026
 
 This describes the **official instance** at `community.kotatsuredo.app`, operated by the Kotatsu-Redo
 project and hosted in France. The server is open source, so other people run their own instances
@@ -76,6 +76,22 @@ work. If that key is lost, the server cannot recover the account; a new key crea
 - **The days you were active** — dates only, no times — used to work out how long you have been
   around, which sets your posting rate limits.
 
+### The manga you open
+
+The same manga has a different address on every source, so to show its ratings and comments the app
+asks the server which work an entry is. It does that when you open a manga's page, and — for
+suggestions — for a few of the titles you read or favourited most recently. It sends what the source
+shows: the entry's address on that source, its titles, year, type and genres.
+
+The server keeps a note of each entry your account asked about: the source, the entry's address on
+it, the work it matched, the title it was matched on, and the genres the source listed. These notes
+are how it learns that two sources carry the same work. Nothing is trusted on one account's word: an
+entry is only relied on, a genre only published, and a source only listed as carrying a work once
+several accounts have reported the same thing. The notes themselves are never shown to anyone.
+
+They are, plainly, a record of which manga you opened while the community features were on. They
+are in your export, and they are deleted with your account.
+
 ### Rejected comments
 
 When the word filter stops a comment, the server records which rule matched, the language, and
@@ -110,8 +126,9 @@ Each upload is tagged with a pseudonym that is **recomputed every day** as
 can work out which pseudonym belonged to which account — not us, not somebody holding the database
 and every key the server has. It is deliberately built so that even we cannot undo it.
 
-The raw rows are **deleted after 7 days**. What survives is a score per source per region, which is
-not about any person.
+The raw rows are **deleted after 7 days**. What survives is a score per source per region, and each
+day's totals per source — how many requests succeeded, failed or were blocked, and how many
+pseudonyms reported them — with no pseudonym in them. Neither is about any person.
 
 Your **region** is worked out on your device from your language and time zone — never from your IP
 address — and is deliberately coarse: `EU`, `NA`, `APAC` and a handful more.
@@ -122,12 +139,13 @@ address — and is deliberately coarse: `EU`, `NA`, `APAC` and a handful more.
 
 - Your IP address.
 - Your email address, phone number, or real name.
-- Which manga you read, search for, or have in your library.
+- What you search for, which chapters you read, or what is in your library. It does learn which
+  manga you open while the community features are on — see [The manga you open](#the-manga-you-open).
 - Any advertising or analytics identifier.
 - Any third-party tracker. The server loads nothing from anyone else's domain.
 
 The server never stores, proxies, or serves manga content of any kind. It holds discussion about
-works, and nothing else.
+works and what it needs to recognise them, and nothing else.
 
 ---
 
@@ -137,6 +155,7 @@ works, and nothing else.
 - **Your ratings** are visible only as part of a work's average. Nobody sees what you personally gave
   a work.
 - **Your votes** are never shown to anyone, including the person you voted on.
+- **Which manga you opened** is never shown to anyone. Only what several accounts agree on is used.
 - **Moderators** can see everything above plus the moderation queues and the block log. They cannot
   see your key, your device hashes in any usable form, or your IP address, because the server does
   not have them.
@@ -151,8 +170,9 @@ works, and nothing else.
 | Ratings and votes | Until you change them, or you delete your account |
 | Rejected comment text | 30 days |
 | Rejected comment counts | Indefinitely — not linked to you after account deletion |
+| Notes of the manga you opened | Until you delete your account |
 | Raw telemetry | 7 days |
-| Telemetry scores | Indefinitely — aggregate, not about any person |
+| Telemetry scores and daily totals | Indefinitely — aggregate, not about any person |
 | Moderation log | Indefinitely |
 | Your identity | Until you delete it |
 | Database backups | 7 days |
@@ -180,6 +200,8 @@ What happens:
 
 - Your ratings are **erased**, and every affected work's average is recalculated on the spot.
 - Your votes are **erased**.
+- Your notes of the manga you opened are **erased**. What they helped establish — that two sources
+  carry the same work, or what genre it is — describes the manga rather than you, and stays.
 - Your comments are **blanked**. The empty rows stay so that replies other people wrote underneath
   them still have a thread to hang from — they carry no text, no nickname and no id. Nothing of yours
   remains in them.
@@ -200,7 +222,8 @@ Two of them are buttons in the app rather than requests to us, which is delibera
 - **Erasure** — *Settings → Community → Delete my data*. Immediate, no confirmation loop.
 - **Access and portability** — *Settings → Community → Export my data*. Downloads everything the
   server holds about your account as a JSON file: your comments (including any a moderator removed),
-  your ratings, your votes, your nickname and when the account was created.
+  your ratings, your votes, the notes of the manga you opened, your nickname and when the account was
+  created.
 
 For correction, restriction or objection, or to complain about how this is run, reach us through the
 [Discord](https://discord.gg/eu3gnd89gP) or the

@@ -60,15 +60,17 @@ class WorkEnricher(
 		val partial: Int = 0,
 		/** Works from before any catalogue answered, queued by the running backfill. */
 		val seeded: Int = 0,
+		/** Works described before catalogue genres were kept, reopened to collect them. */
+		val genreRechecks: Int = 0,
 	)
 
 	suspend fun drainOnce(): Report {
 		if (catalogue == null) return Report(0, 0, 0, 0)
 		// The backfill is housekeeping. Whatever goes wrong with it must not stop new works being
 		// described, which is what happened when its query ran past the statement timeout.
-		val seeded = runCatching { topUpBackfill() }
+		val (seeded, genreRechecks) = runCatching { topUpBackfill() }
 			.onFailure { log.warn("Backfill top-up failed", it) }
-			.getOrDefault(0)
+			.getOrDefault(0 to 0)
 		var enriched = 0
 		var merged = 0
 		var unlisted = 0
@@ -150,6 +152,12 @@ class WorkEnricher(
 				)
 			}.onSuccess {
 				enriched++
+				// Curated upstream, so no quorum: see WorkRepository.applyCatalogueGenres.
+				runCatching {
+					if (record.genres.isNotEmpty()) repository.applyCatalogueGenres(pending.workId, record.genres)
+					// Read with genres kept, so the genre recheck has nothing to ask again.
+					repository.markGenresChecked(pending.workId)
+				}.onFailure { log.warn("Failed to store catalogue genres for work {}", pending.workId, it) }
 				if (outcome is CatalogueOutcome.Found && outcome.partial) {
 					repository.scheduleRecheck(pending.workId, PARTIAL_RETRY_SECONDS)
 				}
@@ -160,7 +168,7 @@ class WorkEnricher(
 					deferred++
 				}
 		}
-		return Report(enriched, merged, unlisted, deferred, partial, seeded)
+		return Report(enriched, merged, unlisted, deferred, partial, seeded, genreRechecks)
 	}
 
 	/**
@@ -175,18 +183,26 @@ class WorkEnricher(
 	 * them: sixteen thousand works sat undescribed through a whole day with nothing queued. The
 	 * trickle takes a fixed share of each sweep instead, and stops when the queue is genuinely
 	 * behind so new works are not held up further.
+	 *
+	 * Whatever share the first-time backfill leaves unused goes to works described before catalogue
+	 * genres were kept: describing a work at all still comes first, and the catalogues are asked no
+	 * faster than before, since the sweep's batch size is what paces requests, not the queue's length.
+	 *
+	 * @return works queued for a first description, and works reopened for their genres
 	 */
-	private fun topUpBackfill(): Int {
-		if (!seedOldWorks) return 0
+	private fun topUpBackfill(): Pair<Int, Int> {
+		if (!seedOldWorks) return 0 to 0
 		val due = repository.dueEnrichmentCount()
 		val limit = when {
 			due <= TOP_UP_BELOW -> TOP_UP_BATCH
 			due <= TRICKLE_BELOW -> BACKFILL_TRICKLE
-			else -> return 0
+			else -> return 0 to 0
 		}
 		val queued = repository.enqueueBackfill(limit)
 		if (limit == TOP_UP_BATCH && queued > 0) log.info("Queued {} works that no catalogue has described yet", queued)
-		return queued
+		val reopened = if (queued < limit) repository.reopenForGenres(limit - queued) else 0
+		if (limit == TOP_UP_BATCH && reopened > 0) log.info("Reopened {} described works to collect their genres", reopened)
+		return queued to reopened
 	}
 
 	private fun defer(pending: PendingEnrichment) {
@@ -208,7 +224,8 @@ class WorkEnricher(
 				.getOrNull()
 			if (report != null && report != Report(0, 0, 0, 0)) log.info("Enrichment: {}", report)
 			// A queue with something in it is drained back to back; an empty one waits.
-			val worked = report != null && report.enriched + report.merged + report.unlisted + report.seeded > 0
+			val worked = report != null &&
+				report.enriched + report.merged + report.unlisted + report.seeded + report.genreRechecks > 0
 			delay(if (worked) IDLE_GAP else interval)
 		}
 	}

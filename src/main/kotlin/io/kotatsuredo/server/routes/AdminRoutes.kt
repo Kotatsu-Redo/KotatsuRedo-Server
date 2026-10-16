@@ -17,6 +17,7 @@ import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.moderation.ModerationService
 import io.kotatsuredo.server.ops.OpsRepository
 import io.kotatsuredo.server.works.WorkRepository
+import io.kotatsuredo.server.ops.ResourceUsage
 import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.moderation.OverviewRepository
 import io.kotatsuredo.server.moderation.PasswordChangeResult
@@ -489,6 +490,7 @@ fun Route.adminRoutes(
 					last60m = ServerMetrics.window(ServerMetrics.WINDOW_MINUTES).toDto(),
 					rateLimitedByBucket = ServerMetrics.refusalsByBucket(),
 					overloadedByResource = ServerMetrics.overloadsByResource(),
+					resources = ResourceUsage.snapshot().toDto(),
 					enrichment = counters?.let {
 						EnrichmentDto(
 							pending = it.enrichmentPending,
@@ -811,6 +813,24 @@ data class OpsWindowDto(
 	val overloaded: Long,
 	@SerialName("server_error") val serverError: Long,
 	@SerialName("refused_share") val refusedShare: Double,
+	/** Median and slow-tail request times, in milliseconds. Null until something has been timed. */
+	@SerialName("p50_ms") val p50Ms: Long? = null,
+	@SerialName("p95_ms") val p95Ms: Long? = null,
+)
+
+@Serializable
+data class ResourcesDto(
+	@SerialName("heap_used_mb") val heapUsedMb: Long,
+	@SerialName("heap_max_mb") val heapMaxMb: Long,
+	@SerialName("heap_percent") val heapPercent: Double,
+	@SerialName("rss_mb") val rssMb: Long? = null,
+	@SerialName("cpu_process") val cpuProcess: Double? = null,
+	@SerialName("cpu_system") val cpuSystem: Double? = null,
+	val processors: Int,
+	val threads: Int,
+	@SerialName("db_active") val dbActive: Int? = null,
+	@SerialName("db_idle") val dbIdle: Int? = null,
+	@SerialName("db_waiting") val dbWaiting: Int? = null,
 )
 
 @Serializable
@@ -840,6 +860,7 @@ data class OpsResponse(
 	@SerialName("overloaded_by_resource") val overloadedByResource: Map<String, Long>,
 	val enrichment: EnrichmentDto?,
 	val works: WorksOpsDto?,
+	val resources: ResourcesDto? = null,
 )
 
 private fun ServerMetrics.Window.toDto() = OpsWindowDto(
@@ -851,6 +872,22 @@ private fun ServerMetrics.Window.toDto() = OpsWindowDto(
 	overloaded = overloaded,
 	serverError = serverError,
 	refusedShare = refusedShare,
+	p50Ms = latencyP50Ms,
+	p95Ms = latencyP95Ms,
+)
+
+private fun ResourceUsage.Snapshot.toDto() = ResourcesDto(
+	heapUsedMb = heapUsedMb,
+	heapMaxMb = heapMaxMb,
+	heapPercent = heapPercent,
+	rssMb = rssMb,
+	cpuProcess = cpuProcess,
+	cpuSystem = cpuSystem,
+	processors = processors,
+	threads = threads,
+	dbActive = dbActive,
+	dbIdle = dbIdle,
+	dbWaiting = dbWaiting,
 )
 
 @Serializable

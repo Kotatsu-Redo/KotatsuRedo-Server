@@ -56,7 +56,8 @@ class ExportRoutesTest {
 			connection.createStatement().use {
 				it.execute(
 					"TRUNCATE comment, comment_vote, rating, work_rating_agg, work, work_title, " +
-						"work_alias, work_cover_hash, work_external_id, work_relation, work_merge_log, " +
+						"work_alias, work_alias_observation, work_genre_observation, work_genre, " +
+						"work_cover_hash, work_external_id, work_relation, work_merge_log, " +
 						"app_user, user_active_day, app_device, device_ban, ban_evasion_flag CASCADE",
 				)
 			}
@@ -117,6 +118,37 @@ class ExportRoutesTest {
 		assertEquals(4.0, export.ratings.single().stars, "half-stars should be converted for display")
 		assertEquals(theirs.id.toString(), export.votes.single().commentId)
 		assertEquals(1, export.votes.single().value)
+	}
+
+	/**
+	 * The notice promises "everything the server holds about your account", and which manga the app
+	 * resolved for this account is held - so it is exported, and nobody else's is.
+	 */
+	@Test
+	fun `the export contains the manga the account opened and the genres it reported`() = testApplication {
+		setup()
+		val client = createClient { install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) } }
+		val me = user("reader")
+		val other = user("someone-else")
+		val workId = works.createWork("Some Manga", 2018, "manga", nsfw = false)
+
+		works.observeAlias("SOURCE_A", "/manga/some-manga", me.id, workId, listOf("some manga"))
+		works.observeAlias("SOURCE_B", "/title/42", me.id, workId, listOf("some manga"))
+		works.observeAlias("SOURCE_A", "/manga/some-manga", other.id, workId, listOf("some manga"))
+		works.observeGenres(workId, me.id, listOf("Romance", "not a genre"))
+		works.observeGenres(workId, other.id, listOf("Action"))
+
+		val export = client.get("/v1/identity/export") {
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("reader")}")
+		}.body<ExportDto>()
+
+		assertEquals(
+			listOf("SOURCE_A" to "/manga/some-manga", "SOURCE_B" to "/title/42"),
+			export.opened.map { it.source to it.key },
+		)
+		assertTrue(export.opened.all { it.workId == workId.toString() })
+		assertEquals(listOf("some manga"), export.opened.first().titleKeys)
+		assertEquals(listOf("romance"), export.genres.map { it.genre }, "only recognised terms are held")
 	}
 
 	@Test

@@ -182,6 +182,24 @@ class CatalogueTest {
 		)
 	}
 
+	/** The series response already lists genres, so describing a work costs no extra request. */
+	@Test
+	fun `mangaupdates reads the genres its series response already carries`() {
+		val record = MangaUpdatesCatalogue(fetcherReturning()).parseSeries(fixture("mangaupdates-series"))
+
+		assertNotNull(record)
+		assertTrue("Action" in record.genres, "raw catalogue labels: ${record.genres}")
+		// `Mature` is MangaUpdates' word for dark themes; read as `adult` it would mislabel the work.
+		assertTrue(record.genres.none { it.equals("mature", ignoreCase = true) }, "raw labels: ${record.genres}")
+		assertEquals(
+			listOf(
+				"action", "comedy", "drama", "horror", "mystery", "psychological", "shounen", "supernatural",
+				"tragedy",
+			),
+			io.kotatsuredo.server.works.Genres.parseAll(record.genres).sorted(),
+		)
+	}
+
 	// -- MangaDex --------------------------------------------------------------------------------
 
 	/**
@@ -261,6 +279,22 @@ class CatalogueTest {
 		assertEquals(mapOf("mangadex" to "bare-1"), record.externalIds)
 		assertEquals("manhwa", record.contentType)
 		assertTrue("均衡の騎士" in record.titles)
+	}
+
+	/** Tags come back in the search response already made, so genres cost no extra request. */
+	@Test
+	fun `mangadex reads the genres it already sends with a search result`() {
+		val record = MangaDexCatalogue(fetcherReturning())
+			.parse(fixture("mangadex-chainsaw-man"), "Chainsaw Man", contentType = "manga")
+
+		assertNotNull(record)
+		assertTrue("Action" in record.genres, "raw catalogue labels: ${record.genres}")
+		assertTrue("Horror" in record.genres, "raw catalogue labels: ${record.genres}")
+		// The vocabulary keeps what it knows and drops the rest - "Award Winning" is not a genre.
+		assertEquals(
+			listOf("action", "comedy", "horror", "supernatural"),
+			io.kotatsuredo.server.works.Genres.parseAll(record.genres).sorted(),
+		)
 	}
 
 	/** A source that packs every alternate name into the title is searched by its main one. */

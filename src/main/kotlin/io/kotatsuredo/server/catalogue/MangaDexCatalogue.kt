@@ -125,6 +125,13 @@ class MangaDexCatalogue(
 		}.distinct()
 		val canonical = titles.firstOrNull() ?: return null
 
+		// Tags ride along in the search response we already make, so genres cost no extra request.
+		val genres = (attributes["tags"] as? JsonArray).orEmpty().mapNotNull { tag ->
+			((tag as? JsonObject)?.get("attributes") as? JsonObject)
+				?.let { it["name"] as? JsonObject }
+				?.let { (it["en"] as? JsonPrimitive)?.contentOrNull }
+		}
+
 		val links = attributes["links"] as? JsonObject
 		return CatalogueRecord(
 			provider = PROVIDER,
@@ -134,6 +141,7 @@ class MangaDexCatalogue(
 			year = (attributes["year"] as? JsonPrimitive)?.intOrNull,
 			contentType = attributes.str("originalLanguage")?.let(::contentTypeOf),
 			nsfw = attributes.str("contentRating") in ADULT_RATINGS,
+			genres = genres,
 			externalIds = buildMap {
 				put(PROVIDER, id)
 				links?.str("mal")?.let { put("mal", it) }

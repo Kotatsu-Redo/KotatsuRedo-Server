@@ -7,6 +7,7 @@ import io.kotatsuredo.server.comments.CommentRepository
 import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.ratings.RatingScale
 import io.kotatsuredo.server.ratings.RatingService
+import io.kotatsuredo.server.works.WorkRepository
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.server.response.header
@@ -53,6 +54,26 @@ data class ExportedVoteDto(
 	@SerialName("created_at") val createdAt: String,
 )
 
+/** A source entry the app asked about on this account's behalf: in effect, a manga it opened. */
+@Serializable
+data class ExportedOpenedDto(
+	val source: String,
+	/** The entry's address on that source. */
+	val key: String,
+	@SerialName("work_id") val workId: String,
+	/** The normalized title keys it was matched on. */
+	@SerialName("title_keys") val titleKeys: List<String>,
+	@SerialName("first_seen") val firstSeen: String,
+	@SerialName("last_seen") val lastSeen: String,
+)
+
+@Serializable
+data class ExportedGenreDto(
+	@SerialName("work_id") val workId: String,
+	val genre: String,
+	@SerialName("reported_at") val reportedAt: String,
+)
+
 @Serializable
 data class ExportDto(
 	@SerialName("exported_at") val exportedAt: String,
@@ -62,6 +83,10 @@ data class ExportDto(
 	val comments: List<ExportedCommentDto>,
 	val ratings: List<ExportedRatingDto>,
 	val votes: List<ExportedVoteDto>,
+	/** Manga opened with the community features on, as the source entries the app asked about. */
+	val opened: List<ExportedOpenedDto> = emptyList(),
+	/** Genres the sources of those manga listed, as reported from this account. */
+	val genres: List<ExportedGenreDto> = emptyList(),
 	/**
 	 * What is deliberately absent, said out loud rather than left to be noticed.
 	 *
@@ -95,6 +120,7 @@ fun Route.exportRoutes(
 	identities: IdentityService,
 	comments: CommentRepository,
 	ratings: RatingService,
+	works: WorkRepository,
 	limiter: RateLimiter,
 ) {
 	get("/identity/export") {
@@ -152,6 +178,36 @@ fun Route.exportRoutes(
 				voteCursor = page.lastOrNull()?.first ?: voteCursor
 			} while (page.size == EXPORT_PAGE_SIZE)
 
+			write("],\"opened\":[")
+			first = true
+			var openedCursor: Pair<String, String>? = null
+			do {
+				val page = works.aliasObservationsByPage(identity.id, openedCursor, EXPORT_PAGE_SIZE)
+				page.forEach { observation ->
+					if (!first) write(",")
+					first = false
+					write(exportJson.encodeToString(observation.toExportDto()))
+				}
+				openedCursor = page.lastOrNull()?.let { it.source to it.sourceKey } ?: openedCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
+			write("],\"genres\":[")
+			first = true
+			var genreCursor: Pair<Long, String>? = null
+			do {
+				val page = works.genreObservationsByPage(identity.id, genreCursor, EXPORT_PAGE_SIZE)
+				page.forEach { observation ->
+					if (!first) write(",")
+					first = false
+					write(
+						exportJson.encodeToString(
+							ExportedGenreDto(observation.workId.toString(), observation.genre, observation.createdAt.iso()),
+						),
+					)
+				}
+				genreCursor = page.lastOrNull()?.let { it.workId to it.genre } ?: genreCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
 			write("],\"notes\":${exportJson.encodeToString(NOTES)}}")
 		}
 	}
@@ -172,6 +228,15 @@ private fun io.kotatsuredo.server.comments.Comment.toExportDto() = ExportedComme
 	state = state.name.lowercase(),
 	up = up,
 	down = down,
+)
+
+private fun io.kotatsuredo.server.works.AliasObservation.toExportDto() = ExportedOpenedDto(
+	source = source,
+	key = sourceKey,
+	workId = workId.toString(),
+	titleKeys = titleKeys,
+	firstSeen = createdAt.iso(),
+	lastSeen = updatedAt.iso(),
 )
 
 private fun io.kotatsuredo.server.ratings.ExportedRating.toExportDto() = ExportedRatingDto(

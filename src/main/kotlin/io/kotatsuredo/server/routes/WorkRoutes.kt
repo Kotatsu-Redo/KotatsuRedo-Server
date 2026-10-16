@@ -10,15 +10,20 @@ import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.works.LinkOutcome
+import io.kotatsuredo.server.works.Genres
 import io.kotatsuredo.server.works.WorkFingerprint
 import io.kotatsuredo.server.works.WorkLinker
 import io.kotatsuredo.server.works.WorkLimits
 import io.kotatsuredo.server.works.WorkResolver
+import io.kotatsuredo.server.works.WorkRepository
 import io.kotatsuredo.server.works.WorkResolutionOverloaded
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
+import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import kotlinx.serialization.SerialName
@@ -38,10 +43,62 @@ data class FingerprintDto(
 	val nsfw: Boolean = false,
 	@SerialName("cover_phash") val coverPHash: Long? = null,
 	@SerialName("external_ids") val externalIds: Map<String, String> = emptyMap(),
+	/** The source's own genre labels. Unrecognised ones are dropped server-side. */
+	val genres: List<String> = emptyList(),
 )
 
 @Serializable
 data class ResolveRequest(val works: List<FingerprintDto>)
+
+@Serializable
+data class WorkSourceDto(
+	val source: String,
+	val key: String,
+	/** Distinct accounts that have seen this work here. Two is the floor for appearing at all. */
+	val reporters: Int,
+	@SerialName("last_seen") val lastSeen: String,
+	val verified: Boolean,
+)
+
+@Serializable
+data class SimilarWorkDto(
+	@SerialName("work_id") val workId: String,
+	val title: String,
+	val year: Int? = null,
+	@SerialName("content_type") val contentType: String? = null,
+	val nsfw: Boolean = false,
+	val genres: List<String> = emptyList(),
+	@SerialName("shared_genres") val sharedGenres: Int = 0,
+	/**
+	 * How much the shared genres are worth: each one counts by how much rarer it is than the
+	 * commonest genre the work asked about has. Sharing `villainess` says far more than sharing
+	 * `action`, and a client blending several of these needs the weight, not just the count.
+	 *
+	 * Comparable within one response. Across responses it is not: the scale depends on the work
+	 * asked about.
+	 */
+	val score: Double = 0.0,
+	/** Where to read it: the sources that carry it, best corroborated first. */
+	val sources: List<WorkSourceDto> = emptyList(),
+)
+
+@Serializable
+data class SimilarWorksResponse(
+	@SerialName("work_id") val workId: String,
+	val similar: List<SimilarWorkDto>,
+)
+
+@Serializable
+data class WorkGenresResponse(
+	@SerialName("work_id") val workId: String,
+	val genres: List<String>,
+)
+
+@Serializable
+data class WorkSourcesResponse(
+	@SerialName("work_id") val workId: String,
+	val sources: List<WorkSourceDto>,
+)
 
 @Serializable
 data class ResolvedDto(
@@ -73,8 +130,96 @@ fun Route.workRoutes(
 	resolver: WorkResolver,
 	linker: WorkLinker,
 	limiter: RateLimiter,
+	works: WorkRepository,
 	queues: ModerationQueueRepository? = null,
 ) = route("/works") {
+
+	/**
+	 * Works like this one.
+	 *
+	 * Item to item, and nothing else: the answer depends on the work asked about, never on who is
+	 * asking or what else they have read. Blending several of these into a personal list is the
+	 * app's job, on the device, where the reading history already lives and can stay.
+	 */
+	get("/{id}/similar") {
+		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
+		val workId = call.resolveWorkId(works)
+
+		val similar = works.similarTo(workId).map { candidate ->
+			SimilarWorkDto(
+				workId = candidate.workId.toString(),
+				title = candidate.title,
+				year = candidate.year,
+				contentType = candidate.contentType,
+				nsfw = candidate.nsfw,
+				genres = works.genresOf(candidate.workId),
+				sharedGenres = candidate.sharedGenres,
+				score = candidate.score,
+				sources = works.sourcesFor(candidate.workId, limit = MAX_SOURCES_PER_SIMILAR).map {
+					WorkSourceDto(
+						source = it.source,
+						key = it.sourceKey,
+						reporters = it.reporters,
+						lastSeen = it.lastSeen.toString(),
+						verified = it.verified,
+					)
+				},
+			)
+		}
+
+		// Genres change when a catalogue answers or a quorum lands, which is a scale of days.
+		call.response.header(HttpHeaders.CacheControl, "private, max-age=21600")
+		call.respond(SimilarWorksResponse(workId.toString(), similar))
+	}
+
+	/**
+	 * The work's genres, as the app would show them.
+	 *
+	 * Catalogue-backed terms first, then the ones readers' sources agree on. Everything here is in
+	 * the server's closed vocabulary, so a client can switch on the values.
+	 */
+	get("/{id}/genres") {
+		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
+		val workId = call.resolveWorkId(works)
+
+		call.response.header(HttpHeaders.CacheControl, "private, max-age=3600")
+		call.respond(WorkGenresResponse(workId.toString(), works.genresOf(workId)))
+	}
+
+	/**
+	 * Which sources carry this work.
+	 *
+	 * The ranking the app had could say a source was good in general, never that it had *this*
+	 * manga. This answers that from observations the resolver already stores - nothing new is
+	 * collected - and the client orders the list by its own per-operation scores.
+	 *
+	 * Aggregate by construction: a source appears only once distinct accounts have seen the work
+	 * there, so a reply can never describe one person's library.
+	 */
+	get("/{id}/sources") {
+		val caller = call.requireCaller(identities)
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
+		val workId = call.resolveWorkId(works)
+
+		// Coverage moves when somebody opens the work somewhere new, which is a scale of days.
+		call.response.header(HttpHeaders.CacheControl, "private, max-age=3600")
+		call.respond(
+			WorkSourcesResponse(
+				workId = workId.toString(),
+				sources = works.sourcesFor(workId).map {
+					WorkSourceDto(
+						source = it.source,
+						key = it.sourceKey,
+						reporters = it.reporters,
+						lastSeen = it.lastSeen.toString(),
+						verified = it.verified,
+					)
+				},
+			),
+		)
+	}
 
 	/**
 	 * The hot path, and always batched: a client resolving a screenful of manga should cost one
@@ -117,6 +262,9 @@ fun Route.workRoutes(
 							nsfw = dto.nsfw,
 							coverPHash = dto.coverPHash,
 							externalIds = emptyMap(),
+							// Extra labels are dropped rather than refused; the vocabulary discards
+							// most of them anyway.
+							genres = dto.genres.take(Genres.MAX_GENRES_PER_WORK * 2),
 						),
 						reporterId = caller.identity.id,
 					)
@@ -220,6 +368,11 @@ private const val MAX_TITLE_INPUTS_PER_BATCH = 100
 private const val MAX_EXTERNAL_IDS = 10
 private const val MAX_EXTERNAL_PROVIDER = 32
 private const val MAX_EXTERNAL_ID = 128
+private const val MAX_GENRE_LABELS = 200
+private const val MAX_GENRE_LABEL = 60
+
+/** Enough for the app to pick one the reader has enabled, without listing every mirror. */
+private const val MAX_SOURCES_PER_SIMILAR = 5
 private const val MAX_CONTENT_TYPE = 32
 private const val MAX_EVIDENCE = 200
 private val SOURCE_PATTERN = Regex("[A-Za-z0-9_.-]+")
@@ -242,7 +395,12 @@ private fun FingerprintDto.isValid(): Boolean =
 		externalIds.size <= MAX_EXTERNAL_IDS &&
 		externalIds.all { (provider, id) ->
 			provider.length in 1..MAX_EXTERNAL_PROVIDER && id.length in 1..MAX_EXTERNAL_ID
-		}
+		} &&
+		// Only absurd input is rejected. A manga carrying more labels than the server cares about is
+		// ordinary - sources tag generously - and failing its fingerprint would cost the reader the
+		// work's ratings and comments over a category nobody needs.
+		genres.size <= MAX_GENRE_LABELS &&
+		genres.all { it.length <= MAX_GENRE_LABEL }
 
 private fun String.sanitizedEvidence(): String = map { if (it.isISOControl()) ' ' else it }
 	.joinToString("")

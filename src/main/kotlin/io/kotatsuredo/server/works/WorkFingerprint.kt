@@ -17,6 +17,11 @@ data class WorkFingerprint(
 	val coverPHash: Long? = null,
 	/** `mal` / `anilist` / `kitsu` / `mangaupdates`, when the user has a scrobbler linked. */
 	val externalIds: Map<String, String> = emptyMap(),
+	/**
+	 * What the source lists this work's genres as. Raw labels: the server maps them onto its own
+	 * closed vocabulary and drops the rest, so a parser's oddities cost nothing.
+	 */
+	val genres: List<String> = emptyList(),
 ) {
 	val allTitles: List<String> get() = (listOf(title) + altTitles).filter { it.isNotBlank() }
 }

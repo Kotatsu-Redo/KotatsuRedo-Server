@@ -56,6 +56,7 @@ class WorkEnricherTest {
 		titles: List<String> = listOf(title),
 		year: Int? = 2018,
 		ids: Map<String, String> = emptyMap(),
+		genres: List<String> = emptyList(),
 	) = CatalogueRecord(
 		provider = "fake",
 		externalId = "1",
@@ -65,7 +66,17 @@ class WorkEnricherTest {
 		contentType = "manga",
 		nsfw = false,
 		externalIds = ids,
+		genres = genres,
 	)
+
+	/** A work some catalogue described before genres were kept: finished, with an id to show for it. */
+	private fun describedBeforeGenres(title: String): Long {
+		val id = repository.createWork(title, 2018, "manga", false)
+		repository.addExternalIds(id, mapOf("mal" to "$id"))
+		repository.enqueueEnrichment(id, title, 2018, "manga")
+		repository.finishEnrichment(id)
+		return id
+	}
 
 	private fun queued(title: String, year: Int? = null): Long {
 		val id = repository.createWork(title, year, "manga", false)
@@ -171,6 +182,62 @@ class WorkEnricherTest {
 
 		assertEquals(2, report.seeded, "a small share, not the whole batch")
 		assertEquals(1, repository.backfillCandidates(), "the rest wait their turn")
+	}
+
+	/**
+	 * Genres arrived after most works were described, and a finished entry is never asked about again,
+	 * so without this the most-read works - the first described - would never have catalogue genres.
+	 */
+	@Test
+	fun `a work described before genres were kept is asked once more and collects them`() = runTest {
+		val id = describedBeforeGenres("Chainsaw Man")
+		val enricher = WorkEnricher(
+			repository,
+			catalogue { record("Chainsaw Man", ids = mapOf("mal" to "$id"), genres = listOf("Action", "Horror")) },
+		)
+
+		val report = enricher.drainOnce()
+
+		assertEquals(1, report.genreRechecks)
+		assertEquals(1, report.enriched)
+		assertEquals(listOf("action", "horror"), repository.genresOf(id).sorted())
+		assertEquals(null, repository.mergedInto(id), "its own id must not merge it into itself")
+
+		assertEquals(0, enricher.drainOnce().genreRechecks, "collected, so nothing to ask again")
+		assertEquals(1, calls.get())
+	}
+
+	/** A catalogue that lists no genres for a work would otherwise be asked about it every sweep. */
+	@Test
+	fun `a work whose catalogue lists no genres is reopened only once`() = runTest {
+		describedBeforeGenres("Genreless")
+		val enricher = WorkEnricher(repository, catalogue { record(it) })
+
+		assertEquals(1, enricher.drainOnce().genreRechecks)
+		assertEquals(0, enricher.drainOnce().genreRechecks)
+		assertEquals(1, calls.get(), "asked once, not once per sweep")
+	}
+
+	@Test
+	fun `a work described with genres already kept is never reopened for them`() = runTest {
+		queued("Fresh")
+		val enricher = WorkEnricher(repository, catalogue { record(it, ids = mapOf("mal" to "fresh")) })
+
+		assertEquals(1, enricher.drainOnce().enriched)
+		assertEquals(0, enricher.drainOnce().genreRechecks, "its answer was read with genres kept")
+		assertEquals(1, calls.get())
+	}
+
+	@Test
+	fun `first descriptions come before genre rechecks in a busy queue`() = runTest {
+		describedBeforeGenres("Described Earlier")
+		repeat(3) { repository.createWork("Never Described $it", 2020, "manga", false) }
+		repeat(25) { queued("Queued $it") }
+
+		val report = WorkEnricher(repository, catalogue { null }, batchSize = 1).drainOnce()
+
+		assertEquals(2, report.seeded)
+		assertEquals(0, report.genreRechecks, "the trickle went to works never described at all")
 	}
 
 	/** No catalogue lists hentai, so asking about it only spends the pool on certain misses. */

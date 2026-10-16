@@ -55,6 +55,68 @@ class TelemetryRepository(private val dataSource: DataSource) {
 	 * Retention is part of the privacy promise, not housekeeping: raw per-reporter rows exist only
 	 * until they have been rolled up, plus a short grace window (PLAN.md §6).
 	 */
+	/**
+	 * Folds raw rows into the daily rollup, up to and including [throughDay].
+	 *
+	 * Re-runnable: a day already rolled up is recomputed rather than duplicated, because today's
+	 * rows keep arriving after the first run of the day touches them.
+	 *
+	 * @return rows written
+	 */
+	fun rollUpThrough(throughDay: LocalDate): Int =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				INSERT INTO source_probe_daily
+					(source, day, region, op, reporters, ok, fail, empty, cf_blocked, latency_mean_ms)
+				SELECT source, day, region, op,
+				       count(DISTINCT reporter_day),
+				       sum(ok), sum(fail), sum(empty), sum(cf_blocked),
+				       COALESCE(
+				         round(
+				           sum(latency_p50_ms::numeric * (ok + fail)) / NULLIF(sum(ok + fail), 0)
+				         ),
+				         0
+				       )
+				FROM source_probe_raw
+				WHERE day <= ?
+				GROUP BY source, day, region, op
+				ON CONFLICT (source, day, region, op) DO UPDATE SET
+					reporters       = EXCLUDED.reporters,
+					ok              = EXCLUDED.ok,
+					fail            = EXCLUDED.fail,
+					empty           = EXCLUDED.empty,
+					cf_blocked      = EXCLUDED.cf_blocked,
+					latency_mean_ms = EXCLUDED.latency_mean_ms,
+					rolled_up_at    = now()
+				""".trimIndent(),
+			).use { statement ->
+				statement.setObject(1, throughDay, Types.DATE)
+				statement.executeUpdate()
+			}
+		}
+
+	/**
+	 * The oldest raw day that the rollup does not yet cover, or null when it covers everything.
+	 *
+	 * Retention asks this before deleting: a day that was never rolled up is a day of history that
+	 * would be gone for good, and losing it silently is how the tuning window quietly becomes seven
+	 * days again.
+	 */
+	fun oldestUnrolledDay(): LocalDate? =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT min(raw.day) FROM (SELECT DISTINCT day FROM source_probe_raw) raw
+				WHERE NOT EXISTS (SELECT 1 FROM source_probe_daily d WHERE d.day = raw.day)
+				""".trimIndent(),
+			).use { statement ->
+				statement.executeQuery().use { rows ->
+					if (rows.next()) rows.getObject(1, LocalDate::class.java) else null
+				}
+			}
+		}
+
 	fun purgeOlderThan(cutoff: LocalDate): Int =
 		dataSource.connection.use { connection ->
 			connection.prepareStatement("DELETE FROM source_probe_raw WHERE day < ?").use { statement ->
