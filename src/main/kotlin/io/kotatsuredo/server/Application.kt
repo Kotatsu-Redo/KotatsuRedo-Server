@@ -18,6 +18,8 @@ import io.kotatsuredo.server.plugins.configureStatusPages
 import io.kotatsuredo.server.routes.healthRoutes
 import io.kotatsuredo.server.routes.exportRoutes
 import io.kotatsuredo.server.routes.identityRoutes
+import io.kotatsuredo.server.routes.SimilarWorks
+import io.kotatsuredo.server.routes.publicRoutes
 import io.kotatsuredo.server.ratings.RatingRepository
 import io.kotatsuredo.server.ratings.RatingService
 import io.kotatsuredo.server.routes.ratingRoutes
@@ -237,6 +239,9 @@ fun Application.module(
 	configurePanelHeaders()
 	configureAdminCsrf()
 	limiter.validate(org.slf4j.LoggerFactory.getLogger("RateLimiter"))
+	// One instance for both similar-works routes, so the authenticated and anonymous answers share
+	// the cache rather than each building their own.
+	val similarWorks = works?.let(::SimilarWorks)
 
 	routing {
 		route("/v1") {
@@ -245,13 +250,18 @@ fun Application.module(
 			if (scoring != null) {
 				scoreRoutes(scoring)
 			}
+			// No account involved, so outside the identity block: these must work for an app that
+			// never switched the community features on.
+			if (works != null && similarWorks != null) {
+				publicRoutes(works, similarWorks, limiter)
+			}
 			if (identities != null) {
 				identityRoutes(identities, limiter, rulesUrl)
 				if (telemetry != null) {
 					telemetryRoutes(identities, telemetry, limiter)
 				}
-				if (resolver != null && linker != null && works != null) {
-					workRoutes(identities, resolver, linker, limiter, works, queues)
+				if (resolver != null && linker != null && works != null && similarWorks != null) {
+					workRoutes(identities, resolver, linker, limiter, works, queues, similarWorks)
 				}
 				if (ratings != null && works != null) {
 					ratingRoutes(identities, ratings, works, limiter)

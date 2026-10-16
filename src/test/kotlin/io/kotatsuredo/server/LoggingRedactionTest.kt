@@ -57,7 +57,27 @@ class LoggingRedactionTest {
 		assertFalse(logged.contains("Bearer", ignoreCase = true), "the word Bearer appeared in logs:\n$logged")
 	}
 
+	/**
+	 * The anonymous suggestions lookup carries the manga in its query string, and the privacy notice
+	 * says that never reaches a log. The request line is path-only for every route, so this holds
+	 * whether or not the route itself is mounted.
+	 */
+	@Test
+	fun `no log line contains the manga an anonymous lookup asked about`() = testApplication {
+		application { module({ true }) }
+
+		client.get("/v1/public/similar?source=SOURCE_A&key=$MANGA_KEY")
+
+		val logged = appender.list.joinToString("\n") { it.formattedMessage }
+
+		assertTrue(logged.contains("/v1/public/similar"), "expected the request to be logged at all, got: $logged")
+		assertFalse(logged.contains(MANGA_KEY), "the manga's key leaked into logs:\n$logged")
+		assertFalse(logged.contains("SOURCE_A"), "the source asked about leaked into logs:\n$logged")
+	}
+
 	private companion object {
+		const val MANGA_KEY = "zzsecretmangakeyzz00112233445566778899"
+
 		// Distinctive so a partial leak still trips the assertion.
 		const val HEADER_SECRET = "zzsecretheaderzz00112233445566778899"
 		const val COOKIE_SECRET = "zzsecretcookiezz00112233445566778899"

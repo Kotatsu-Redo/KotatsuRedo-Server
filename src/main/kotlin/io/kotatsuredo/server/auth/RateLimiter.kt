@@ -57,6 +57,11 @@ class RateLimiter(
 		// making a 25-work request cost the same as a one-work request.
 		WORK_MUTATION(mapOf(TrustTier.NEW to 100, TrustTier.NORMAL to 300, TrustTier.ESTABLISHED to 600), 3600),
 		GENERAL(mapOf(TrustTier.NEW to 300, TrustTier.NORMAL to 300, TrustTier.ESTABLISHED to 300), 60),
+		// Anonymous lookups have no account to key on, so this is only ever checked per network, where
+		// it becomes 600 a minute. One reader asks once per manga page and at most eight times per
+		// six-hourly suggestions run; that leaves room for dozens of readers behind one carrier-grade
+		// NAT, and holds a scraper to ten uncached works a second.
+		PUBLIC_LOOKUP(mapOf(TrustTier.NEW to 60, TrustTier.NORMAL to 60, TrustTier.ESTABLISHED to 60), 60),
 		;
 
 		fun limitFor(tier: TrustTier): Int = limit.getValue(tier)

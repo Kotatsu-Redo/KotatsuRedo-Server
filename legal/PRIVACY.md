@@ -6,9 +6,11 @@ This describes the **official instance** at `community.kotatsuredo.app`, operate
 project and hosted in France. The server is open source, so other people run their own instances
 with their own operators — see [Self-hosters](#self-hosters) at the end.
 
-This notice covers only the community server: comments, ratings, and source telemetry. The
-Kotatsu-Redo app itself sends nothing here unless you switch the community features on, and reading
-manga never involves this server at all.
+This notice covers only the community server: comments, ratings, suggestions and source telemetry.
+With the community features off, the app contacts it only for two anonymous lookups that carry no
+account — source health scores, and
+[suggestions](#suggestions-with-the-community-features-off). Reading manga — the chapters and pages
+themselves — never involves this server at all.
 
 ---
 
@@ -92,6 +94,19 @@ several accounts have reported the same thing. The notes themselves are never sh
 They are, plainly, a record of which manga you opened while the community features were on. They
 are in your export, and they are deleted with your account.
 
+### Suggestions, with the community features off
+
+Suggestions are on by default, whether or not you use the community features. With those off, the
+app still asks the server for works like a manga you read, favourited or opened — that is also what
+fills the "related" row on a manga's page. To ask, it sends only that manga's source and its address
+on that source. The request carries no account, no key and no identifier of any kind.
+
+The server keeps nothing about it. Nothing is written to the database, and the only log line is the
+endpoint's own address and whether it answered — never which manga, and never your IP address. It
+answers only for manga that several accounts have already established, so an answer describes the
+work and never anybody's reading. For anything it does not know, the app builds suggestions on your
+phone, as it always has.
+
 ### Rejected comments
 
 When the word filter stops a comment, the server records which rule matched, the language, and
@@ -171,6 +186,7 @@ works and what it needs to recognise them, and nothing else.
 | Rejected comment text | 30 days |
 | Rejected comment counts | Indefinitely — not linked to you after account deletion |
 | Notes of the manga you opened | Until you delete your account |
+| Suggestion lookups without an account | Not kept at all |
 | Raw telemetry | 7 days |
 | Telemetry scores and daily totals | Indefinitely — aggregate, not about any person |
 | Moderation log | Indefinitely |
@@ -251,7 +267,8 @@ You have the right to complain to a supervisory authority — in France, the
 ## Children
 
 The community features are for people aged **18 or over**. The app itself is not age-restricted, and
-reading manga with the community features switched off involves this server not at all.
+with the community features switched off it makes only the anonymous lookups described above, which
+carry no account and leave nothing behind.
 
 If we learn that an account belongs to someone under 18, it is removed.
 

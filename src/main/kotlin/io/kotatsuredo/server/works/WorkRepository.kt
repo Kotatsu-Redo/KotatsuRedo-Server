@@ -404,6 +404,46 @@ class WorkRepository(private val dataSource: DataSource) {
 			}
 		}
 
+	/**
+	 * The work an entry is, for a caller with no account - read-only, and only when it is aggregate.
+	 *
+	 * A verified alias answers outright. Otherwise the work that at least
+	 * [SOURCE_CORROBORATION_REQUIRED] distinct, unsanctioned accounts have seen the entry as - the
+	 * same rule [sourcesFor] uses, so an answer can never be one person's reading played back. Never
+	 * writes: no work, alias or observation is created, and nothing about the asker is recorded.
+	 *
+	 * @return the work as stored, which may since have been merged - see [mergedInto]
+	 */
+	fun corroboratedWorkFor(source: String, sourceKey: String): Long? =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT work_id FROM (
+					SELECT work_id, 0 AS priority, 0 AS support
+					FROM work_alias
+					WHERE source = ? AND source_key = ? AND is_verified
+					UNION ALL
+					SELECT observation.work_id, 1, count(DISTINCT observation.user_id)
+					FROM work_alias_observation observation
+					JOIN app_user account ON account.id = observation.user_id
+					WHERE observation.source = ? AND observation.source_key = ?
+					  AND NOT account.is_banned AND NOT account.is_shadowbanned
+					GROUP BY observation.work_id
+					HAVING count(DISTINCT observation.user_id) >= ?
+				) candidates
+				ORDER BY priority, support DESC, work_id
+				LIMIT 1
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setString(3, source)
+				statement.setString(4, sourceKey)
+				statement.setInt(5, SOURCE_CORROBORATION_REQUIRED)
+				statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
+			}
+		}
+
 	/** Only corroborated aliases may short-circuit resolution for every account. */
 	fun findVerifiedAlias(source: String, sourceKey: String): Long? =
 		dataSource.connection.use { connection ->

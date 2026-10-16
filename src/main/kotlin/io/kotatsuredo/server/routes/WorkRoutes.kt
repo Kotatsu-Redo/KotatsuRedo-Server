@@ -132,6 +132,7 @@ fun Route.workRoutes(
 	limiter: RateLimiter,
 	works: WorkRepository,
 	queues: ModerationQueueRepository? = null,
+	similarWorks: SimilarWorks = SimilarWorks(works),
 ) = route("/works") {
 
 	/**
@@ -146,31 +147,9 @@ fun Route.workRoutes(
 		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id)
 		val workId = call.resolveWorkId(works)
 
-		val similar = works.similarTo(workId).map { candidate ->
-			SimilarWorkDto(
-				workId = candidate.workId.toString(),
-				title = candidate.title,
-				year = candidate.year,
-				contentType = candidate.contentType,
-				nsfw = candidate.nsfw,
-				genres = works.genresOf(candidate.workId),
-				sharedGenres = candidate.sharedGenres,
-				score = candidate.score,
-				sources = works.sourcesFor(candidate.workId, limit = MAX_SOURCES_PER_SIMILAR).map {
-					WorkSourceDto(
-						source = it.source,
-						key = it.sourceKey,
-						reporters = it.reporters,
-						lastSeen = it.lastSeen.toString(),
-						verified = it.verified,
-					)
-				},
-			)
-		}
-
 		// Genres change when a catalogue answers or a quorum lands, which is a scale of days.
 		call.response.header(HttpHeaders.CacheControl, "private, max-age=21600")
-		call.respond(SimilarWorksResponse(workId.toString(), similar))
+		call.respond(similarWorks.responseFor(workId))
 	}
 
 	/**
@@ -370,14 +349,12 @@ private const val MAX_EXTERNAL_PROVIDER = 32
 private const val MAX_EXTERNAL_ID = 128
 private const val MAX_GENRE_LABELS = 200
 private const val MAX_GENRE_LABEL = 60
-
-/** Enough for the app to pick one the reader has enabled, without listing every mirror. */
-private const val MAX_SOURCES_PER_SIMILAR = 5
 private const val MAX_CONTENT_TYPE = 32
 private const val MAX_EVIDENCE = 200
 private val SOURCE_PATTERN = Regex("[A-Za-z0-9_.-]+")
 
-private fun FingerprintRef.isValid(): Boolean =
+/** A source and an entry on it, as every route that takes one accepts it. */
+internal fun FingerprintRef.isValid(): Boolean =
 	source.length in 1..MAX_SOURCE &&
 		SOURCE_PATTERN.matches(source) &&
 		key.length in 1..MAX_SOURCE_KEY &&
