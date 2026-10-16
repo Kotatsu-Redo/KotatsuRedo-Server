@@ -7,9 +7,9 @@ import java.time.Duration
 /**
  * The "works like this one" answer, built once per work and kept briefly.
  *
- * One answer is a similarity query plus a genre and a source lookup per candidate - about forty
- * queries - and it is asked for by every app with suggestions on, which is now the default, on every
- * manga page and every suggestions run. The answer depends only on the work, never on who asks, so
+ * One answer is a similarity query with its signals, then one batched genre and one batched source
+ * lookup for all candidates, and it is asked for by every app with suggestions on, which is now the
+ * default, on every manga page and every suggestions run. The answer depends only on the work, never on who asks, so
  * the authenticated and the anonymous route share it.
  *
  * An hour is short beside how fast it changes: genres move when a catalogue answers or a quorum
@@ -60,29 +60,40 @@ class SimilarWorks(
 		/** Enough for the app to pick one the reader has enabled, without listing every mirror. */
 		private const val MAX_SOURCES_PER_SIMILAR = 5
 
-		private fun buildResponse(works: WorkRepository, workId: Long) = SimilarWorksResponse(
-			workId = workId.toString(),
-			similar = works.similarTo(workId).map { candidate ->
-				SimilarWorkDto(
-					workId = candidate.workId.toString(),
-					title = candidate.title,
-					year = candidate.year,
-					contentType = candidate.contentType,
-					nsfw = candidate.nsfw,
-					genres = works.genresOf(candidate.workId),
-					sharedGenres = candidate.sharedGenres,
-					score = candidate.score,
-					sources = works.sourcesFor(candidate.workId, limit = MAX_SOURCES_PER_SIMILAR).map {
-						WorkSourceDto(
-							source = it.source,
-							key = it.sourceKey,
-							reporters = it.reporters,
-							lastSeen = it.lastSeen.toString(),
-							verified = it.verified,
+		/** Three queries for the candidates' details, whatever their number: genres and sources batched. */
+		private fun buildResponse(works: WorkRepository, workId: Long): SimilarWorksResponse {
+			val candidates = works.similarTo(workId)
+			val ids = candidates.map { it.workId }
+			val genres = works.genresOfAll(ids)
+			val sources = works.sourcesForAll(ids, limit = MAX_SOURCES_PER_SIMILAR)
+			return SimilarWorksResponse(
+				workId = workId.toString(),
+				similar = candidates
+					// Co-reading can bring in a work nobody has corroborated a source for, which no
+					// reader could open: worth nothing to list.
+					.filter { !it.coReadOnly || !sources[it.workId].isNullOrEmpty() }
+					.map { candidate ->
+						SimilarWorkDto(
+							workId = candidate.workId.toString(),
+							title = candidate.title,
+							year = candidate.year,
+							contentType = candidate.contentType,
+							nsfw = candidate.nsfw,
+							genres = genres[candidate.workId].orEmpty(),
+							sharedGenres = candidate.sharedGenres,
+							score = candidate.score,
+							sources = sources[candidate.workId].orEmpty().map {
+								WorkSourceDto(
+									source = it.source,
+									key = it.sourceKey,
+									reporters = it.reporters,
+									lastSeen = it.lastSeen.toString(),
+									verified = it.verified,
+								)
+							},
 						)
 					},
-				)
-			},
-		)
+			)
+		}
 	}
 }

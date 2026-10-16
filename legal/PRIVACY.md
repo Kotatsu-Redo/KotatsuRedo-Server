@@ -94,6 +94,11 @@ several accounts have reported the same thing. The notes themselves are never sh
 They are, plainly, a record of which manga you opened while the community features were on. They
 are in your export, and they are deleted with your account.
 
+From these notes the server also counts, for pairs of works, how many accounts opened both — that is
+what lets a suggestion say that people who read one manga often read another. A pair is kept only
+when at least ten accounts opened both, and the count is all that is kept: it records no account. It
+is rebuilt from scratch every day, so an account deleted today has left it by tomorrow.
+
 ### Suggestions, with the community features off
 
 Suggestions are on by default, whether or not you use the community features. With those off, the
@@ -186,6 +191,7 @@ works and what it needs to recognise them, and nothing else.
 | Rejected comment text | 30 days |
 | Rejected comment counts | Indefinitely — not linked to you after account deletion |
 | Notes of the manga you opened | Until you delete your account |
+| Counts of works opened together | Refreshed daily; contains no account |
 | Suggestion lookups without an account | Not kept at all |
 | Raw telemetry | 7 days |
 | Telemetry scores and daily totals | Indefinitely — aggregate, not about any person |

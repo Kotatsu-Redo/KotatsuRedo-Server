@@ -91,6 +91,14 @@ class PolicyClaimsTest {
 		)
 	}
 
+	/** "...keeps a pair only when at least ten accounts did, and stores no account with it." */
+	@Test
+	fun `co-reading counts hold no account`() {
+		val coRead = columns().filter { it.first == "work_coread" }.map { it.second }.toSet()
+		assertTrue(coRead.isNotEmpty(), "work_coread is gone - check legal/PRIVACY.md")
+		assertEquals(setOf("work_a", "work_b", "readers", "refreshed_at"), coRead, "work_coread gained a column")
+	}
+
 	/**
 	 * "They are in your export, and they are deleted with your account."
 	 *

@@ -1,8 +1,13 @@
 package io.kotatsuredo.server.works
 
+import java.sql.Connection
 import java.sql.Statement
 import java.sql.Types
 import java.time.LocalDate
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.ln
+import kotlin.math.sqrt
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.add
@@ -53,9 +58,24 @@ data class SimilarWork(
 	val year: Int?,
 	val contentType: String?,
 	val nsfw: Boolean,
-	/** Sum of the shared genres' rarity weights. Comparable within one response, not across works. */
+	/** See [WorkRepository.similarTo]. Comparable within one response, not across works. */
 	val score: Double,
 	val sharedGenres: Int,
+	/**
+	 * Found through co-reading alone, sharing too few genres to have been a candidate otherwise. Such
+	 * a work is only worth listing where somebody can actually open it.
+	 */
+	val coReadOnly: Boolean = false,
+)
+
+/** What one co-reading rebuild did, for the log. */
+data class CoReadRefresh(
+	/** Distinct (account, work) rows read, after the per-account cap. */
+	val accountWorks: Long,
+	/** Pairs stored: those at least [WorkRepository.CO_READ_MIN_READERS] accounts share. */
+	val pairs: Long,
+	val accountBuckets: Int,
+	val pairBatches: Int,
 )
 
 /** One account's record of a source entry it asked about, as the data export reports it. */
@@ -1096,79 +1116,391 @@ class WorkRepository(private val dataSource: DataSource) {
 		}
 	}
 
-	/**
-	 * Works that share this one's genres, rarest genre first.
-	 *
-	 * The weighting is the whole idea: two works both tagged `action` have said almost nothing about
-	 * each other, while two tagged `villainess` have said a great deal. Each shared genre is worth
-	 * the log of how much rarer it is than the commonest genre this work has, so agreement on
-	 * something specific outweighs agreement on something universal.
-	 *
-	 * Candidates come from the work's rarest genres rather than all of them, because `action` alone
-	 * would sweep in tens of thousands of works to score and throw away.
-	 */
-	fun similarTo(workId: Long, limit: Int = MAX_SIMILAR): List<SimilarWork> =
-		dataSource.connection.use { connection ->
+	/** [genresOf] for many works in one query. A work without published genres is absent. */
+	fun genresOfAll(workIds: Collection<Long>): Map<Long, List<String>> {
+		if (workIds.isEmpty()) return emptyMap()
+		return dataSource.connection.use { connection ->
 			connection.prepareStatement(
 				"""
-				WITH target AS (SELECT genre FROM work_genre WHERE work_id = ?),
-				stats AS (
-					SELECT g.genre, count(*)::float8 AS works
-					FROM work_genre g JOIN target t ON t.genre = g.genre
-					GROUP BY g.genre
-				),
-				commonest AS (SELECT max(works) AS works FROM stats),
-				rare AS (SELECT genre FROM stats ORDER BY works LIMIT $SIMILAR_SEED_GENRES),
-				candidates AS (
-					SELECT DISTINCT wg.work_id
-					FROM work_genre wg JOIN rare r ON r.genre = wg.genre
-					WHERE wg.work_id <> ?
-					LIMIT $SIMILAR_CANDIDATES
-				),
-				scored AS (
-					SELECT c.work_id,
-					       sum(ln(1 + (SELECT works FROM commonest) / s.works)) AS score,
-					       count(*) AS shared
-					FROM candidates c
-					JOIN work_genre wg ON wg.work_id = c.work_id
-					JOIN stats s ON s.genre = wg.genre
-					GROUP BY c.work_id
-					HAVING count(*) >= $SIMILAR_SHARED_REQUIRED
-				)
-				SELECT w.id, w.canonical_title, w.year, w.content_type, w.nsfw, scored.score, scored.shared
-				FROM scored
-				JOIN work w ON w.id = scored.work_id AND w.merged_into IS NULL
-				WHERE w.content_type IS NULL
-				   OR w.content_type = (SELECT content_type FROM work WHERE id = ?)
-				   OR (SELECT content_type FROM work WHERE id = ?) IS NULL
-				ORDER BY scored.score DESC, scored.shared DESC, w.id
-				LIMIT ?
+				SELECT work_id, genre FROM work_genre WHERE work_id = ANY(?)
+				ORDER BY work_id, origin = 'catalogue' DESC, reporters DESC, genre
 				""".trimIndent(),
 			).use { statement ->
-				statement.setLong(1, workId)
-				statement.setLong(2, workId)
-				statement.setLong(3, workId)
-				statement.setLong(4, workId)
-				statement.setInt(5, limit)
+				statement.setArray(1, connection.createArrayOf("bigint", workIds.toTypedArray()))
 				statement.executeQuery().use { rows ->
-					buildList {
-						while (rows.next()) {
-							add(
-								SimilarWork(
-									workId = rows.getLong(1),
-									title = rows.getString(2),
-									year = rows.getInt(3).takeUnless { rows.wasNull() },
-									contentType = rows.getString(4),
-									nsfw = rows.getBoolean(5),
-									score = rows.getDouble(6),
-									sharedGenres = rows.getInt(7),
-								),
-							)
-						}
+					val result = LinkedHashMap<Long, MutableList<String>>()
+					while (rows.next()) {
+						result.getOrPut(rows.getLong(1)) { ArrayList() }.add(rows.getString(2))
 					}
+					result
 				}
 			}
 		}
+	}
+
+	/**
+	 * Works like this one, best first.
+	 *
+	 * **Genres** are the base. Two works both tagged `action` have said almost nothing about each
+	 * other, while two tagged `villainess` have said a great deal, so each shared genre is worth
+	 * `ln(1 + commonest / works)` - `works` being how many works carry that genre and `commonest` the
+	 * same count for the most common of this work's genres. Candidates come from the work's
+	 * [SIMILAR_SEED_GENRES] rarest genres, because `action` alone would sweep in tens of thousands of
+	 * works to score and throw away, and need [SIMILAR_SHARED_REQUIRED] genres in common: one is a
+	 * coincidence.
+	 *
+	 * **Co-reading** says what genres cannot: that the people who read one thing read another. The
+	 * [CO_READ_NEIGHBOURS] works most often opened by the same accounts (see [refreshCoReading]) join
+	 * the candidates whatever their genres, each lifted by its cosine similarity
+	 * `coreaders / sqrt(readers(this) * readers(that))`, scaled to the best genre score in the answer
+	 * so that the two add up meaningfully:
+	 *
+	 *     base = genre + CO_READ_WEIGHT * bestGenre * cosine        (bestGenre = 1 with no genre match)
+	 *
+	 * Then three adjustments, deliberately mild and each exactly 1 without data, multiply the base:
+	 *
+	 *     quality   = 1 + QUALITY_WEIGHT * clamp((bayesian - globalMean) / RATING_HALF_SPAN, -1, 1)
+	 *     readers   = 1 + READERSHIP_WEIGHT * min(1, ln(1 + readers) / ln(1 + READERSHIP_SATURATION))
+	 *     era       = YEAR_FLOOR + (1 - YEAR_FLOOR) * exp(-|year - thisYear| / YEAR_SCALE)
+	 *
+	 * Quality comes from the rating aggregate, whose Bayesian prior already pulls a thinly rated work
+	 * to the mean; readership is distinct accounts, so a widely read work wins a tie without drowning
+	 * a niche match; era applies only when both years are known. Every input is an aggregate - nothing
+	 * here can describe one person. Scores compare within one answer only: their scale depends on the
+	 * work asked about.
+	 */
+	fun similarTo(workId: Long, limit: Int = MAX_SIMILAR): List<SimilarWork> =
+		dataSource.connection.use { connection ->
+			val byGenre = genreCandidates(connection, workId, limit * SIMILAR_RESCORE_POOL)
+			val coRead = coReadersOf(connection, workId)
+			val coReadOnly = coRead.keys - byGenre.keys
+			val candidates = byGenre + candidateWorks(connection, workId, coReadOnly)
+			if (candidates.isEmpty()) {
+				return@use emptyList()
+			}
+
+			val readers = readersOf(connection, candidates.keys + workId)
+			val (globalMean, bayesian) = qualityOf(connection, candidates.keys)
+			val ownYear = yearOf(connection, workId)
+			val bestGenre = byGenre.values.maxOfOrNull { it.score }?.takeIf { it > 0.0 } ?: 1.0
+			val ownReaders = readers[workId] ?: 0
+
+			candidates.values
+				.map { candidate ->
+					val coreaders = coRead[candidate.workId] ?: 0
+					val theirReaders = readers[candidate.workId] ?: 0
+					val cosine = if (coreaders > 0 && ownReaders > 0 && theirReaders > 0) {
+						(coreaders / sqrt(ownReaders.toDouble() * theirReaders)).coerceAtMost(1.0)
+					} else {
+						0.0
+					}
+					candidate.copy(
+						score = similarityScore(
+							genre = candidate.score,
+							bestGenre = bestGenre,
+							coReadCosine = cosine,
+							bayesian = bayesian[candidate.workId],
+							globalMean = globalMean,
+							readers = theirReaders,
+							year = candidate.year,
+							ownYear = ownYear,
+						),
+					)
+				}
+				.sortedWith(compareByDescending<SimilarWork> { it.score }.thenByDescending { it.sharedGenres }.thenBy { it.workId })
+				.take(limit)
+		}
+
+	/** Works sharing enough of this one's rarest genres, by genre score alone. */
+	private fun genreCandidates(connection: Connection, workId: Long, limit: Int): Map<Long, SimilarWork> =
+		connection.prepareStatement(
+			"""
+			WITH target AS (SELECT genre FROM work_genre WHERE work_id = ?),
+			stats AS (
+				SELECT g.genre, count(*)::float8 AS works
+				FROM work_genre g JOIN target t ON t.genre = g.genre
+				GROUP BY g.genre
+			),
+			commonest AS (SELECT max(works) AS works FROM stats),
+			rare AS (SELECT genre FROM stats ORDER BY works LIMIT $SIMILAR_SEED_GENRES),
+			candidates AS (
+				SELECT DISTINCT wg.work_id
+				FROM work_genre wg JOIN rare r ON r.genre = wg.genre
+				WHERE wg.work_id <> ?
+				LIMIT $SIMILAR_CANDIDATES
+			),
+			scored AS (
+				SELECT c.work_id,
+				       sum(ln(1 + (SELECT works FROM commonest) / s.works)) AS score,
+				       count(*) AS shared
+				FROM candidates c
+				JOIN work_genre wg ON wg.work_id = c.work_id
+				JOIN stats s ON s.genre = wg.genre
+				GROUP BY c.work_id
+				HAVING count(*) >= $SIMILAR_SHARED_REQUIRED
+			)
+			SELECT w.id, w.canonical_title, w.year, w.content_type, w.nsfw, scored.score, scored.shared
+			FROM scored
+			JOIN work w ON w.id = scored.work_id AND w.merged_into IS NULL
+			WHERE $SAME_CONTENT_TYPE
+			ORDER BY scored.score DESC, scored.shared DESC, w.id
+			LIMIT ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setLong(1, workId)
+			statement.setLong(2, workId)
+			statement.setLong(3, workId)
+			statement.setLong(4, workId)
+			statement.setInt(5, limit)
+			statement.executeQuery().use { rows -> rows.readSimilar(coReadOnly = false) }
+		}
+
+	/**
+	 * The co-read neighbours that did not come in by genre, with whatever genre score they do have.
+	 * The same rules as [genreCandidates] otherwise: a work still its own, of the same kind.
+	 */
+	private fun candidateWorks(connection: Connection, workId: Long, ids: Collection<Long>): Map<Long, SimilarWork> {
+		if (ids.isEmpty()) return emptyMap()
+		return connection.prepareStatement(
+			"""
+			WITH target AS (SELECT genre FROM work_genre WHERE work_id = ?),
+			stats AS (
+				SELECT g.genre, count(*)::float8 AS works
+				FROM work_genre g JOIN target t ON t.genre = g.genre
+				GROUP BY g.genre
+			),
+			commonest AS (SELECT max(works) AS works FROM stats),
+			scored AS (
+				SELECT wg.work_id,
+				       sum(ln(1 + (SELECT works FROM commonest) / s.works)) AS score,
+				       count(*) AS shared
+				FROM work_genre wg JOIN stats s ON s.genre = wg.genre
+				WHERE wg.work_id = ANY(?)
+				GROUP BY wg.work_id
+			)
+			SELECT w.id, w.canonical_title, w.year, w.content_type, w.nsfw,
+			       coalesce(scored.score, 0), coalesce(scored.shared, 0)
+			FROM work w
+			LEFT JOIN scored ON scored.work_id = w.id
+			WHERE w.id = ANY(?) AND w.id <> ? AND w.merged_into IS NULL
+			  AND ($SAME_CONTENT_TYPE)
+			""".trimIndent(),
+		).use { statement ->
+			val array = connection.createArrayOf("bigint", ids.toTypedArray())
+			statement.setLong(1, workId)
+			statement.setArray(2, array)
+			statement.setArray(3, array)
+			statement.setLong(4, workId)
+			statement.setLong(5, workId)
+			statement.setLong(6, workId)
+			statement.executeQuery().use { rows -> rows.readSimilar(coReadOnly = true) }
+		}
+	}
+
+	private fun java.sql.ResultSet.readSimilar(coReadOnly: Boolean): Map<Long, SimilarWork> {
+		val result = LinkedHashMap<Long, SimilarWork>()
+		while (next()) {
+			val shared = getInt(7)
+			val work = SimilarWork(
+				workId = getLong(1),
+				title = getString(2),
+				year = getInt(3).takeUnless { wasNull() },
+				contentType = getString(4),
+				nsfw = getBoolean(5),
+				score = getDouble(6),
+				sharedGenres = shared,
+				coReadOnly = coReadOnly && shared < SIMILAR_SHARED_REQUIRED,
+			)
+			result[work.workId] = work
+		}
+		return result
+	}
+
+	/** This work's strongest co-read neighbours: other work id to accounts that opened both. */
+	private fun coReadersOf(connection: Connection, workId: Long): Map<Long, Int> =
+		connection.prepareStatement(
+			"""
+			SELECT work_b AS other, readers FROM work_coread WHERE work_a = ?
+			UNION ALL
+			SELECT work_a, readers FROM work_coread WHERE work_b = ?
+			ORDER BY readers DESC, other
+			LIMIT ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setLong(1, workId)
+			statement.setLong(2, workId)
+			statement.setInt(3, CO_READ_NEIGHBOURS)
+			statement.executeQuery().use { rows ->
+				val result = LinkedHashMap<Long, Int>()
+				while (rows.next()) result[rows.getLong(1)] = rows.getInt(2)
+				result
+			}
+		}
+
+	/** Distinct unsanctioned accounts that have opened each work - its readership, as a count. */
+	private fun readersOf(connection: Connection, ids: Collection<Long>): Map<Long, Int> =
+		connection.prepareStatement(
+			"""
+			SELECT observation.work_id, count(DISTINCT observation.user_id)
+			FROM work_alias_observation observation
+			JOIN app_user account ON account.id = observation.user_id
+			WHERE observation.work_id = ANY(?)
+			  AND NOT account.is_banned AND NOT account.is_shadowbanned
+			GROUP BY observation.work_id
+			""".trimIndent(),
+		).use { statement ->
+			statement.setArray(1, connection.createArrayOf("bigint", ids.toTypedArray()))
+			statement.executeQuery().use { rows ->
+				val result = HashMap<Long, Int>()
+				while (rows.next()) result[rows.getLong(1)] = rows.getInt(2)
+				result
+			}
+		}
+
+	/** The global mean rating (null before anyone has rated) and each rated work's Bayesian average. */
+	private fun qualityOf(connection: Connection, ids: Collection<Long>): Pair<Double?, Map<Long, Double>> {
+		val globalMean = connection.createStatement().use { statement ->
+			statement.executeQuery(
+				"SELECT sum(value_sum)::float8 / NULLIF(sum(count), 0) FROM rating_global_shard",
+			).use { rows -> if (rows.next()) rows.getDouble(1).takeUnless { rows.wasNull() } else null }
+		}
+		val bayesian = connection.prepareStatement(
+			"SELECT work_id, bayesian FROM work_rating_agg WHERE work_id = ANY(?) AND count > 0",
+		).use { statement ->
+			statement.setArray(1, connection.createArrayOf("bigint", ids.toTypedArray()))
+			statement.executeQuery().use { rows ->
+				val result = HashMap<Long, Double>()
+				while (rows.next()) result[rows.getLong(1)] = rows.getDouble(2)
+				result
+			}
+		}
+		return globalMean to bayesian
+	}
+
+	private fun yearOf(connection: Connection, workId: Long): Int? =
+		connection.prepareStatement("SELECT year FROM work WHERE id = ?").use { statement ->
+			statement.setLong(1, workId)
+			statement.executeQuery().use { rows ->
+				if (rows.next()) rows.getInt(1).takeUnless { rows.wasNull() } else null
+			}
+		}
+
+	// -- co-reading --------------------------------------------------------------------------------
+
+	/**
+	 * Rebuilds `work_coread`: for each pair of works, how many accounts opened both.
+	 *
+	 * Read from the notes the resolver already keeps, with the same exclusions as everything else
+	 * aggregate - sanctioned accounts do not count, merged works count as their survivor. Each account
+	 * contributes only its [perAccountCap] most recently opened works, which bounds the pairs one
+	 * account can generate (`cap * (cap - 1) / 2`) and keeps one bulk-opening account from defining
+	 * everyone's neighbours. A pair is stored only when at least [minReaders] accounts share it, and
+	 * nothing about which accounts they were is stored at all.
+	 *
+	 * Built in session-local scratch tables, in slices, so no single statement outgrows the pool's
+	 * statement timeout as the data grows: accounts are read in hash buckets, pairs counted in ranges
+	 * of the lower work id. The published table is replaced in the same transaction, so readers see
+	 * either yesterday's pairs or today's, never a half-built mix.
+	 */
+	fun refreshCoReading(
+		perAccountCap: Int = CO_READ_PER_ACCOUNT,
+		minReaders: Int = CO_READ_MIN_READERS,
+	): CoReadRefresh = dataSource.connection.use { connection ->
+		require(perAccountCap > 1 && minReaders > 1)
+		connection.autoCommit = false
+		try {
+			val buckets = accountBuckets(connection)
+			connection.createStatement().use { statement ->
+				statement.execute("CREATE TEMP TABLE coread_recent (user_id TEXT NOT NULL, work_id BIGINT NOT NULL) ON COMMIT DROP")
+			}
+			connection.prepareStatement(
+				"""
+				INSERT INTO coread_recent (user_id, work_id)
+				SELECT user_id, work_id FROM (
+					SELECT observation.user_id, observation.work_id,
+					       row_number() OVER (
+					         PARTITION BY observation.user_id
+					         ORDER BY max(observation.updated_at) DESC, observation.work_id
+					       ) AS position
+					FROM work_alias_observation observation
+					JOIN app_user account ON account.id = observation.user_id
+					JOIN work w ON w.id = observation.work_id AND w.merged_into IS NULL
+					WHERE NOT account.is_banned AND NOT account.is_shadowbanned
+					  AND ((hashtext(observation.user_id)::bigint % ?) + ?) % ? = ?
+					GROUP BY observation.user_id, observation.work_id
+				) ranked
+				WHERE position <= ?
+				""".trimIndent(),
+			).use { statement ->
+				for (bucket in 0 until buckets) {
+					statement.setLong(1, buckets.toLong())
+					statement.setLong(2, buckets.toLong())
+					statement.setLong(3, buckets.toLong())
+					statement.setLong(4, bucket.toLong())
+					statement.setInt(5, perAccountCap)
+					statement.executeUpdate()
+				}
+			}
+			connection.createStatement().use { statement ->
+				statement.execute("CREATE INDEX ON coread_recent (user_id, work_id)")
+				statement.execute("ANALYZE coread_recent")
+				statement.execute("CREATE TEMP TABLE coread_pairs (work_a BIGINT, work_b BIGINT, readers INTEGER) ON COMMIT DROP")
+			}
+			val (minWork, maxWork, accountWorks) = connection.createStatement().use { statement ->
+				statement.executeQuery("SELECT min(work_id), max(work_id), count(*) FROM coread_recent").use { rows ->
+					rows.next()
+					Triple(rows.getLong(1), rows.getLong(2), rows.getLong(3))
+				}
+			}
+			var batches = 0
+			if (accountWorks > 0) {
+				batches = (accountWorks / CO_READ_ROWS_PER_BATCH + 1).toInt().coerceAtMost(CO_READ_MAX_BATCHES)
+				val width = (maxWork - minWork) / batches + 1
+				connection.prepareStatement(
+					"""
+					INSERT INTO coread_pairs (work_a, work_b, readers)
+					SELECT x.work_id, y.work_id, count(*)::int
+					FROM coread_recent x
+					JOIN coread_recent y ON y.user_id = x.user_id AND y.work_id > x.work_id
+					WHERE x.work_id >= ? AND x.work_id < ?
+					GROUP BY x.work_id, y.work_id
+					HAVING count(*) >= ?
+					""".trimIndent(),
+				).use { statement ->
+					for (batch in 0 until batches) {
+						statement.setLong(1, minWork + batch * width)
+						statement.setLong(2, minWork + (batch + 1) * width)
+						statement.setInt(3, minReaders)
+						statement.executeUpdate()
+					}
+				}
+			}
+			val pairs = connection.createStatement().use { statement ->
+				statement.executeUpdate("DELETE FROM work_coread")
+				statement.executeUpdate(
+					"INSERT INTO work_coread (work_a, work_b, readers, refreshed_at) " +
+						"SELECT work_a, work_b, readers, now() FROM coread_pairs",
+				).toLong()
+			}
+			connection.commit()
+			CoReadRefresh(accountWorks = accountWorks, pairs = pairs, accountBuckets = buckets, pairBatches = batches)
+		} catch (error: Exception) {
+			connection.rollback()
+			throw error
+		} finally {
+			connection.autoCommit = true
+		}
+	}
+
+	/** Enough hash buckets that each holds about [CO_READ_OBSERVATIONS_PER_BUCKET] observations. */
+	private fun accountBuckets(connection: Connection): Int {
+		val estimate = connection.createStatement().use { statement ->
+			statement.executeQuery(
+				"SELECT greatest(reltuples, 0)::bigint FROM pg_class WHERE oid = 'work_alias_observation'::regclass",
+			).use { rows -> if (rows.next()) rows.getLong(1) else 0L }
+		}
+		return (estimate / CO_READ_OBSERVATIONS_PER_BUCKET + 1).toInt().coerceIn(1, CO_READ_MAX_BATCHES)
+	}
 
 	// -- per-account records, for the data export ---------------------------------------------
 
@@ -1360,6 +1692,97 @@ class WorkRepository(private val dataSource: DataSource) {
 				}
 			}
 		}
+
+	/**
+	 * [sourcesFor] for many works in one query, at most [limit] each: the same corroboration rule,
+	 * the same exclusions and the same freshness-faded order, ranked per work. A work no source
+	 * qualifies for is absent.
+	 */
+	fun sourcesForAll(workIds: Collection<Long>, limit: Int): Map<Long, List<WorkSource>> {
+		if (workIds.isEmpty()) return emptyMap()
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				WITH per_source AS (
+					SELECT observation.work_id,
+					       observation.source,
+					       (array_agg(observation.source_key ORDER BY observation.updated_at DESC))[1] AS source_key,
+					       count(DISTINCT observation.user_id) AS reporters,
+					       max(observation.updated_at) AS last_seen_at,
+					       bool_or(alias.is_verified) AS verified
+					FROM work_alias_observation observation
+					JOIN app_user account ON account.id = observation.user_id
+					LEFT JOIN work_alias alias
+					       ON alias.source = observation.source AND alias.source_key = observation.source_key
+					WHERE observation.work_id = ANY(?)
+					  AND NOT account.is_banned AND NOT account.is_shadowbanned
+					GROUP BY observation.work_id, observation.source
+					HAVING count(DISTINCT observation.user_id) >= ?
+				),
+				ranked AS (
+					SELECT per_source.*,
+					       row_number() OVER (
+					         PARTITION BY work_id
+					         ORDER BY reporters *
+					                  power(0.5, EXTRACT(EPOCH FROM now() - last_seen_at) / 86400.0 / $COVERAGE_HALF_LIFE_DAYS) DESC,
+					                  reporters DESC, source
+					       ) AS position
+					FROM per_source
+				)
+				SELECT work_id, source, source_key, reporters, last_seen_at::date, verified
+				FROM ranked
+				WHERE position <= ?
+				ORDER BY work_id, position
+				""".trimIndent(),
+			).use { statement ->
+				statement.setArray(1, connection.createArrayOf("bigint", workIds.toTypedArray()))
+				statement.setInt(2, SOURCE_CORROBORATION_REQUIRED)
+				statement.setInt(3, limit)
+				statement.executeQuery().use { rows ->
+					val result = LinkedHashMap<Long, MutableList<WorkSource>>()
+					while (rows.next()) {
+						result.getOrPut(rows.getLong(1)) { ArrayList() }.add(
+							WorkSource(
+								source = rows.getString(2),
+								sourceKey = rows.getString(3),
+								reporters = rows.getInt(4),
+								lastSeen = rows.getObject(5, LocalDate::class.java),
+								verified = rows.getBoolean(6),
+							),
+						)
+					}
+					result
+				}
+			}
+		}
+	}
+
+	/** The formula documented on [similarTo]. */
+	private fun similarityScore(
+		genre: Double,
+		bestGenre: Double,
+		coReadCosine: Double,
+		bayesian: Double?,
+		globalMean: Double?,
+		readers: Int,
+		year: Int?,
+		ownYear: Int?,
+	): Double {
+		val base = genre + CO_READ_WEIGHT * bestGenre * coReadCosine
+		val quality = if (bayesian != null && globalMean != null) {
+			1.0 + QUALITY_WEIGHT * ((bayesian - globalMean) / RATING_HALF_SPAN).coerceIn(-1.0, 1.0)
+		} else {
+			1.0
+		}
+		val readership = 1.0 + READERSHIP_WEIGHT *
+			(ln(1.0 + readers) / ln(1.0 + READERSHIP_SATURATION)).coerceAtMost(1.0)
+		val era = if (year != null && ownYear != null) {
+			YEAR_FLOOR + (1.0 - YEAR_FLOOR) * exp(-abs(year - ownYear) / YEAR_SCALE)
+		} else {
+			1.0
+		}
+		return base * quality * readership * era
+	}
 
 	/** A work still its own, never queued, never described by any catalogue, and one they cover. */
 	private val backfillCandidate = """
@@ -2119,6 +2542,58 @@ class WorkRepository(private val dataSource: DataSource) {
 
 		/** One genre in common is a coincidence. */
 		const val SIMILAR_SHARED_REQUIRED = 2
+
+		/** Genre candidates re-scored per answer slot, so the adjustments have something to reorder. */
+		const val SIMILAR_RESCORE_POOL = 5
+
+		/**
+		 * A candidate of the same kind as the work asked about, or one whose kind nobody stated. Takes
+		 * the asked-about work's id twice; `w` is the candidate.
+		 */
+		const val SAME_CONTENT_TYPE = "w.content_type IS NULL" +
+			" OR w.content_type = (SELECT content_type FROM work WHERE id = ?)" +
+			" OR (SELECT content_type FROM work WHERE id = ?) IS NULL"
+
+		/** Co-read neighbours considered per answer, strongest first. */
+		const val CO_READ_NEIGHBOURS = 50
+
+		/** A perfectly co-read work (cosine 1) adds one and a half times the answer's best genre score. */
+		const val CO_READ_WEIGHT = 1.5
+
+		/** The quality prior moves a score by at most this fraction either way. */
+		const val QUALITY_WEIGHT = 0.15
+
+		/** Ratings run 1 to 10: a mean this far from the global one is as far as quality can count. */
+		const val RATING_HALF_SPAN = 4.5
+
+		/** Readership adds at most this fraction, reached at [READERSHIP_SATURATION] readers. */
+		const val READERSHIP_WEIGHT = 0.1
+		const val READERSHIP_SATURATION = 1_000.0
+
+		/** The most an era gap can cost: works decades apart keep four fifths of their score. */
+		const val YEAR_FLOOR = 0.8
+
+		/** Years over which an era gap costs about two thirds of what it ever can. */
+		const val YEAR_SCALE = 10.0
+
+		/**
+		 * Most recently opened works each account contributes to co-reading, so one account adds at
+		 * most `200 * 199 / 2` pairs however much it has opened.
+		 */
+		const val CO_READ_PER_ACCOUNT = 200
+
+		/**
+		 * Accounts a pair needs before it is stored. Co-reading is the most personal signal derived
+		 * here, so this is well above the two the source list needs and the three a genre needs.
+		 */
+		const val CO_READ_MIN_READERS = 10
+
+		/** Capped (account, work) rows per pair-counting slice: one slice is one statement. */
+		const val CO_READ_ROWS_PER_BATCH = 200_000L
+
+		/** Observations per account bucket when reading them in: one bucket is one statement. */
+		const val CO_READ_OBSERVATIONS_PER_BUCKET = 500_000L
+		const val CO_READ_MAX_BATCHES = 256
 
 		/** Half-life on coverage freshness. Slower than the score's seven days: a source keeping a
 		 * finished series is still carrying it, it just has nothing new to report. */

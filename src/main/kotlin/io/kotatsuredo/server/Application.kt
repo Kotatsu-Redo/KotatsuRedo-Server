@@ -54,6 +54,7 @@ import io.kotatsuredo.server.catalogue.MangaUpdatesCatalogue
 import io.kotatsuredo.server.telemetry.TelemetryRepository
 import io.kotatsuredo.server.telemetry.TelemetryRetention
 import io.kotatsuredo.server.telemetry.TelemetryService
+import io.kotatsuredo.server.works.CoReading
 import io.kotatsuredo.server.works.WorkDeduplicator
 import io.kotatsuredo.server.works.WorkEnricher
 import io.kotatsuredo.server.works.WorkLinker
@@ -160,6 +161,8 @@ fun main(args: Array<String>) {
 	WorkDeduplicator(workRepository, ratings).schedule(jobs)
 	// Describes newly seen works after the fact, so no reader waits on Kitsu or MangaUpdates.
 	WorkEnricher(workRepository, catalogue, ratings).schedule(jobs)
+	// Counts which works the same accounts open, for suggestions; aggregate, rebuilt daily.
+	CoReading(workRepository).schedule(jobs)
 	jobs.launch(Dispatchers.IO) {
 		while (isActive) {
 			delay(60 * 60 * 1000L)
