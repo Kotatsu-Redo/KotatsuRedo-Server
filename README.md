@@ -85,6 +85,7 @@ access path: a user who does not want an identity turns the feature off in the a
 | `POST /v1/works/resolve` | Batch: source fingerprints → work ids. The hot path. |
 | `POST /v1/works/link` | A user migration confirming two source entries are the same work. |
 | `POST /v1/works/{id}/dispute` | "This work is wrong." Files a queue item; duplicates collapse. `202`. |
+| `GET /v1/public/charts?window=day\|week\|month` | No account needed. Top works by ratings and comments in the window, `&type=manga\|manhwa\|manhua&genre=&limit=1..50`. Never lists adult content. `max-age=900`. |
 | `GET /v1/works/{id}/rating` | Aggregate plus this caller's own value. |
 | `PUT`/`DELETE /v1/works/{id}/rating` | Set or clear it. Half-star steps, `1..10`. |
 | `GET /v1/works/{id}/comments` | A page of root comments with their replies. `?sort=top\|new&lang=&chapter=&limit=&offset=` |

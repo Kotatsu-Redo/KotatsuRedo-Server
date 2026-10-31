@@ -6,6 +6,7 @@ import io.kotatsuredo.server.auth.RateLimiter
 import io.kotatsuredo.server.auth.networkKey
 import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.ops.ServerMetrics
+import io.kotatsuredo.server.works.Genres
 import io.kotatsuredo.server.works.WorkLimits
 import io.kotatsuredo.server.works.WorkRepository
 import io.ktor.http.HttpHeaders
@@ -26,6 +27,7 @@ import io.ktor.server.routing.route
 fun Route.publicRoutes(
 	works: WorkRepository,
 	similarWorks: SimilarWorks,
+	charts: Charts,
 	limiter: RateLimiter,
 ) = route("/public") {
 
@@ -57,7 +59,42 @@ fun Route.publicRoutes(
 		call.response.header(HttpHeaders.CacheControl, "public, max-age=21600")
 		call.respond(similarWorks.responseFor(workId))
 	}
+
+	/**
+	 * What readers are rating and discussing right now.
+	 *
+	 * Ranked only on what people chose to publish - ratings and comments inside the window - and never
+	 * on what they merely opened. Nothing adult is listed, whatever is asked. See
+	 * [WorkRepository.chartCandidates].
+	 *
+	 * A genre outside the vocabulary is an empty chart rather than an error, as everywhere else an
+	 * unknown label is dropped rather than refused: an app newer than this server keeps working.
+	 */
+	get("/charts") {
+		val parameters = call.request.queryParameters
+		val window = ChartWindow.parse(parameters["window"]) ?: throw ApiException(ApiError.BadRequest("window"))
+		val type = parameters["type"]
+		if (type != null && type !in CHART_TYPES) throw ApiException(ApiError.BadRequest("type"))
+		val limit = parameters["limit"]?.let { raw ->
+			raw.toIntOrNull()?.takeIf { it in 1..MAX_CHART_LIMIT } ?: throw ApiException(ApiError.BadRequest("limit"))
+		} ?: DEFAULT_CHART_LIMIT
+		val rawGenre = parameters["genre"]
+		val genre = rawGenre?.let(Genres::parse)
+		call.enforceNetworkLimit(limiter, RateLimiter.Bucket.PUBLIC_LOOKUP)
+
+		val response = if (rawGenre != null && (genre == null || genre in Charts.EXCLUDED_GENRES)) {
+			charts.emptyFor(window)
+		} else {
+			charts.responseFor(ChartQuery(window, type, genre, limit))
+		}
+		call.response.header(HttpHeaders.CacheControl, "public, max-age=900")
+		call.respond(response)
+	}
 }
+
+private val CHART_TYPES = setOf("manga", "manhwa", "manhua")
+private const val DEFAULT_CHART_LIMIT = 30
+private const val MAX_CHART_LIMIT = 50
 
 /** The per-network allowance alone, for routes with no account to charge. */
 private fun ApplicationCall.enforceNetworkLimit(limiter: RateLimiter, bucket: RateLimiter.Bucket) {

@@ -1,5 +1,6 @@
 package io.kotatsuredo.server.works
 
+import io.kotatsuredo.server.comments.CommentState
 import java.sql.Connection
 import java.sql.Statement
 import java.sql.Types
@@ -1757,6 +1758,103 @@ class WorkRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	/**
+	 * Works readers rated or discussed in the last [hours], best first, every one that qualifies:
+	 * whether it can be opened is the caller's check, through [sourcesForAll].
+	 *
+	 *     activity = 2 * distinct raters + distinct commenters
+	 *     quality  = the work's Bayesian rating, or [CHART_DEFAULT_QUALITY] with no ratings at all
+	 *     score    = activity * quality / 10
+	 *
+	 * A public ranking, so its inputs are only what people chose to publish: ratings and comments,
+	 * never `work_alias_observation` or `work_genre_observation`, which record what they opened.
+	 * [CHART_ACCOUNTS_REQUIRED] distinct accounts are needed, so that no entry describes one person.
+	 * A sanctioned account counts for nothing, and neither does a comment nobody else can see.
+	 *
+	 * Only `updated_at` is compared for ratings: it starts equal to `created_at` and only moves
+	 * forward, so a new rating and a changed one both show there.
+	 *
+	 * Nothing adult is ever on a chart, and the flag alone would not ensure that: a work can carry an
+	 * adult genre without it, the type comes from whichever source was seen first, and a merge does not
+	 * carry the flag across, so a flagged work merged away leaves the survivor looking clean.
+	 *
+	 * A merge moves everything it can, but a rating by someone who rated both works stays behind on
+	 * the loser, so activity is followed along the merge chain to the work it now belongs to. Counting
+	 * distinct accounts keeps that person from counting twice.
+	 */
+	fun chartCandidates(hours: Int): List<SimilarWork> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				WITH RECURSIVE activity AS (
+					SELECT r.work_id, r.user_id, TRUE AS rated
+					FROM rating r
+					JOIN app_user account ON account.id = r.user_id
+					WHERE r.updated_at >= now() - make_interval(hours => ?)
+					  AND NOT account.is_banned AND NOT account.is_shadowbanned
+					UNION ALL
+					SELECT c.work_id, c.user_id, FALSE
+					FROM comment c
+					JOIN app_user account ON account.id = c.user_id
+					WHERE c.created_at >= now() - make_interval(hours => ?)
+					  AND c.state = ${CommentState.VISIBLE.code} AND c.deleted_at IS NULL
+					  AND NOT account.is_banned AND NOT account.is_shadowbanned
+				),
+				followed AS (
+					SELECT DISTINCT work_id AS origin, work_id AS current_id, 0 AS hops FROM activity
+					UNION ALL
+					SELECT followed.origin, w.merged_into, followed.hops + 1
+					FROM followed
+					JOIN work w ON w.id = followed.current_id
+					WHERE w.merged_into IS NOT NULL AND followed.hops < $MAX_MERGE_HOPS
+				),
+				canonical AS (
+					SELECT DISTINCT ON (origin) origin, current_id FROM followed ORDER BY origin, hops DESC
+				),
+				merged_nsfw AS (
+					SELECT w.merged_into AS work_id, 0 AS hops
+					FROM work w
+					WHERE w.nsfw AND w.merged_into IS NOT NULL
+					UNION ALL
+					SELECT w.merged_into, merged_nsfw.hops + 1
+					FROM merged_nsfw
+					JOIN work w ON w.id = merged_nsfw.work_id
+					WHERE w.merged_into IS NOT NULL AND merged_nsfw.hops < $MAX_MERGE_HOPS
+				),
+				tally AS (
+					SELECT canonical.current_id AS work_id,
+					       count(DISTINCT activity.user_id) FILTER (WHERE activity.rated) AS raters,
+					       count(DISTINCT activity.user_id) FILTER (WHERE NOT activity.rated) AS commenters
+					FROM activity
+					JOIN canonical ON canonical.origin = activity.work_id
+					GROUP BY canonical.current_id
+					HAVING count(DISTINCT activity.user_id) >= $CHART_ACCOUNTS_REQUIRED
+				)
+				SELECT w.id, w.canonical_title, w.year, w.content_type, w.nsfw,
+				       (2 * tally.raters + tally.commenters) *
+				           coalesce(agg.bayesian::float8, $CHART_DEFAULT_QUALITY) / 10.0 AS score,
+				       0
+				FROM tally
+				-- Still a redirect at the end of the walk means a cycle: the chain never reached a work.
+				JOIN work w ON w.id = tally.work_id AND w.merged_into IS NULL
+				-- The row outlives the last rating, with a Bayesian of zero that only means no ratings.
+				LEFT JOIN work_rating_agg agg ON agg.work_id = w.id AND agg.count > 0
+				WHERE NOT w.nsfw
+				  AND coalesce(lower(w.content_type), '') <> '$CHART_EXCLUDED_TYPE'
+				  AND w.id NOT IN (SELECT work_id FROM merged_nsfw)
+				  AND NOT EXISTS (
+				        SELECT 1 FROM work_genre g
+				        WHERE g.work_id = w.id AND g.genre IN ($CHART_EXCLUDED_GENRES_SQL)
+				      )
+				ORDER BY score DESC, w.id
+				""".trimIndent(),
+			).use { statement ->
+				statement.setInt(1, hours)
+				statement.setInt(2, hours)
+				statement.executeQuery().use { rows -> rows.readSimilar(coReadOnly = false).values.toList() }
+			}
+		}
+
 	/** The formula documented on [similarTo]. */
 	private fun similarityScore(
 		genre: Double,
@@ -2605,5 +2703,16 @@ class WorkRepository(private val dataSource: DataSource) {
 
 		/** A merge chain longer than this is a cycle, and following it forever is worse than stopping. */
 		const val MAX_MERGE_HOPS = 8
+
+		/** Distinct accounts active on a work in a window before a chart lists it. One is a person. */
+		const val CHART_ACCOUNTS_REQUIRED = 2
+
+		/** The quality a chart assumes for a work nobody has rated, on the 1 to 10 rating scale. */
+		const val CHART_DEFAULT_QUALITY = 7.0
+
+		const val CHART_EXCLUDED_TYPE = "hentai"
+
+		/** Must stay [io.kotatsuredo.server.routes.Charts.EXCLUDED_GENRES]; a route test pins that they agree. */
+		const val CHART_EXCLUDED_GENRES_SQL = "'adult', 'ecchi'"
 	}
 }

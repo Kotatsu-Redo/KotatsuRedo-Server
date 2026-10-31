@@ -18,6 +18,7 @@ import io.kotatsuredo.server.plugins.configureStatusPages
 import io.kotatsuredo.server.routes.healthRoutes
 import io.kotatsuredo.server.routes.exportRoutes
 import io.kotatsuredo.server.routes.identityRoutes
+import io.kotatsuredo.server.routes.Charts
 import io.kotatsuredo.server.routes.SimilarWorks
 import io.kotatsuredo.server.routes.publicRoutes
 import io.kotatsuredo.server.ratings.RatingRepository
@@ -245,6 +246,9 @@ fun Application.module(
 	// One instance for both similar-works routes, so the authenticated and anonymous answers share
 	// the cache rather than each building their own.
 	val similarWorks = works?.let(::SimilarWorks)
+	val charts = works?.let(::Charts)
+	// On the application's own scope, so it stops with it
+	charts?.schedule(this)
 
 	routing {
 		route("/v1") {
@@ -255,8 +259,8 @@ fun Application.module(
 			}
 			// No account involved, so outside the identity block: these must work for an app that
 			// never switched the community features on.
-			if (works != null && similarWorks != null) {
-				publicRoutes(works, similarWorks, limiter)
+			if (works != null && similarWorks != null && charts != null) {
+				publicRoutes(works, similarWorks, charts, limiter)
 			}
 			if (identities != null) {
 				identityRoutes(identities, limiter, rulesUrl)

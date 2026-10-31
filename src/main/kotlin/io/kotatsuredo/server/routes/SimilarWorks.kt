@@ -1,6 +1,8 @@
 package io.kotatsuredo.server.routes
 
+import io.kotatsuredo.server.works.SimilarWork
 import io.kotatsuredo.server.works.WorkRepository
+import io.kotatsuredo.server.works.WorkSource
 import java.time.Clock
 import java.time.Duration
 
@@ -58,7 +60,7 @@ class SimilarWorks(
 		private const val INITIAL_CAPACITY = 256
 
 		/** Enough for the app to pick one the reader has enabled, without listing every mirror. */
-		private const val MAX_SOURCES_PER_SIMILAR = 5
+		internal const val MAX_SOURCES_PER_SIMILAR = 5
 
 		/** Three queries for the candidates' details, whatever their number: genres and sources batched. */
 		private fun buildResponse(works: WorkRepository, workId: Long): SimilarWorksResponse {
@@ -73,27 +75,30 @@ class SimilarWorks(
 					// reader could open: worth nothing to list.
 					.filter { !it.coReadOnly || !sources[it.workId].isNullOrEmpty() }
 					.map { candidate ->
-						SimilarWorkDto(
-							workId = candidate.workId.toString(),
-							title = candidate.title,
-							year = candidate.year,
-							contentType = candidate.contentType,
-							nsfw = candidate.nsfw,
-							genres = genres[candidate.workId].orEmpty(),
-							sharedGenres = candidate.sharedGenres,
-							score = candidate.score,
-							sources = sources[candidate.workId].orEmpty().map {
-								WorkSourceDto(
-									source = it.source,
-									key = it.sourceKey,
-									reporters = it.reporters,
-									lastSeen = it.lastSeen.toString(),
-									verified = it.verified,
-								)
-							},
-						)
+						candidate.toDto(genres[candidate.workId].orEmpty(), sources[candidate.workId].orEmpty())
 					},
 			)
 		}
 	}
 }
+
+/** One work as the app parses it, shared by every answer that lists works to open. */
+internal fun SimilarWork.toDto(genres: List<String>, sources: List<WorkSource>) = SimilarWorkDto(
+	workId = workId.toString(),
+	title = title,
+	year = year,
+	contentType = contentType,
+	nsfw = nsfw,
+	genres = genres,
+	sharedGenres = sharedGenres,
+	score = score,
+	sources = sources.map {
+		WorkSourceDto(
+			source = it.source,
+			key = it.sourceKey,
+			reporters = it.reporters,
+			lastSeen = it.lastSeen.toString(),
+			verified = it.verified,
+		)
+	},
+)
