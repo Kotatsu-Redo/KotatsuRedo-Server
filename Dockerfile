@@ -18,6 +18,13 @@ RUN ./gradlew --no-daemon --quiet installDist
 FROM eclipse-temurin:17-jre@sha256:c6f2875c05ea10f16398bdc5f73405c384991506f2f1ead8bcc6582ae8adea79
 WORKDIR /app
 
+# The base image is pinned, so its OS packages only age. Without this a rebuild would silently undo
+# security updates already running on the server. Docker caches this layer, so run
+# `docker builder prune` first when a deploy should pick up newer packages.
+RUN apt-get update -qq \
+	&& DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq -o Dpkg::Options::=--force-confold \
+	&& rm -rf /var/lib/apt/lists/*
+
 RUN useradd --system --uid 10001 --create-home kotatsu
 COPY --from=build --chown=kotatsu:kotatsu /app/build/install/kotatsuredo-server ./
 
