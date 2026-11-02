@@ -129,6 +129,7 @@ data class QueuedCommentDto(
 	val author: String,
 	@SerialName("author_banned") val authorBanned: Boolean,
 	@SerialName("author_shadowbanned") val authorShadowbanned: Boolean,
+	@SerialName("author_supporter") val authorSupporter: Boolean = false,
 	@SerialName("author_removed_count") val authorRemovedCount: Int,
 	@SerialName("flagged_rule") val flaggedRule: String? = null,
 )
@@ -269,6 +270,7 @@ private fun QueuedComment.toDto() = QueuedCommentDto(
 	author = authorName,
 	authorBanned = authorIsBanned,
 	authorShadowbanned = authorIsShadowbanned,
+	authorSupporter = authorIsSupporter,
 	authorRemovedCount = authorRemovedCount,
 	flaggedRule = flaggedRule,
 )
@@ -637,6 +639,18 @@ fun Route.adminRoutes(
 			val session = call.requireEnrolled(moderation)
 			val reason = call.receive<ReasonRequest>().reason
 			call.respondOk(moderation.resetNickname(session.moderator, call.stringId(), reason))
+		}
+
+		post("/users/{id}/supporter") {
+			val session = call.requireEnrolled(moderation)
+			val reason = call.receive<ReasonRequest>().reason
+			call.respondOk(moderation.setSupporter(session.moderator, call.stringId(), true, reason))
+		}
+
+		post("/users/{id}/unsupporter") {
+			val session = call.requireEnrolled(moderation)
+			val reason = call.receive<ReasonRequest>().reason
+			call.respondOk(moderation.setSupporter(session.moderator, call.stringId(), false, reason))
 		}
 
 		post("/users/{id}/ban-device") {

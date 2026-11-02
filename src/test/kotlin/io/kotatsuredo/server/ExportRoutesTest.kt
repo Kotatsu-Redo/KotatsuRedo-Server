@@ -151,6 +151,29 @@ class ExportRoutesTest {
 		assertEquals(listOf("romance"), export.genres.map { it.genre }, "only recognised terms are held")
 	}
 
+	/** The privacy notice lists what the export holds, and these two are in that list. */
+	@Test
+	fun `the export contains the covers the account reported and whether it is a supporter`() = testApplication {
+		setup()
+		val client = createClient { install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) } }
+		val me = user("cover-reader")
+		val other = user("cover-someone-else")
+		works.observeCover("SOURCE_A", "/manga/some-manga", me.id, "https://cdn.example.org/mine.jpg")
+		works.observeCover("SOURCE_A", "/manga/some-manga", other.id, "https://cdn.example.org/theirs.jpg")
+		source.connection.use { connection ->
+			connection.createStatement().use {
+				it.execute("UPDATE app_user SET is_supporter = TRUE WHERE id = '${me.id}'")
+			}
+		}
+
+		val export = client.get("/v1/identity/export") {
+			header(HttpHeaders.Authorization, "Bearer ${testSecret("cover-reader")}")
+		}.body<ExportDto>()
+
+		assertEquals(listOf("https://cdn.example.org/mine.jpg"), export.covers.map { it.coverUrl })
+		assertTrue(export.isSupporter)
+	}
+
 	@Test
 	fun `the export crosses a storage page without dropping records`() = testApplication {
 		setup()

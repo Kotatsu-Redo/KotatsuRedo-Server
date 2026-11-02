@@ -13,6 +13,7 @@ object AppUsers : Table("app_user") {
 	val isBanned = bool("is_banned")
 	val banReason = text("ban_reason").nullable()
 	val isShadowbanned = bool("is_shadowbanned")
+	val isSupporter = bool("is_supporter")
 
 	override val primaryKey = PrimaryKey(id)
 }

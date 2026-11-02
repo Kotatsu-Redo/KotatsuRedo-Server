@@ -69,6 +69,11 @@ services:
       RATE_COMMENTS_NEW: ${RATE_COMMENTS_NEW:-5}
       RATE_COMMENTS_NORMAL: ${RATE_COMMENTS_NORMAL:-20}
       RATE_COMMENTS_ESTABLISHED: ${RATE_COMMENTS_ESTABLISHED:-40}
+      # Manga newly resolved per hour, by trust tier. A reader who runs out sees no ratings or
+      # comments on anything they have not opened before until the hour turns over.
+      RATE_WORK_MUTATION_NEW: ${RATE_WORK_MUTATION_NEW:-100}
+      RATE_WORK_MUTATION_NORMAL: ${RATE_WORK_MUTATION_NORMAL:-300}
+      RATE_WORK_MUTATION_ESTABLISHED: ${RATE_WORK_MUTATION_ESTABLISHED:-600}
       # The first-moderator bootstrap. Empty by default and empty is the same as unset, because
       # Config trims blanks - so an unclaimed panel needs these set, and a claimed one does not care.
       MOD_BOOTSTRAP_USERNAME: ${MOD_BOOTSTRAP_USERNAME:-}

@@ -87,7 +87,13 @@ class CommentService(
 		)
 		val stored = requireNotNull(repository.find(id)) { "comment $id vanished after insert" }
 		return PostResult.Posted(
-			CommentView(stored, Nicknames.display(author.nickname, author.id), myVote = 0, isMine = true),
+			CommentView(
+				stored,
+				Nicknames.display(author.nickname, author.id),
+				myVote = 0,
+				isMine = true,
+				isSupporter = author.isSupporter,
+			),
 		)
 	}
 
@@ -157,6 +163,7 @@ class CommentService(
 				authorName = Nicknames.display(editor.nickname, editor.id),
 				myVote = repository.myVote(commentId, editor.id),
 				isMine = true,
+				isSupporter = editor.isSupporter,
 			),
 		)
 	}
@@ -258,7 +265,9 @@ class CommentService(
 	fun purgeAllBy(userId: String): Int = repository.tombstoneAllBy(userId)
 
 	private fun decorate(comments: List<Comment>, viewer: Identity): List<CommentView> {
-		val names = repository.authorNames(comments.mapNotNull { it.userId }.toSet())
+		val authors = comments.mapNotNull { it.userId }.toSet()
+		val names = repository.authorNames(authors)
+		val supporters = repository.supporters(authors)
 		val votes = repository.myVotes(comments.map { it.id }, viewer.id)
 		return comments.map { comment ->
 			val author = comment.userId
@@ -270,6 +279,7 @@ class CommentService(
 				authorName = if (anonymous) "" else Nicknames.display(names[author], author!!),
 				myVote = votes[comment.id] ?: 0,
 				isMine = author != null && author == viewer.id,
+				isSupporter = !anonymous && author in supporters,
 			)
 		}
 	}

@@ -10,6 +10,7 @@ import io.kotatsuredo.server.works.Genres
 import io.kotatsuredo.server.works.WorkLimits
 import io.kotatsuredo.server.works.WorkRepository
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
@@ -69,6 +70,9 @@ fun Route.publicRoutes(
 	 *
 	 * A genre outside the vocabulary is an empty chart rather than an error, as everywhere else an
 	 * unknown label is dropped rather than refused: an app newer than this server keeps working.
+	 *
+	 * The app asks for one whole chart and narrows it down itself, so it never has to say what it looks for. A
+	 * chart it already has costs a reply of no content, for as long as nothing has changed.
 	 */
 	get("/charts") {
 		val parameters = call.request.queryParameters
@@ -88,13 +92,20 @@ fun Route.publicRoutes(
 			charts.responseFor(ChartQuery(window, type, genre, limit))
 		}
 		call.response.header(HttpHeaders.CacheControl, "public, max-age=900")
-		call.respond(response)
+		// The address says everything else about the answer, so when it was made is all a tag has to say. Looked for
+		// inside what comes back, since a proxy that compresses an answer is free to reword its tag.
+		call.response.header(HttpHeaders.ETag, "\"${response.generatedAt}\"")
+		if (call.request.headers[HttpHeaders.IfNoneMatch]?.contains(response.generatedAt.toString()) == true) {
+			call.respond(HttpStatusCode.NotModified)
+		} else {
+			call.respond(response)
+		}
 	}
 }
 
 private val CHART_TYPES = setOf("manga", "manhwa", "manhua")
 private const val DEFAULT_CHART_LIMIT = 30
-private const val MAX_CHART_LIMIT = 50
+private const val MAX_CHART_LIMIT = 200
 
 /** The per-network allowance alone, for routes with no account to charge. */
 private fun ApplicationCall.enforceNetworkLimit(limiter: RateLimiter, bucket: RateLimiter.Bucket) {

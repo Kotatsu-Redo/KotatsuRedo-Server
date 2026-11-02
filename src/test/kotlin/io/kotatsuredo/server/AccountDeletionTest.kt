@@ -59,6 +59,20 @@ class AccountDeletionTest {
 	private fun user(seed: String): Identity =
 		(identities.hello(seed, DeviceIdentifiers("dev-$seed", null)) as HelloOutcome.Ok).identity
 
+	/** "Your notes of the manga you opened are erased", and the cover it saw is one of those notes. */
+	@Test
+	fun `deleting an account erases the covers it reported`() {
+		val leaving = user("leaving-covers")
+		val staying = user("staying-covers")
+		works.observeCover("MANGADEX", "x1", leaving.id, "https://cdn.example.org/x1.jpg")
+		works.observeCover("MANGADEX", "x1", staying.id, "https://cdn.example.org/x1.jpg")
+
+		identities.deleteEverything(leaving.id)
+
+		assertEquals(emptyList(), works.coverObservationsByPage(leaving.id, null, 10))
+		assertEquals(1, works.coverObservationsByPage(staying.id, null, 10).size)
+	}
+
 	@Test
 	fun `deleting an account does not delete other people's replies`() {
 		val workId = works.createWork("Some Manga", 2018, "manga", nsfw = false)

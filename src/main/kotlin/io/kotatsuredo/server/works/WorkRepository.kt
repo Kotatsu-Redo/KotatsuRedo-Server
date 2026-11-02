@@ -90,6 +90,14 @@ data class AliasObservation(
 	val updatedAt: java.time.OffsetDateTime,
 )
 
+/** A cover address an account reported for a source entry, for the account's own data export. */
+data class CoverObservation(
+	val source: String,
+	val sourceKey: String,
+	val coverUrl: String,
+	val updatedAt: java.time.OffsetDateTime,
+)
+
 /** One account's genre report for a work, as the data export reports it. */
 data class GenreObservation(
 	val workId: Long,
@@ -107,6 +115,8 @@ data class WorkSource(
 	val lastSeen: LocalDate,
 	/** True once the alias passed the resolver's own quorum. */
 	val verified: Boolean,
+	/** An address enough accounts agree on for this entry's cover. Null is the usual answer. */
+	val coverUrl: String? = null,
 )
 
 class WorkRepository(private val dataSource: DataSource) {
@@ -1077,6 +1087,108 @@ class WorkRepository(private val dataSource: DataSource) {
 	}
 
 	/**
+	 * Remembers the cover address this account saw on a source entry, replacing what it reported before.
+	 *
+	 * Other readers' apps load what is served from here, which hands whoever controls the address those readers'
+	 * IP addresses and a picture of their choosing. So nothing is served on anyone's word: see [agreedCovers].
+	 */
+	fun observeCover(source: String, sourceKey: String, userId: String, coverUrl: String) {
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				INSERT INTO work_cover_observation (source, source_key, user_id, cover_url)
+				VALUES (?, ?, ?, ?)
+				ON CONFLICT (source, source_key, user_id)
+				DO UPDATE SET cover_url = EXCLUDED.cover_url, updated_at = now()
+				WHERE work_cover_observation.cover_url IS DISTINCT FROM EXCLUDED.cover_url
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, source)
+				statement.setString(2, sourceKey)
+				statement.setString(3, userId)
+				statement.setString(4, coverUrl)
+				statement.executeUpdate()
+			}
+		}
+	}
+
+	/**
+	 * The address several established accounts independently reported for each entry, where there is one.
+	 *
+	 * Exact agreement, so an address that differs per reader, like a signed one, simply never appears and the
+	 * app falls back to asking the site. Only an account past the new tier counts: at least a day old and active on
+	 * three days, the same bar as `user_trust` tier 1, so that making a few to agree with each other takes patience.
+	 * Written out rather than joined to that view, which counts every active day of every reader of every entry.
+	 *
+	 * A cover is an extra on top of the list of sources, so this failing costs the covers and nothing else.
+	 */
+	private fun agreedCovers(connection: java.sql.Connection, entries: Collection<WorkSource>): Map<Pair<String, String>, String> {
+		if (entries.isEmpty()) return emptyMap()
+		// One entry can be listed under two works, and asking for it twice would count each report twice.
+		val wanted = entries.map { it.source to it.sourceKey }.distinct()
+		return runCatching {
+			connection.prepareStatement(
+				"""
+				SELECT observation.source, observation.source_key, observation.cover_url
+				FROM unnest(?::text[], ?::text[]) AS wanted(source, source_key)
+				JOIN work_cover_observation observation
+				  ON observation.source = wanted.source AND observation.source_key = wanted.source_key
+				JOIN app_user account ON account.id = observation.user_id
+				WHERE NOT account.is_banned AND NOT account.is_shadowbanned
+				  AND account.created_at < now() - interval '1 day'
+				  AND EXISTS (SELECT 1 FROM user_active_day active WHERE active.user_id = account.id OFFSET 2)
+				GROUP BY observation.source, observation.source_key, observation.cover_url
+				HAVING count(*) >= ?
+				ORDER BY count(*)
+				""".trimIndent(),
+			).use { statement ->
+				statement.setArray(1, connection.createArrayOf("text", wanted.map { it.first }.toTypedArray()))
+				statement.setArray(2, connection.createArrayOf("text", wanted.map { it.second }.toTypedArray()))
+				statement.setInt(3, COVER_AGREEMENT_REQUIRED)
+				statement.executeQuery().use { rows ->
+					// Most agreed last, so that it is the one left standing
+					buildMap { while (rows.next()) put(rows.getString(1) to rows.getString(2), rows.getString(3)) }
+				}
+			}
+		}.getOrElse { error ->
+			log.warn("Could not look up agreed covers; answering without them", error)
+			emptyMap()
+		}
+	}
+
+	fun coverObservationsByPage(userId: String, after: Pair<String, String>?, limit: Int): List<CoverObservation> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT source, source_key, cover_url, updated_at
+				FROM work_cover_observation
+				WHERE user_id = ? AND (source, source_key) > (?, ?)
+				ORDER BY source, source_key
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setString(2, after?.first.orEmpty())
+				statement.setString(3, after?.second.orEmpty())
+				statement.setInt(4, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							add(
+								CoverObservation(
+									source = rows.getString(1),
+									sourceKey = rows.getString(2),
+									coverUrl = rows.getString(3),
+									updatedAt = rows.getObject(4, java.time.OffsetDateTime::class.java),
+								),
+							)
+						}
+					}
+				}
+			}
+		}
+
+	/**
 	 * Genres from a catalogue, which are curated upstream and need no quorum.
 	 *
 	 * A genre both sides know is marked as the catalogue's, because that is the stronger claim.
@@ -1148,7 +1260,12 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * same count for the most common of this work's genres. Candidates come from the work's
 	 * [SIMILAR_SEED_GENRES] rarest genres, because `action` alone would sweep in tens of thousands of
 	 * works to score and throw away, and need [SIMILAR_SHARED_REQUIRED] genres in common: one is a
-	 * coincidence.
+	 * coincidence. That sum is then scaled by `sqrt(shared / theirGenres)`: a work tagged with sixteen genres
+	 * shares a few with almost anything, and without this it turns up near the top of every answer ahead of works
+	 * that are actually about the same thing.
+	 *
+	 * Adult works only answer for adult works: a work flagged adult, or carrying `adult` or `ecchi` when the work
+	 * asked about does not, is never a candidate. See [SUITED_TO_SEED].
 	 *
 	 * **Co-reading** says what genres cannot: that the people who read one thing read another. The
 	 * [CO_READ_NEIGHBOURS] works most often opened by the same accounts (see [refreshCoReading]) join
@@ -1217,6 +1334,9 @@ class WorkRepository(private val dataSource: DataSource) {
 		connection.prepareStatement(
 			"""
 			WITH target AS (SELECT genre FROM work_genre WHERE work_id = ?),
+			seed AS (
+				SELECT nsfw OR EXISTS (SELECT 1 FROM target WHERE genre = 'adult') AS adult FROM work WHERE id = ?
+			),
 			stats AS (
 				SELECT g.genre, count(*)::float8 AS works
 				FROM work_genre g JOIN target t ON t.genre = g.genre
@@ -1224,26 +1344,31 @@ class WorkRepository(private val dataSource: DataSource) {
 			),
 			commonest AS (SELECT max(works) AS works FROM stats),
 			rare AS (SELECT genre FROM stats ORDER BY works LIMIT $SIMILAR_SEED_GENRES),
+			-- Those with the most of them first. Which ones made the cut used to be up to the plan, and most of a
+			-- common genre shares nothing else with this work, which left too few to score on a big catalogue.
 			candidates AS (
-				SELECT DISTINCT wg.work_id
+				SELECT wg.work_id
 				FROM work_genre wg JOIN rare r ON r.genre = wg.genre
 				WHERE wg.work_id <> ?
+				GROUP BY wg.work_id
+				ORDER BY count(*) DESC, wg.work_id
 				LIMIT $SIMILAR_CANDIDATES
 			),
 			scored AS (
 				SELECT c.work_id,
-				       sum(ln(1 + (SELECT works FROM commonest) / s.works)) AS score,
-				       count(*) AS shared
+				       sum(ln(1 + (SELECT works FROM commonest) / s.works)) *
+				         sqrt(count(s.genre)::float8 / count(*)) AS score,
+				       count(s.genre) AS shared
 				FROM candidates c
 				JOIN work_genre wg ON wg.work_id = c.work_id
-				JOIN stats s ON s.genre = wg.genre
+				LEFT JOIN stats s ON s.genre = wg.genre
 				GROUP BY c.work_id
-				HAVING count(*) >= $SIMILAR_SHARED_REQUIRED
+				HAVING count(s.genre) >= $SIMILAR_SHARED_REQUIRED
 			)
 			SELECT w.id, w.canonical_title, w.year, w.content_type, w.nsfw, scored.score, scored.shared
 			FROM scored
 			JOIN work w ON w.id = scored.work_id AND w.merged_into IS NULL
-			WHERE $SAME_CONTENT_TYPE
+			WHERE ($SAME_CONTENT_TYPE) AND $SUITED_TO_SEED
 			ORDER BY scored.score DESC, scored.shared DESC, w.id
 			LIMIT ?
 			""".trimIndent(),
@@ -1252,7 +1377,8 @@ class WorkRepository(private val dataSource: DataSource) {
 			statement.setLong(2, workId)
 			statement.setLong(3, workId)
 			statement.setLong(4, workId)
-			statement.setInt(5, limit)
+			statement.setLong(5, workId)
+			statement.setInt(6, limit)
 			statement.executeQuery().use { rows -> rows.readSimilar(coReadOnly = false) }
 		}
 
@@ -1265,6 +1391,9 @@ class WorkRepository(private val dataSource: DataSource) {
 		return connection.prepareStatement(
 			"""
 			WITH target AS (SELECT genre FROM work_genre WHERE work_id = ?),
+			seed AS (
+				SELECT nsfw OR EXISTS (SELECT 1 FROM target WHERE genre = 'adult') AS adult FROM work WHERE id = ?
+			),
 			stats AS (
 				SELECT g.genre, count(*)::float8 AS works
 				FROM work_genre g JOIN target t ON t.genre = g.genre
@@ -1273,9 +1402,10 @@ class WorkRepository(private val dataSource: DataSource) {
 			commonest AS (SELECT max(works) AS works FROM stats),
 			scored AS (
 				SELECT wg.work_id,
-				       sum(ln(1 + (SELECT works FROM commonest) / s.works)) AS score,
-				       count(*) AS shared
-				FROM work_genre wg JOIN stats s ON s.genre = wg.genre
+				       sum(ln(1 + (SELECT works FROM commonest) / s.works)) *
+				         sqrt(count(s.genre)::float8 / count(*)) AS score,
+				       count(s.genre) AS shared
+				FROM work_genre wg LEFT JOIN stats s ON s.genre = wg.genre
 				WHERE wg.work_id = ANY(?)
 				GROUP BY wg.work_id
 			)
@@ -1284,16 +1414,17 @@ class WorkRepository(private val dataSource: DataSource) {
 			FROM work w
 			LEFT JOIN scored ON scored.work_id = w.id
 			WHERE w.id = ANY(?) AND w.id <> ? AND w.merged_into IS NULL
-			  AND ($SAME_CONTENT_TYPE)
+			  AND ($SAME_CONTENT_TYPE) AND $SUITED_TO_SEED
 			""".trimIndent(),
 		).use { statement ->
 			val array = connection.createArrayOf("bigint", ids.toTypedArray())
 			statement.setLong(1, workId)
-			statement.setArray(2, array)
+			statement.setLong(2, workId)
 			statement.setArray(3, array)
-			statement.setLong(4, workId)
+			statement.setArray(4, array)
 			statement.setLong(5, workId)
 			statement.setLong(6, workId)
+			statement.setLong(7, workId)
 			statement.executeQuery().use { rows -> rows.readSimilar(coReadOnly = true) }
 		}
 	}
@@ -1752,7 +1883,10 @@ class WorkRepository(private val dataSource: DataSource) {
 							),
 						)
 					}
-					result
+					val covers = agreedCovers(connection, result.values.flatten())
+					result.mapValues { (_, sources) ->
+						sources.map { it.copy(coverUrl = covers[it.source to it.sourceKey]) }
+					}
 				}
 			}
 		}
@@ -2609,6 +2743,9 @@ class WorkRepository(private val dataSource: DataSource) {
 	}
 
 	private companion object {
+
+		private val log = org.slf4j.LoggerFactory.getLogger(WorkRepository::class.java)
+
 		const val ALIAS_AGREEMENT_REQUIRED = 5
 
 		/**
@@ -2626,11 +2763,17 @@ class WorkRepository(private val dataSource: DataSource) {
 		 */
 		const val GENRE_AGREEMENT_REQUIRED = 3
 
+		/** Accounts that must report the very same cover address before anybody else's app is sent to it. */
+		const val COVER_AGREEMENT_REQUIRED = 3
+
 		/** A reader picks from a handful; the rest is a list nobody scrolls and a bigger response. */
 		const val MAX_SOURCES_PER_WORK = 40
 
-		/** A screenful of suggestions per seed work; the app blends several seeds of its own. */
-		const val MAX_SIMILAR = 20
+		/**
+		 * A couple of screenfuls per seed work; the app blends several seeds of its own and leaves out what
+		 * the reader has, which for a big library can be most of an answer.
+		 */
+		const val MAX_SIMILAR = 40
 
 		/** Genres that seed the candidate set, rarest first - see [similarTo]. */
 		const val SIMILAR_SEED_GENRES = 3
@@ -2714,5 +2857,14 @@ class WorkRepository(private val dataSource: DataSource) {
 
 		/** Must stay [io.kotatsuredo.server.routes.Charts.EXCLUDED_GENRES]; a route test pins that they agree. */
 		const val CHART_EXCLUDED_GENRES_SQL = "'adult', 'ecchi'"
+
+		/**
+		 * Nobody reading a school romance asked for porn, and on real answers nearly half of what came back for
+		 * ordinary series was adult. Ecchi is fine for someone already reading ecchi. Needs `target` and `seed`.
+		 */
+		const val SUITED_TO_SEED = "((SELECT adult FROM seed) OR (" +
+			"NOT w.nsfw AND NOT EXISTS (" +
+			"SELECT 1 FROM work_genre own WHERE own.work_id = w.id AND own.genre IN ($CHART_EXCLUDED_GENRES_SQL) " +
+			"AND own.genre NOT IN (SELECT genre FROM target))))"
 	}
 }

@@ -63,7 +63,7 @@ class PolicyClaimsTest {
 		assertEquals(
 			setOf(
 				"id", "secret_sha256", "nickname", "created_at", "last_seen_at",
-				"is_banned", "ban_reason", "is_shadowbanned",
+				"is_banned", "ban_reason", "is_shadowbanned", "is_supporter",
 			),
 			user,
 			"app_user changed shape - check legal/PRIVACY.md still describes it",

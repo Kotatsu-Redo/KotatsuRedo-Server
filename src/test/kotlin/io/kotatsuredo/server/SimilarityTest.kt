@@ -6,6 +6,7 @@ import io.kotatsuredo.server.identity.HelloOutcome
 import io.kotatsuredo.server.identity.IdentityRepository
 import io.kotatsuredo.server.identity.IdentityService
 import io.kotatsuredo.server.routes.SimilarWorks
+import io.kotatsuredo.server.works.CoverUrls
 import io.kotatsuredo.server.works.WorkRepository
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -111,6 +112,212 @@ class SimilarityTest {
 			assertEquals(repository.sourcesFor(id, limit = 5), sources[id].orEmpty(), "sources of $id")
 		}
 		assertEquals(5, sources[crowded]?.size, "the per-work limit applies to each work")
+	}
+
+	// -- covers ------------------------------------------------------------------------------------
+
+	/** Past the new tier: more than a day old and active on three days. */
+	private fun established(prefix: String, count: Int) = users(prefix, count).onEach { settled(it) }
+
+	private fun settled(userId: String) {
+		sql("UPDATE app_user SET created_at = now() - interval '2 days' WHERE id = '$userId'")
+		sql(
+			"INSERT INTO user_active_day (user_id, day) " +
+				"SELECT '$userId', CURRENT_DATE - n FROM generate_series(1, 3) n ON CONFLICT DO NOTHING",
+		)
+	}
+
+	@Test
+	fun `a cover is only served once enough established accounts report the same address`() {
+		val (a, b, c) = established("cover", 3)
+		val dissenter = established("cover-other", 1).single()
+		val id = work("Covered")
+		seen(id, "MANGADEX", "x1", listOf(a, b, c, dissenter))
+		val url = "https://cdn.example.org/x1.jpg"
+
+		repository.observeCover("MANGADEX", "x1", a, url)
+		assertEquals(null, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl, "one account is not agreement")
+
+		repository.observeCover("MANGADEX", "x1", b, url)
+		assertEquals(null, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl, "nor are two")
+
+		repository.observeCover("MANGADEX", "x1", c, "https://evil.example.net/other.jpg")
+		assertEquals(null, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl, "they have to agree exactly")
+
+		repository.observeCover("MANGADEX", "x1", c, url)
+		assertEquals(url, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl)
+
+		repository.observeCover("MANGADEX", "x1", dissenter, "https://evil.example.net/other.jpg")
+		assertEquals(url, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl, "the lone dissenter loses")
+	}
+
+	@Test
+	fun `new and banned accounts do not count towards a cover`() {
+		val (a, b, c) = established("cover-old", 3)
+		val fresh = user("cover-new")
+		val aged = user("cover-aged")
+		sql("UPDATE app_user SET created_at = now() - interval '30 days' WHERE id = '$aged'")
+		val id = work("Contested")
+		seen(id, "MANGADEX", "x1", listOf(a, b, c, fresh, aged))
+		val url = "https://cdn.example.org/x1.jpg"
+
+		repository.observeCover("MANGADEX", "x1", a, url)
+		repository.observeCover("MANGADEX", "x1", b, url)
+		repository.observeCover("MANGADEX", "x1", fresh, url)
+		assertEquals(null, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl, "a day-old account is required")
+
+		repository.observeCover("MANGADEX", "x1", aged, url)
+		assertEquals(null, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl, "so is having actually been around")
+
+		repository.observeCover("MANGADEX", "x1", c, url)
+		assertEquals(url, repository.sourcesForAll(listOf(id), 5)[id]?.single()?.coverUrl)
+
+		ban(c)
+		assertEquals(null, repository.sourcesForAll(listOf(id), 5)[id]?.firstOrNull()?.coverUrl, "a ban takes the report with it")
+	}
+
+	/** Asking for an entry twice used to count each report twice, so one account's word could be enough. */
+	@Test
+	fun `an entry listed under two works does not count its reports twice`() {
+		val (a, b, c) = established("cover-twice", 3)
+		val d = established("cover-twice-other", 1).single()
+		val first = work("Listed Once")
+		val second = work("Listed Again")
+		seen(first, "MANGADEX", "x1", listOf(a, b))
+		seen(second, "MANGADEX", "x1", listOf(c, d))
+		val url = "https://cdn.example.org/x1.jpg"
+		repository.observeCover("MANGADEX", "x1", a, url)
+		repository.observeCover("MANGADEX", "x1", b, url)
+
+		val sources = repository.sourcesForAll(listOf(first, second), 5)
+
+		assertEquals(null, sources[first]?.single()?.coverUrl, "two accounts are still only two")
+		assertEquals(null, sources[second]?.single()?.coverUrl, "two accounts are still only two")
+	}
+
+	/**
+	 * A cover is an extra. Every suggestion and every chart reads through this query, so a problem with
+	 * covers alone must not take the sources, and with them the whole answer, down with it.
+	 */
+	@Test
+	fun `sources are still answered when covers cannot be read`() {
+		val (a, b) = established("cover-broken", 2)
+		val id = work("Still Listed")
+		seen(id, "MANGADEX", "x1", listOf(a, b))
+
+		sql("ALTER TABLE work_cover_observation RENAME TO work_cover_observation_hidden")
+		try {
+			val source = repository.sourcesForAll(listOf(id), 5)[id]?.single()
+			assertEquals("x1", source?.sourceKey)
+			assertEquals(null, source?.coverUrl)
+		} finally {
+			sql("ALTER TABLE work_cover_observation_hidden RENAME TO work_cover_observation")
+		}
+	}
+
+	@Test
+	fun `reporting the same cover again does not rewrite the row`() {
+		val reporter = user("cover-again")
+		val url = "https://cdn.example.org/x1.jpg"
+		repository.observeCover("MANGADEX", "x1", reporter, url)
+		sql("UPDATE work_cover_observation SET updated_at = '2020-01-01T00:00:00Z'")
+
+		repository.observeCover("MANGADEX", "x1", reporter, url)
+		assertEquals(2020, reportedYear(reporter), "a repeat open costs no write")
+
+		repository.observeCover("MANGADEX", "x1", reporter, "https://cdn.example.org/new.jpg")
+		assertTrue(reportedYear(reporter) > 2020, "a new address does")
+	}
+
+	private fun reportedYear(userId: String): Int =
+		repository.coverObservationsByPage(userId, null, 1).single().updatedAt.year
+
+	@Test
+	fun `only a plain public https address is kept as a cover`() {
+		assertEquals("https://cdn.example.org/a.jpg?w=300", CoverUrls.clean(" https://cdn.example.org/a.jpg?w=300 "))
+		listOf(
+			null,
+			"",
+			"http://cdn.example.org/a.jpg",
+			"https://user:pass@cdn.example.org/a.jpg",
+			"https://192.168.1.10/a.jpg",
+			"https://[::1]/a.jpg",
+			"https://localhost/a.jpg",
+			"https://nas.local/a.jpg",
+			"https://nas.local./a.jpg",
+			"https://localhost./a.jpg",
+			"https://127.1/a.jpg",
+			"https://0x7f.1/a.jpg",
+			"https://0x7f.0.0.1/a.jpg",
+			"https://10.0.0.1./a.jpg",
+			"https://router.home.arpa/a.jpg",
+			"https://cdn.example.org:8443/a.jpg",
+			"file:///etc/passwd",
+			"https://cdn.example.org/a b.jpg",
+			"https://cdn.example.org/" + "a".repeat(1100),
+		).forEach { assertEquals(null, CoverUrls.clean(it), "$it") }
+	}
+
+	// -- what is close, and what is suitable --------------------------------------------------------
+
+	private fun adultWork(title: String, genres: List<String>): Long =
+		repository.createWork(title, 2019, "manga", true).also { repository.applyCatalogueGenres(it, genres) }
+
+	@Test
+	fun `a work about the same thing beats one tagged with everything`() {
+		val seed = work("Seed", genres = listOf("Romance", "Comedy", "School Life"))
+		val focused = work("Focused", genres = listOf("Romance", "Comedy", "School Life"))
+		val everything = work(
+			"Everything",
+			genres = listOf("Romance", "Comedy", "School Life", "Action", "Adventure", "Fantasy", "Horror", "Mystery", "Sports", "Drama"),
+		)
+
+		val found = repository.similarTo(seed).map { it.workId }
+		assertTrue(found.indexOf(focused) in 0 until found.indexOf(everything), "$found")
+	}
+
+	@Test
+	fun `adult works do not answer for ordinary ones`() {
+		val seed = work("Seed", genres = listOf("Romance", "Comedy", "School Life"))
+		val fine = work("Fine", genres = listOf("Romance", "Comedy", "School Life"))
+		val flagged = adultWork("Flagged", listOf("Romance", "Comedy", "School Life"))
+		val taggedAdult = work("Tagged adult", genres = listOf("Romance", "Comedy", "School Life", "Adult"))
+		val taggedEcchi = work("Tagged ecchi", genres = listOf("Romance", "Comedy", "School Life", "Ecchi"))
+
+		val found = repository.similarTo(seed).map { it.workId }
+		assertTrue(fine in found, "$found")
+		assertTrue(flagged !in found && taggedAdult !in found && taggedEcchi !in found, "$found")
+	}
+
+	@Test
+	fun `someone reading ecchi can be offered ecchi but still not porn`() {
+		val seed = work("Seed", genres = listOf("Romance", "Comedy", "Ecchi"))
+		val ecchi = work("Ecchi", genres = listOf("Romance", "Comedy", "Ecchi"))
+		val adult = work("Adult", genres = listOf("Romance", "Comedy", "Ecchi", "Adult"))
+
+		val found = repository.similarTo(seed).map { it.workId }
+		assertTrue(ecchi in found, "$found")
+		assertTrue(adult !in found, "$found")
+	}
+
+	@Test
+	fun `an adult work can be answered with adult works`() {
+		val seed = adultWork("Seed", listOf("Romance", "Comedy", "Adult"))
+		val flagged = adultWork("Flagged", listOf("Romance", "Comedy", "Adult"))
+
+		assertTrue(flagged in repository.similarTo(seed).map { it.workId })
+	}
+
+	@Test
+	fun `co-reading does not bring in what genres would have kept out`() {
+		val seed = work("Seed", genres = listOf("Romance", "Comedy"))
+		val adult = adultWork("Adult", listOf("Horror", "Adult"))
+		val readers = users("suit-reader", 12)
+		seen(seed, "S1", "s", readers)
+		seen(adult, "S1", "a", readers)
+		repository.refreshCoReading()
+
+		assertTrue(adult !in repository.similarTo(seed).map { it.workId })
 	}
 
 	// -- signals -----------------------------------------------------------------------------------

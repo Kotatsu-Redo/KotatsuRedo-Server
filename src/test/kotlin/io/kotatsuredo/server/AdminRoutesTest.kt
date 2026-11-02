@@ -273,6 +273,41 @@ class AdminRoutesTest {
 	}
 
 	@Test
+	fun `a supporter crown shows on the author's comments and can be taken back`() = testApplication {
+		setup()
+		val root = assertNotNull(moderation.bootstrapFirstAdmin("root", "a-long-enough-password"))
+		val secret = enrol(root)
+		val token = client.login("root", "a-long-enough-password", Totp.code(secret, step() + 1)).sessionCookie()
+
+		val workId = works.createWork("Some Manga", 2018, "manga", nsfw = false)
+		val donor = user("donor")
+		val reader = user("reader")
+		val id = assertIs<PostResult.Posted>(
+			comments.post(workId, null, donor, null, "Thanks for keeping this running.", false, "en"),
+		).view.comment.id
+		assertEquals(false, comments.view(id, reader)?.isSupporter)
+
+		val granted = client.withSession(token, "/users/${donor.id}/supporter", "{}")
+		assertEquals(HttpStatusCode.OK, granted.status)
+
+		assertEquals(true, comments.view(id, reader)?.isSupporter)
+		assertTrue(user("donor").isSupporter)
+		val next = assertIs<PostResult.Posted>(
+			comments.post(workId, null, user("donor"), null, "And another thing about this chapter.", false, "en"),
+		).view
+		assertTrue(next.isSupporter)
+		assertTrue(client.withSession(token, "/actions").bodyAsText().contains("grant_supporter"))
+
+		// A deleted comment says nothing about who wrote it, the crown included
+		assertTrue(comments.delete(next.comment.id, donor.id))
+		assertEquals(false, comments.view(next.comment.id, reader)?.isSupporter)
+
+		val removed = client.withSession(token, "/users/${donor.id}/unsupporter", "{}")
+		assertEquals(HttpStatusCode.OK, removed.status)
+		assertEquals(false, comments.view(id, reader)?.isSupporter)
+	}
+
+	@Test
 	fun `signing out invalidates the session`() = testApplication {
 		setup()
 		val root = assertNotNull(moderation.bootstrapFirstAdmin("root", "a-long-enough-password"))

@@ -581,6 +581,7 @@ class IdentityRepository(
 		isBanned = this[AppUsers.isBanned],
 		banReason = this[AppUsers.banReason],
 		isShadowbanned = this[AppUsers.isShadowbanned],
+		isSupporter = this[AppUsers.isSupporter],
 	)
 
 	private companion object {

@@ -104,6 +104,8 @@ object ModActions {
 	const val SHADOWBAN_USER = "shadowban_user"
 	const val UNSHADOWBAN_USER = "unshadowban_user"
 	const val RESET_NICKNAME = "reset_nickname"
+	const val GRANT_SUPPORTER = "grant_supporter"
+	const val REMOVE_SUPPORTER = "remove_supporter"
 	const val BAN_DEVICE = "ban_device"
 	const val UNBAN_DEVICE = "unban_device"
 	const val MERGE_WORKS = "merge_works"

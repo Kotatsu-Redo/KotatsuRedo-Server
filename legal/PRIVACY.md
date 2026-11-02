@@ -1,6 +1,6 @@
 # Privacy notice
 
-**Kotatsu-Redo community server** · last updated 16 October 2026
+**Kotatsu-Redo community server** · last updated 2 November 2026
 
 This describes the **official instance** at `community.kotatsuredo.app`, operated by the Kotatsu-Redo
 project and hosted in France. The server is open source, so other people run their own instances
@@ -39,6 +39,11 @@ comments to other readers and means nothing outside this server.
 
 If you set a **nickname**, it is stored as you typed it and shown with a four-character suffix
 (`reader#ejre`) so two people can pick the same name.
+
+If you donated and it was linked to your account, a moderator can mark you as a **supporter**, which
+shows a crown next to your name on your comments. Nothing connects a donation to an account by itself,
+because an account is only a key, so this is set by hand. The server stores only that yes or no, and
+no payment details. Granting or removing it is recorded in the moderation log.
 
 **If you lose the key, it is gone.** Nobody can recover it, because nobody — including us — has it.
 That is the same property that stops anyone tying your comments back to you. Back it up: the app can
@@ -83,13 +88,20 @@ work. If that key is lost, the server cannot recover the account; a new key crea
 The same manga has a different address on every source, so to show its ratings and comments the app
 asks the server which work an entry is. It does that when you open a manga's page, and — for
 suggestions — for a few of the titles you read or favourited most recently. It sends what the source
-shows: the entry's address on that source, its titles, year, type and genres.
+shows: the entry's address on that source, its titles, year, type and genres, and the address of its
+cover image.
 
 The server keeps a note of each entry your account asked about: the source, the entry's address on
-it, the work it matched, the title it was matched on, and the genres the source listed. These notes
-are how it learns that two sources carry the same work. Nothing is trusted on one account's word: an
-entry is only relied on, a genre only published, and a source only listed as carrying a work once
-several accounts have reported the same thing. The notes themselves are never shown to anyone.
+it, the work it matched, the title it was matched on, the genres the source listed, and the cover
+address. These notes are how it learns that two sources carry the same work. Nothing is trusted on one
+account's word: an entry is only relied on, a genre only published, a source only listed as carrying a
+work, and a cover address only passed on once several accounts have reported the same thing. The notes
+themselves are never shown to anyone.
+
+A cover address that several accounts agree on is sent to other readers, so their app can show the
+cover without first asking the site for the whole entry. Their app then fetches the image straight from
+the site that hosts it, as it does when browsing that source. That request never passes through this
+server, and the site sees it as it sees any other visitor, including their IP address.
 
 They are, plainly, a record of which manga you opened while the community features were on. They
 are in your export, and they are deleted with your account.
@@ -171,7 +183,8 @@ works and what it needs to recognise them, and nothing else.
 
 ## Who can see what
 
-- **Your comments, nickname and public id** are visible to anyone using the app.
+- **Your comments, nickname and public id**, and your supporter crown if you have one, are visible
+  to anyone using the app.
 - **Your ratings** are visible only as part of a work's average. Nobody sees what you personally gave
   a work.
 - **Your votes** are never shown to anyone, including the person you voted on.
@@ -222,8 +235,9 @@ What happens:
 
 - Your ratings are **erased**, and every affected work's average is recalculated on the spot.
 - Your votes are **erased**.
-- Your notes of the manga you opened are **erased**. What they helped establish — that two sources
-  carry the same work, or what genre it is — describes the manga rather than you, and stays.
+- Your notes of the manga you opened, and the cover addresses in them, are **erased**. What they
+  helped establish — that two sources carry the same work, or what genre it is — describes the manga
+  rather than you, and stays.
 - Your comments are **blanked**. The empty rows stay so that replies other people wrote underneath
   them still have a thread to hang from — they carry no text, no nickname and no id. Nothing of yours
   remains in them.
@@ -244,8 +258,8 @@ Two of them are buttons in the app rather than requests to us, which is delibera
 - **Erasure** — *Settings → Community → Delete my data*. Immediate, no confirmation loop.
 - **Access and portability** — *Settings → Community → Export my data*. Downloads everything the
   server holds about your account as a JSON file: your comments (including any a moderator removed),
-  your ratings, your votes, the notes of the manga you opened, your nickname and when the account was
-  created.
+  your ratings, your votes, the notes of the manga you opened including the genres and cover addresses
+  in them, your nickname, whether you are marked as a supporter, and when the account was created.
 
 For correction, restriction or objection, or to complain about how this is run, reach us through the
 [Discord](https://discord.gg/eu3gnd89gP) or the

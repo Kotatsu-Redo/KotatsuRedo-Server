@@ -1,5 +1,6 @@
 package io.kotatsuredo.server.scoring
 
+import io.kotatsuredo.server.db.withBackgroundLimits
 import java.sql.Types
 import java.time.OffsetDateTime
 import javax.sql.DataSource
@@ -62,27 +63,31 @@ class ScoringRepository(private val dataSource: DataSource) {
 
 	private fun aggregate(sql: String, byOp: Boolean, windowDays: Int, halfLifeDays: Double): List<SourceAggregate> =
 		dataSource.connection.use { connection ->
-			connection.prepareStatement(sql).use { statement ->
-				// Order matters and matches AGGREGATE: half-life first (inside power), window second.
-				statement.setDouble(1, halfLifeDays)
-				statement.setInt(2, windowDays)
-				statement.executeQuery().use { rows ->
-					buildList {
-						while (rows.next()) {
-							add(
-								SourceAggregate(
-									source = rows.getString("source"),
-									region = rows.getString("region"),
-									op = if (byOp) rows.getShort("op") else null,
-									okWeighted = rows.getDouble("ok_w"),
-									failWeighted = rows.getDouble("fail_w"),
-									emptyWeighted = rows.getDouble("empty_w"),
-									cfBlockedWeighted = rows.getDouble("cf_w"),
-									latencyP50Ms = rows.getDouble("p50_w"),
-									reporterWeight = rows.getDouble("reporter_w"),
-									sampleSize = rows.getInt("sample_size"),
-								),
-							)
+			// Reads every raw row in the window, and a couple of million of those take longer than a
+			// request is allowed to: past that, every run failed and the scores froze where they were.
+			connection.withBackgroundLimits {
+				connection.prepareStatement(sql).use { statement ->
+					// Order matters and matches AGGREGATE: half-life first (inside power), window second.
+					statement.setDouble(1, halfLifeDays)
+					statement.setInt(2, windowDays)
+					statement.executeQuery().use { rows ->
+						buildList {
+							while (rows.next()) {
+								add(
+									SourceAggregate(
+										source = rows.getString("source"),
+										region = rows.getString("region"),
+										op = if (byOp) rows.getShort("op") else null,
+										okWeighted = rows.getDouble("ok_w"),
+										failWeighted = rows.getDouble("fail_w"),
+										emptyWeighted = rows.getDouble("empty_w"),
+										cfBlockedWeighted = rows.getDouble("cf_w"),
+										latencyP50Ms = rows.getDouble("p50_w"),
+										reporterWeight = rows.getDouble("reporter_w"),
+										sampleSize = rows.getInt("sample_size"),
+									),
+								)
+							}
 						}
 					}
 				}

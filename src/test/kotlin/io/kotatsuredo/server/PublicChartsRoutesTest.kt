@@ -16,6 +16,7 @@ import io.kotatsuredo.server.works.WorkLinker
 import io.kotatsuredo.server.works.WorkRepository
 import io.kotatsuredo.server.works.WorkResolver
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
@@ -32,6 +33,7 @@ import org.slf4j.LoggerFactory
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -495,7 +497,7 @@ class PublicChartsRoutesTest {
 			"window=week&type=" to "type",
 			"window=week&type=MANGA" to "type",
 			"window=week&limit=0" to "limit",
-			"window=week&limit=51" to "limit",
+			"window=week&limit=201" to "limit",
 			"window=week&limit=-1" to "limit",
 			"window=week&limit=ten" to "limit",
 			"window=week&limit=" to "limit",
@@ -506,6 +508,35 @@ class PublicChartsRoutesTest {
 			val error = Json.parseToJsonElement(response.bodyAsText()).jsonObject
 			assertTrue(field in error.toString(), "$query answered $error")
 		}
+	}
+
+	@Test
+	fun `a chart the app already has costs no content`() = testApplication {
+		setup()
+		active(listedWork("Work"))
+
+		val first = charts("window=week")
+		val tag = assertNotNull(first.headers[HttpHeaders.ETag])
+		assertTrue(first.bodyAsText().isNotEmpty())
+
+		val again = client.get("/v1/public/charts?window=week") { header(HttpHeaders.IfNoneMatch, tag) }
+		assertEquals(HttpStatusCode.NotModified, again.status)
+		assertEquals("", again.bodyAsText())
+
+		// A proxy that compresses the answer changes how the tag looks, not what it says
+		val reworded = client.get("/v1/public/charts?window=week") { header(HttpHeaders.IfNoneMatch, "W/$tag") }
+		assertEquals(HttpStatusCode.NotModified, reworded.status)
+
+		val outdated = client.get("/v1/public/charts?window=week") { header(HttpHeaders.IfNoneMatch, "\"1\"") }
+		assertEquals(HttpStatusCode.OK, outdated.status)
+	}
+
+	@Test
+	fun `a whole chart can be asked for at once`() = testApplication {
+		setup()
+		(1..60).forEach { active(listedWork("Work $it")) }
+
+		assertEquals(60, ids("window=week&limit=200").size)
 	}
 
 	@Test

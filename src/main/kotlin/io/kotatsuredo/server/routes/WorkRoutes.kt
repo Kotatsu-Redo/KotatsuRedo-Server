@@ -10,6 +10,7 @@ import io.kotatsuredo.server.identity.TrustTier
 import io.kotatsuredo.server.moderation.ModerationQueueRepository
 import io.kotatsuredo.server.ops.ServerMetrics
 import io.kotatsuredo.server.works.LinkOutcome
+import io.kotatsuredo.server.works.CoverUrls
 import io.kotatsuredo.server.works.Genres
 import io.kotatsuredo.server.works.WorkFingerprint
 import io.kotatsuredo.server.works.WorkLinker
@@ -45,6 +46,7 @@ data class FingerprintDto(
 	@SerialName("external_ids") val externalIds: Map<String, String> = emptyMap(),
 	/** The source's own genre labels. Unrecognised ones are dropped server-side. */
 	val genres: List<String> = emptyList(),
+	@SerialName("cover_url") val coverUrl: String? = null,
 )
 
 @Serializable
@@ -58,6 +60,8 @@ data class WorkSourceDto(
 	val reporters: Int,
 	@SerialName("last_seen") val lastSeen: String,
 	val verified: Boolean,
+	/** Only ever set once several accounts agree on it. Saves the app asking the site just to show a cover. */
+	@SerialName("cover_url") val coverUrl: String? = null,
 )
 
 @Serializable
@@ -203,6 +207,10 @@ fun Route.workRoutes(
 	/**
 	 * The hot path, and always batched: a client resolving a screenful of manga should cost one
 	 * request, not twenty (PLAN.md §3 Capacity).
+	 *
+	 * The work-mutation quota is charged per entry, and only for an entry that resolving writes for.
+	 * A batch that runs out part way answers 429 as a whole, but the entries already resolved stay
+	 * resolved and are free the next time.
 	 */
 	post("/resolve") {
 		val caller = call.requireCaller(identities)
@@ -214,17 +222,11 @@ fun Route.workRoutes(
 		if (titleInputs > MAX_TITLE_INPUTS_PER_BATCH) {
 			throw ApiException(ApiError.BadRequest("too_many_titles"))
 		}
-		call.enforceLimit(
-			limiter,
-			RateLimiter.Bucket.WORK_MUTATION,
-			caller.tier,
-			caller.identity.id,
-			// One manga, one unit. Charging per title made an app that sends the alt title its source
-			// shows - which is most of them, and exactly what makes matching work - cost double, so a
-			// new account's hundred an hour was really fifty manga of browsing. The batch is still
-			// bounded by MAX_TITLE_INPUTS_PER_BATCH above.
-			cost = body.works.size,
-		)
+		// Every entry asked about costs a general unit, as any other read does, so looking up known
+		// manga is bounded without spending the quota below. One manga, one unit: charging per title
+		// made an app that sends the alt title its source shows cost double. The batch is still
+		// bounded by MAX_TITLE_INPUTS_PER_BATCH above.
+		call.enforceLimit(limiter, RateLimiter.Bucket.GENERAL, caller.tier, caller.identity.id, cost = body.works.size)
 
 		val resolved = try {
 			coroutineScope { body.works.map { dto ->
@@ -244,9 +246,17 @@ fun Route.workRoutes(
 							// Extra labels are dropped rather than refused; the vocabulary discards
 							// most of them anyway.
 							genres = dto.genres.take(Genres.MAX_GENRES_PER_WORK * 2),
+							coverUrl = CoverUrls.clean(dto.coverUrl),
 						),
 						reporterId = caller.identity.id,
-					)
+					) {
+						// Charged by the resolver, under the entry's lock, so a manga this account
+						// already resolved - or is resolving right now in another request, which 9.8.5
+						// does on every details screen - is never paid for twice. Charging up front
+						// cost a reader two to four units per manga and locked them out of ratings and
+						// comments for the rest of the hour.
+						call.enforceLimit(limiter, RateLimiter.Bucket.WORK_MUTATION, caller.tier, caller.identity.id)
+					}
 					ResolvedDto(
 						source = dto.source,
 						key = dto.key,

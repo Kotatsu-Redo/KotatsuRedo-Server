@@ -46,6 +46,8 @@ data class CommentView(
 	val authorName: String,
 	val myVote: Int,
 	val isMine: Boolean,
+	/** The author donated, so their name gets a crown. */
+	val isSupporter: Boolean = false,
 )
 
 sealed interface PostResult {

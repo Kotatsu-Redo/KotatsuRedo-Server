@@ -75,10 +75,19 @@ data class ExportedGenreDto(
 )
 
 @Serializable
+data class ExportedCoverDto(
+	val source: String,
+	val key: String,
+	@SerialName("cover_url") val coverUrl: String,
+	@SerialName("reported_at") val reportedAt: String,
+)
+
+@Serializable
 data class ExportDto(
 	@SerialName("exported_at") val exportedAt: String,
 	@SerialName("user_id") val userId: String,
 	val nickname: String? = null,
+	@SerialName("is_supporter") val isSupporter: Boolean = false,
 	@SerialName("created_at") val createdAt: String,
 	val comments: List<ExportedCommentDto>,
 	val ratings: List<ExportedRatingDto>,
@@ -87,6 +96,8 @@ data class ExportDto(
 	val opened: List<ExportedOpenedDto> = emptyList(),
 	/** Genres the sources of those manga listed, as reported from this account. */
 	val genres: List<ExportedGenreDto> = emptyList(),
+	/** Cover addresses those sources showed, as reported from this account. */
+	val covers: List<ExportedCoverDto> = emptyList(),
 	/**
 	 * What is deliberately absent, said out loud rather than left to be noticed.
 	 *
@@ -137,6 +148,7 @@ fun Route.exportRoutes(
 			write("{\"exported_at\":${exportJson.encodeToString(OffsetDateTime.now().iso())}")
 			write(",\"user_id\":${exportJson.encodeToString(identity.id)}")
 			write(",\"nickname\":${exportJson.encodeToString(identity.nickname)}")
+			write(",\"is_supporter\":${identity.isSupporter}")
 			write(",\"created_at\":${exportJson.encodeToString(identity.createdAt.iso())}")
 
 			write(",\"comments\":[")
@@ -206,6 +218,23 @@ fun Route.exportRoutes(
 					)
 				}
 				genreCursor = page.lastOrNull()?.let { it.workId to it.genre } ?: genreCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
+			write("],\"covers\":[")
+			first = true
+			var coverCursor: Pair<String, String>? = null
+			do {
+				val page = works.coverObservationsByPage(identity.id, coverCursor, EXPORT_PAGE_SIZE)
+				page.forEach { observation ->
+					if (!first) write(",")
+					first = false
+					write(
+						exportJson.encodeToString(
+							ExportedCoverDto(observation.source, observation.sourceKey, observation.coverUrl, observation.updatedAt.iso()),
+						),
+					)
+				}
+				coverCursor = page.lastOrNull()?.let { it.source to it.sourceKey } ?: coverCursor
 			} while (page.size == EXPORT_PAGE_SIZE)
 
 			write("],\"notes\":${exportJson.encodeToString(NOTES)}}")

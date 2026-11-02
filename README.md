@@ -76,16 +76,16 @@ access path: a user who does not want an identity turns the feature off in the a
 |---|---|
 | `GET /v1/health` | `200` healthy, `503` when the database is unreachable. What uptime monitoring should watch. |
 | `GET /v1/version` | Server and API version. |
-| `POST /v1/identity/hello` | Create-or-touch. First call from an unknown secret creates the account. Carries the device identifiers. |
+| `POST /v1/identity/hello` | Create-or-touch. First call from an unknown secret creates the account. Carries the device identifiers. Answers with `is_supporter`, as comments do for their author. |
 | `GET /v1/identity/me` | The caller's identity and trust tier. |
 | `POST /v1/identity/nickname` | Set or change the nickname. |
 | `DELETE /v1/identity/me` | Delete everything about this user. |
 | `POST /v1/telemetry/probes` | Batched, fire-and-forget source probes. `202`. |
 | `GET /v1/sources/scores?region=` | All source scores for a region. ETag + `max-age=3600`; the app polls daily and usually gets `304`. |
-| `POST /v1/works/resolve` | Batch: source fingerprints → work ids. The hot path. |
+| `POST /v1/works/resolve` | Batch: source fingerprints → work ids. The hot path. Each entry may carry a `cover_url`; once three settled accounts report the same address, a work's `sources` in similar works and charts carry it too. Only an entry the account has not resolved before spends the `RATE_WORK_MUTATION_*` quota. |
 | `POST /v1/works/link` | A user migration confirming two source entries are the same work. |
 | `POST /v1/works/{id}/dispute` | "This work is wrong." Files a queue item; duplicates collapse. `202`. |
-| `GET /v1/public/charts?window=day\|week\|month` | No account needed. Top works by ratings and comments in the window, `&type=manga\|manhwa\|manhua&genre=&limit=1..50`. Never lists adult content. `max-age=900`. |
+| `GET /v1/public/charts?window=day\|week\|month` | No account needed. Top works by ratings and comments in the window, `&type=manga\|manhwa\|manhua&genre=&limit=1..200`. Never lists adult content. ETag + `max-age=900`: the app fetches a whole chart, narrows it down itself, and usually gets `304`. |
 | `GET /v1/works/{id}/rating` | Aggregate plus this caller's own value. |
 | `PUT`/`DELETE /v1/works/{id}/rating` | Set or clear it. Half-star steps, `1..10`. |
 | `GET /v1/works/{id}/comments` | A page of root comments with their replies. `?sort=top\|new&lang=&chapter=&limit=&offset=` |

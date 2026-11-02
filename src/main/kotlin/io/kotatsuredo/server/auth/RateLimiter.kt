@@ -53,9 +53,19 @@ class RateLimiter(
 		// report a second device without turning batching into a cardinality multiplier.
 		TELEMETRY(mapOf(TrustTier.NEW to 512, TrustTier.NORMAL to 1024, TrustTier.ESTABLISHED to 2048), 86_400),
 		EXPORT(mapOf(TrustTier.NEW to 1, TrustTier.NORMAL to 1, TrustTier.ESTABLISHED to 1), 3600),
-		// Charged per work in a resolve batch (links cost one). This keeps batching efficient without
-		// making a 25-work request cost the same as a one-work request.
-		WORK_MUTATION(mapOf(TrustTier.NEW to 100, TrustTier.NORMAL to 300, TrustTier.ESTABLISHED to 600), 3600),
+		// Charged per entry a resolve has to write for - a new work, an alias, an account's first note
+		// of an entry - never for one the account already resolved (links cost one). This keeps
+		// batching efficient without making a 25-work request cost the same as a one-work request.
+		// Tunable like comments: running out hides ratings and comments on every manga the reader has
+		// not opened before, so it is the limit an operator is most likely to need to move.
+		WORK_MUTATION(
+			mapOf(
+				TrustTier.NEW to envLimit("RATE_WORK_MUTATION_NEW", 100),
+				TrustTier.NORMAL to envLimit("RATE_WORK_MUTATION_NORMAL", 300),
+				TrustTier.ESTABLISHED to envLimit("RATE_WORK_MUTATION_ESTABLISHED", 600),
+			),
+			3600,
+		),
 		GENERAL(mapOf(TrustTier.NEW to 300, TrustTier.NORMAL to 300, TrustTier.ESTABLISHED to 300), 60),
 		// Anonymous lookups have no account to key on, so this is only ever checked per network, where
 		// it becomes 600 a minute. One reader asks once per manga page and at most eight times per

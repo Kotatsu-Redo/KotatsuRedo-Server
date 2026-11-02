@@ -160,7 +160,7 @@ class Charts(
 		val EXCLUDED_GENRES = setOf("adult", "ecchi")
 
 		/**
-		 * The most of a window's ranking kept, and so the deepest a filter can reach. Far more than the 50
+		 * The most of a window's ranking kept, and so the deepest a filter can reach. Far more than the 200
 		 * one answer may hold, so that a narrow genre still fills its chart, and about 300 KB per window.
 		 */
 		const val MAX_RANKED = 1000

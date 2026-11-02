@@ -48,6 +48,7 @@ data class IdentityResponse(
 	val tier: Int,
 	/** Retained for older clients. Device-only recovery is disabled, so this is always false. */
 	val restored: Boolean = false,
+	@SerialName("is_supporter") val isSupporter: Boolean = false,
 )
 
 fun Route.identityRoutes(
@@ -143,6 +144,7 @@ private fun io.kotatsuredo.server.identity.Identity.toResponse(tier: TrustTier) 
 	nickname = nickname,
 	displayName = displayName,
 	tier = tier.level,
+	isSupporter = isSupporter,
 )
 
 private const val MAX_SSAID_LENGTH = 128

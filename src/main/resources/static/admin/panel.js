@@ -276,6 +276,18 @@ function commentCard(comment) {
 		return true;
 	});
 
+	add(comment.author_supporter ? 'Remove supporter crown' : 'Give supporter crown', '', async () => {
+		const path = comment.author_supporter ? 'unsupporter' : 'supporter';
+		const reason = await askReason(
+			comment.author_supporter ? 'Remove supporter crown' : 'Give supporter crown',
+			'A little crown next to their name on comments, as a thank-you for donating.',
+			false,
+		);
+		if (reason === null) return false;
+		await api('/users/' + comment.author_id + '/' + path, { method: 'POST', body: JSON.stringify({ reason }) });
+		return true;
+	});
+
 	add('All their comments', '', async () => {
 		const page = await api('/users/' + comment.author_id + '/comments');
 		show('Comments by ' + comment.author, page.comments.length + ' in total', commentList(page.comments, 'None.'));

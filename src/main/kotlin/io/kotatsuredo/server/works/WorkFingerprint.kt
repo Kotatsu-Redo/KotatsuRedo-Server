@@ -22,8 +22,34 @@ data class WorkFingerprint(
 	 * closed vocabulary and drops the rest, so a parser's oddities cost nothing.
 	 */
 	val genres: List<String> = emptyList(),
+	/** Where the source keeps this work's cover, if it is an address other readers could safely be sent to. */
+	val coverUrl: String? = null,
 ) {
 	val allTitles: List<String> get() = (listOf(title) + altTitles).filter { it.isNotBlank() }
+}
+
+/** What may be kept as a cover address. Everything else is dropped rather than refused: it is only ever an extra. */
+object CoverUrls {
+
+	private const val MAX_LENGTH = 1024
+	/** A last label a browser's URL parser reads as a number makes the whole host an IPv4 address: `0x7f.1`, `127.1`. */
+	private val NUMERIC_LABEL = Regex("[0-9]+|0x[0-9a-f]*")
+	private val PRIVATE_HOST_SUFFIXES = listOf(".local", ".internal", ".localhost", ".lan", ".home.arpa", ".intranet")
+
+	fun clean(raw: String?): String? {
+		val url = raw?.trim()?.takeIf { it.length in 1..MAX_LENGTH } ?: return null
+		if (url.any { it.isWhitespace() || it.isISOControl() }) return null
+		val uri = runCatching { java.net.URI(url) }.getOrNull() ?: return null
+		val host = uri.host?.lowercase()?.removeSuffix(".") ?: return null
+		val isPublicHost = '.' in host &&
+			!host.startsWith("[") &&
+			!NUMERIC_LABEL.matches(host.substringAfterLast('.')) &&
+			PRIVATE_HOST_SUFFIXES.none(host::endsWith)
+		val isPlainHttps = uri.scheme.equals("https", ignoreCase = true) &&
+			uri.userInfo == null &&
+			uri.port in setOf(-1, 443)
+		return url.takeIf { isPublicHost && isPlainHttps }
+	}
 }
 
 object WorkLimits {

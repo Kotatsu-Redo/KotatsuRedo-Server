@@ -40,28 +40,51 @@ class WorkResolver(
 	 * made a busy external pool look, to the reader, like a manga with no community data. The
 	 * catalogue's titles and identifiers arrive a moment later, and merge the work away if they turn
 	 * out to name one we already had.
+	 *
+	 * @param charge called at most once, under this entry's lock, and only when resolving it is about
+	 *  to write: a new work, an alias, or this account's first note of the entry. An entry this
+	 *  account already resolved costs nothing - including the duplicate a client sends while the
+	 *  first is still in flight, which waits on the same lock and then finds the note the first one
+	 *  wrote. Throwing from it refuses the entry before anything is written.
 	 */
-	suspend fun resolve(fingerprint: WorkFingerprint, reporterId: String? = null): Resolution {
+	suspend fun resolve(
+		fingerprint: WorkFingerprint,
+		reporterId: String? = null,
+		charge: () -> Unit = {},
+	): Resolution {
 		val lockIndex = Math.floorMod(31 * fingerprint.source.hashCode() + fingerprint.sourceKey.hashCode(), aliasLocks.size)
 		return withAliasCapacity(lockIndex) {
 			withResolutionCapacity {
-				val resolution = resolveLocal(fingerprint, reporterId)
-					?: createFromFingerprint(fingerprint, reporterId).also {
-						if (it.created) {
-							repository.enqueueEnrichment(
-								it.workId,
-								fingerprint.title,
-								fingerprint.year,
-								fingerprint.contentType,
-							)
+				// Alternative titles are useful metadata, but are also client-controlled. Only the
+				// primary rendering may select or corroborate a cross-user mapping.
+				val keys = (if (reporterId == null) fingerprint.allTitles else listOf(fingerprint.title))
+					.flatMap(TitleNormalizer::keys)
+					.toSet()
+				val resolution = resolveKnown(fingerprint, reporterId, keys) ?: run {
+					charge()
+					resolveLocal(fingerprint, reporterId, keys)
+						?: createFromFingerprint(fingerprint, reporterId).also {
+							if (it.created) {
+								repository.enqueueEnrichment(
+									it.workId,
+									fingerprint.title,
+									fingerprint.year,
+									fingerprint.contentType,
+								)
+							}
 						}
-					}
+				}
 				// Every path converges here, so the genres the source showed this reader are recorded
 				// once, whichever way the work was found. Recognised terms only, and published only
 				// once other accounts have said the same - see WorkRepository.observeGenres.
 				if (reporterId != null && fingerprint.genres.isNotEmpty()) {
 					runCatching { repository.observeGenres(resolution.workId, reporterId, fingerprint.genres) }
 						.onFailure { log.warn("Failed to record genres for work {}", resolution.workId, it) }
+				}
+				if (reporterId != null && fingerprint.coverUrl != null) {
+					runCatching {
+						repository.observeCover(fingerprint.source, fingerprint.sourceKey, reporterId, fingerprint.coverUrl)
+					}.onFailure { log.warn("Failed to record a cover for work {}", resolution.workId, it) }
 				}
 				resolution
 			}
@@ -93,13 +116,11 @@ class WorkResolver(
 		}
 	}
 
-	/** The local rungs of the ladder. A null result means the work has never been seen here. */
-	private fun resolveLocal(fingerprint: WorkFingerprint, reporterId: String?): Resolution? {
-		// Alternative titles are useful metadata, but are also client-controlled. Only the primary
-		// rendering may select or corroborate a cross-user mapping.
-		val keys = (if (reporterId == null) fingerprint.allTitles else listOf(fingerprint.title))
-			.flatMap(TitleNormalizer::keys)
-			.toSet()
+	/**
+	 * The rungs that only read: an alias, or this account's own earlier note of this entry. A manga
+	 * opened a second time ends here, which is what lets [resolve] leave it uncharged.
+	 */
+	private fun resolveKnown(fingerprint: WorkFingerprint, reporterId: String?, keys: Set<String>): Resolution? {
 		// 1. Alias. O(1) and the overwhelming majority of traffic once a source is warm.
 		val alias = if (reporterId == null) {
 			repository.findByAlias(fingerprint.source, fingerprint.sourceKey)
@@ -109,15 +130,25 @@ class WorkResolver(
 		alias?.let {
 			return Resolution(it, ResolutionMethod.ALIAS, created = false)
 		}
+		if (reporterId == null) return null
 
+		// Repeat opens stay on the (source, key, account) primary-key path. The wider account-title
+		// lookup in [resolveLocal] is needed only when this source entry has not been observed before.
+		val observed = repository.observedAlias(fingerprint.source, fingerprint.sourceKey, reporterId, keys)
+			?: return null
+		return if (isCompatible(fingerprint, repository.metadataOf(observed))) {
+			Resolution(observed, ResolutionMethod.OBSERVATION, created = false)
+		} else {
+			null
+		}
+	}
+
+	/**
+	 * The local rungs of the ladder past [resolveKnown], each of which records what it found. A null
+	 * result means the work has never been seen here.
+	 */
+	private fun resolveLocal(fingerprint: WorkFingerprint, reporterId: String?, keys: Set<String>): Resolution? {
 		if (reporterId != null) {
-			// Repeat opens stay on the (source, key, account) primary-key path. The wider account-title
-			// lookup below is needed only when this source entry has not been observed before.
-			repository.observedAlias(fingerprint.source, fingerprint.sourceKey, reporterId, keys)?.let { observed ->
-				if (isCompatible(fingerprint, repository.metadataOf(observed))) {
-					return Resolution(observed, ResolutionMethod.OBSERVATION, created = false)
-				}
-			}
 			// Reuse this account's own exact-title observation across sources. The mapping remains private
 			// to that account until authoritative catalogue data or the established-account quorum backs
 			// it, so a remote client cannot poison how another account resolves the title.

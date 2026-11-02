@@ -161,6 +161,20 @@ class CommentRepository(private val dataSource: DataSource) {
 		}
 	}
 
+	/** Which authors on a page of comments have a supporter crown, in one query. */
+	fun supporters(userIds: Collection<String>): Set<String> {
+		if (userIds.isEmpty()) return emptySet()
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement("SELECT id FROM app_user WHERE is_supporter AND id = ANY (?)")
+				.use { statement ->
+					statement.setArray(1, connection.createArrayOf("text", userIds.toTypedArray()))
+					statement.executeQuery().use { rows ->
+						buildSet { while (rows.next()) add(rows.getString(1)) }
+					}
+				}
+		}
+	}
+
 	/** This caller's votes across a page, in one query. */
 	fun myVotes(commentIds: Collection<Long>, userId: String): Map<Long, Int> {
 		if (commentIds.isEmpty()) return emptyMap()

@@ -29,6 +29,7 @@ data class QueuedComment(
 	val authorName: String,
 	val authorIsBanned: Boolean,
 	val authorIsShadowbanned: Boolean,
+	val authorIsSupporter: Boolean = false,
 	/** How many of this author's comments a moderator has already removed. The pattern signal. */
 	val authorRemovedCount: Int,
 	/** The `watch` term that flagged it, if any. */
@@ -450,6 +451,7 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 		authorName = displayName(getString("nickname"), getString("user_id")),
 		authorIsBanned = getBoolean("is_banned"),
 		authorIsShadowbanned = getBoolean("is_shadowbanned"),
+		authorIsSupporter = getBoolean("is_supporter"),
 		authorRemovedCount = getInt("removed_count"),
 		flaggedRule = getString("flagged_rule"),
 	)
@@ -461,7 +463,7 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 		val COMMENT_SELECT = """
 			SELECT c.id, c.work_id, w.canonical_title, c.work_chapter_id, c.body, c.lang, c.state,
 			       c.up, c.down, c.score, c.created_at, c.user_id, u.nickname, u.is_banned,
-			       u.is_shadowbanned, c.flagged_rule,
+			       u.is_shadowbanned, u.is_supporter, c.flagged_rule,
 			       (SELECT count(*) FROM comment r WHERE r.user_id = c.user_id AND r.state = 2)
 			           AS removed_count
 			FROM comment c

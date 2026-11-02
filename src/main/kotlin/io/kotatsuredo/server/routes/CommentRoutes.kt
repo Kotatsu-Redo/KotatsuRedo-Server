@@ -57,6 +57,8 @@ data class CommentDto(
 	 * Everything else about it is blank.
 	 */
 	val deleted: Boolean = false,
+	/** The author donated, so the app draws a crown next to their name. */
+	@SerialName("is_supporter") val isSupporter: Boolean = false,
 )
 
 @Serializable
@@ -161,6 +163,7 @@ private fun CommentView.toDto(): CommentDto {
 		myVote = myVote,
 		isMine = isMine,
 		deleted = deleted,
+		isSupporter = isSupporter,
 	)
 }
 

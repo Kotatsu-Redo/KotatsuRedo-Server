@@ -10,6 +10,7 @@ data class Identity(
 	val isBanned: Boolean,
 	val banReason: String?,
 	val isShadowbanned: Boolean,
+	val isSupporter: Boolean = false,
 ) {
 	val displayName: String get() = Nicknames.display(nickname, id)
 }

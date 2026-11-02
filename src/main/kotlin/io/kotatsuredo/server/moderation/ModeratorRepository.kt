@@ -582,6 +582,20 @@ class ModeratorRepository(
 		buildJsonObject { previousNickname?.let { put("previous", it) } }.toString(),
 	)
 
+	fun setSupporterWithAudit(
+		moderatorId: String,
+		userId: String,
+		isSupporter: Boolean,
+		reason: String?,
+	): Boolean = userUpdateWithAudit(
+		moderatorId,
+		userId,
+		if (isSupporter) ModActions.GRANT_SUPPORTER else ModActions.REMOVE_SUPPORTER,
+		reason,
+		"UPDATE app_user SET is_supporter = $isSupporter WHERE id = ?",
+		"{}",
+	)
+
 	private fun userUpdateWithAudit(
 		moderatorId: String,
 		userId: String,

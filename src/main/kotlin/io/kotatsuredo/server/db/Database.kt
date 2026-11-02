@@ -5,10 +5,43 @@ import com.zaxxer.hikari.HikariDataSource
 import io.kotatsuredo.server.DatabaseConfig
 import org.flywaydb.core.Flyway
 import org.slf4j.LoggerFactory
+import java.sql.Connection
+import java.util.concurrent.Executor
 import javax.sql.DataSource
 import org.jetbrains.exposed.sql.Database as ExposedDatabase
 
 private val log = LoggerFactory.getLogger("Database")
+
+/**
+ * Runs [block] under the limits of a background job rather than those of a request.
+ *
+ * The limits on a runtime connection exist so a stuck query cannot hold a reader's request, and they are
+ * far too short for a job that reads a whole week of telemetry: a timeout there fails the same way every
+ * time it runs, leaving its output frozen with only a warning to show for it. `SET LOCAL` ends with the
+ * transaction, so nothing outlives this call on a connection going back to the pool.
+ */
+fun <T> Connection.withBackgroundLimits(block: () -> T): T {
+	val direct = Executor { it.run() }
+	val networkTimeoutBefore = networkTimeout
+	val autoCommitBefore = autoCommit
+	setNetworkTimeout(direct, BACKGROUND_NETWORK_TIMEOUT_MS)
+	autoCommit = false
+	try {
+		createStatement().use { it.execute("SET LOCAL statement_timeout = $BACKGROUND_STATEMENT_TIMEOUT_MS") }
+		return block().also { commit() }
+	} catch (error: Exception) {
+		rollback()
+		throw error
+	} finally {
+		autoCommit = autoCommitBefore
+		setNetworkTimeout(direct, networkTimeoutBefore)
+	}
+}
+
+private const val BACKGROUND_STATEMENT_TIMEOUT_MS = 300_000
+
+/** Past the statement timeout, so that Postgres gets to cancel the query rather than the socket dying under it. */
+private const val BACKGROUND_NETWORK_TIMEOUT_MS = 330_000
 
 /**
  * The seam that lets `/v1/health` be tested without a live Postgres. Small on purpose: the route

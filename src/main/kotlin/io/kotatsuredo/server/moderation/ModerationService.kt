@@ -297,6 +297,10 @@ class ModerationService(
 		return moderators.resetNicknameWithAudit(actor.id, userId, reason, user.nickname)
 	}
 
+	/** The crown next to a donor's name. Set by hand: nothing links a donation to an account, which is only a key. */
+	fun setSupporter(actor: Moderator, userId: String, isSupporter: Boolean, reason: String?): Boolean =
+		moderators.setSupporterWithAudit(actor.id, userId, isSupporter, reason)
+
 	// -- devices ---------------------------------------------------------------------------------
 
 	/**
