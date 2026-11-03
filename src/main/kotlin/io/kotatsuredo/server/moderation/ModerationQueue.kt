@@ -67,6 +67,17 @@ data class SanctionedUser(
 	val lastSeenAt: OffsetDateTime,
 )
 
+/** Enough about an account to tell it from another with the same nickname. */
+data class UserSummary(
+	val userId: String,
+	val displayName: String,
+	val supporter: Boolean,
+	val banned: Boolean,
+	val shadowbanned: Boolean,
+	val comments: Int,
+	val lastSeenAt: OffsetDateTime,
+)
+
 data class QueuedBrigade(
 	val id: Long,
 	val workId: Long,
@@ -229,6 +240,68 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Accounts by display name: `raph` finds any nickname containing it, and `raph#4f2a` only the account
+	 * with that discriminator. A bare `#4f2a` matches on the discriminator alone, and `anon` also finds
+	 * accounts that never chose a nickname.
+	 *
+	 * Nicknames are not unique, so this is a list to choose from and never a way to act on a name directly.
+	 * Exact matches come first, then whoever was active most recently.
+	 */
+	fun searchUsers(query: String, limit: Int): List<UserSummary> {
+		val name = query.substringBefore('#').trim()
+		val discriminator = query.substringAfter('#', "").trim().lowercase()
+		if (name.isEmpty() && discriminator.isEmpty()) return emptyList()
+		val contains = "%" + name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+		return dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				$USER_SUMMARY_SELECT
+				WHERE (? = '' OR u.nickname ILIKE ? ESCAPE '\' OR (u.nickname IS NULL AND lower(?) = 'anon'))
+				  AND (? = '' OR lower(left(u.id, ${Nicknames.DISCRIMINATOR_LENGTH})) = ?)
+				ORDER BY COALESCE(lower(u.nickname), 'anon') = lower(?) DESC, u.last_seen_at DESC
+				LIMIT ?
+				""".trimIndent(),
+			).use { statement ->
+				statement.setString(1, name)
+				statement.setString(2, contains)
+				statement.setString(3, name)
+				statement.setString(4, discriminator)
+				statement.setString(5, discriminator)
+				statement.setString(6, name)
+				statement.setInt(7, limit)
+				statement.executeQuery().use { rows ->
+					buildList { while (rows.next()) add(rows.toUserSummary()) }
+				}
+			}
+		}
+	}
+
+	/** Everyone wearing the crown, most recently active first. */
+	fun supporters(limit: Int): List<UserSummary> = dataSource.connection.use { connection ->
+		connection.prepareStatement(
+			"$USER_SUMMARY_SELECT WHERE u.is_supporter ORDER BY u.last_seen_at DESC LIMIT ?",
+		).use { statement ->
+			statement.setInt(1, limit)
+			statement.executeQuery().use { rows ->
+				buildList { while (rows.next()) add(rows.toUserSummary()) }
+			}
+		}
+	}
+
+	private fun ResultSet.toUserSummary(): UserSummary {
+		val id = getString("id")
+		return UserSummary(
+			userId = id,
+			displayName = Nicknames.display(getString("nickname"), id),
+			supporter = getBoolean("is_supporter"),
+			banned = getBoolean("is_banned"),
+			shadowbanned = getBoolean("is_shadowbanned"),
+			comments = getInt("comments"),
+			lastSeenAt = getObject("last_seen_at", OffsetDateTime::class.java),
+		)
 	}
 
 	fun comment(id: Long): QueuedComment? = dataSource.connection.use { connection ->
@@ -460,6 +533,12 @@ class ModerationQueueRepository(private val dataSource: DataSource) {
 	private fun displayName(nickname: String?, userId: String): String = Nicknames.display(nickname, userId)
 
 	private companion object {
+		val USER_SUMMARY_SELECT = """
+			SELECT u.id, u.nickname, u.is_supporter, u.is_banned, u.is_shadowbanned, u.last_seen_at,
+			       (SELECT count(*) FROM comment c WHERE c.user_id = u.id) AS comments
+			FROM app_user u
+		""".trimIndent()
+
 		val COMMENT_SELECT = """
 			SELECT c.id, c.work_id, w.canonical_title, c.work_chapter_id, c.body, c.lang, c.state,
 			       c.up, c.down, c.score, c.created_at, c.user_id, u.nickname, u.is_banned,

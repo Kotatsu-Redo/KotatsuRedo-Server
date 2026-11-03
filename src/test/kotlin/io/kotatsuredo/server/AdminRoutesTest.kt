@@ -40,6 +40,10 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
@@ -305,6 +309,76 @@ class AdminRoutesTest {
 		val removed = client.withSession(token, "/users/${donor.id}/unsupporter", "{}")
 		assertEquals(HttpStatusCode.OK, removed.status)
 		assertEquals(false, comments.view(id, reader)?.isSupporter)
+	}
+
+	@Test
+	fun `a crown goes to the account picked from a username search, not to everyone with that name`() = testApplication {
+		setup()
+		val root = assertNotNull(moderation.bootstrapFirstAdmin("root", "a-long-enough-password"))
+		val secret = enrol(root)
+		val token = client.login("root", "a-long-enough-password", Totp.code(secret, step() + 1)).sessionCookie()
+
+		val first = user("first")
+		val second = user("second")
+		val nameless = user("nameless")
+		val other = user("other")
+		identityRepository.setNickname(first.id, "Raph")
+		identityRepository.setNickname(second.id, "raph")
+		identityRepository.setNickname(other.id, "raphael_100%")
+
+		suspend fun search(query: String): List<String> {
+			val encoded = java.net.URLEncoder.encode(query, Charsets.UTF_8)
+			val response = client.withSession(token, "/users/search?q=$encoded")
+			assertEquals(HttpStatusCode.OK, response.status, query)
+			return Json.parseToJsonElement(response.bodyAsText()).jsonObject.getValue("users").jsonArray
+				.map { it.jsonObject.getValue("user_id").jsonPrimitive.content }
+		}
+
+		// Exact names first, in any case, and both accounts that share the name
+		val found = search("RAPH")
+		assertEquals(setOf(first.id, second.id), found.take(2).toSet())
+		assertEquals(other.id, found[2])
+
+		// The discriminator is what tells them apart
+		assertEquals(listOf(first.id), search("raph#${first.id.take(4)}"))
+		assertEquals(first.id, search("#${first.id.take(4).uppercase()}").first())
+		assertEquals(listOf(nameless.id), search("anon#${nameless.id.take(4)}"))
+
+		// What is typed is a name, never a pattern
+		assertEquals(listOf(other.id), search("100%"))
+		assertEquals(emptyList(), search("r%h"))
+		assertEquals(emptyList(), search("ra_h"))
+		assertEquals(emptyList(), search("#"))
+		assertEquals(emptyList(), search("nobody-has-this"))
+
+		assertEquals(HttpStatusCode.BadRequest, client.withSession(token, "/users/search?q=").status)
+		assertEquals(HttpStatusCode.BadRequest, client.withSession(token, "/users/search").status)
+		assertEquals(HttpStatusCode.BadRequest, client.withSession(token, "/users/search?q=a%00b").status)
+		assertEquals(HttpStatusCode.BadRequest, client.withSession(token, "/users/search?q=" + "a".repeat(65)).status)
+
+		assertEquals("[]", client.withSession(token, "/supporters").bodyAsText())
+		assertEquals(
+			HttpStatusCode.OK,
+			client.withSession(token, "/users/${first.id}/supporter", """{"reason":"donated"}""").status,
+		)
+
+		assertTrue(user("first").isSupporter)
+		assertEquals(false, user("second").isSupporter)
+		val listed = Json.parseToJsonElement(client.withSession(token, "/supporters").bodyAsText()).jsonArray
+		assertEquals(listOf(first.id), listed.map { it.jsonObject.getValue("user_id").jsonPrimitive.content })
+		assertEquals("Raph#${first.id.take(4).lowercase()}", listed.single().jsonObject.getValue("user").jsonPrimitive.content)
+		assertTrue(client.withSession(token, "/actions").bodyAsText().contains("donated"))
+
+		assertEquals(HttpStatusCode.OK, client.withSession(token, "/users/${first.id}/unsupporter", "{}").status)
+		assertEquals("[]", client.withSession(token, "/supporters").bodyAsText())
+	}
+
+	@Test
+	fun `looking accounts up takes a moderator session`() = testApplication {
+		setup()
+		user("someone")
+		assertEquals(HttpStatusCode.Unauthorized, client.get("/admin/api/users/search?q=someone").status)
+		assertEquals(HttpStatusCode.Unauthorized, client.get("/admin/api/supporters").status)
 	}
 
 	@Test

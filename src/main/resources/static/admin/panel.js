@@ -5,6 +5,8 @@ const $ = (id) => document.getElementById(id);
 
 let session = null;
 let current = 'overview';
+// Kept so that the results are still there after an action reloads the view.
+let supporterQuery = '';
 
 // -- transport ---------------------------------------------------------------------------------
 
@@ -108,6 +110,14 @@ const VIEWS = {
 		title: 'Sanctions',
 		hint: 'Everyone banned or shadowbanned, and the decision that put them there. Lifting one is done here.',
 		load: () => api('/sanctions').then(sanctionList),
+	},
+	supporters: {
+		title: 'Supporters',
+		hint: 'Give a donor their crown by username. Several people can share a name, so check the #tag before you give it.',
+		load: () => Promise.all([
+			api('/supporters'),
+			supporterQuery ? searchUsers(supporterQuery) : null,
+		]).then(([supporters, found]) => supportersPage(supporters, found)),
 	},
 	devices: {
 		title: 'Banned devices',
@@ -650,6 +660,105 @@ function accountPage() {
 	return card;
 }
 
+function searchUsers(query) {
+	return api('/users/search?q=' + encodeURIComponent(query));
+}
+
+function supportersPage(supporters, found) {
+	const form = element(
+		'<form class="card">' +
+			'<label for="supporter-q">Username</label>' +
+			'<div class="search-row">' +
+				'<input id="supporter-q" maxlength="64" autocomplete="off" spellcheck="false" placeholder="raph or raph#4f2a">' +
+				'<button class="primary" type="submit">Search</button>' +
+			'</div>' +
+		'</form>',
+	);
+	const input = form.querySelector('input');
+	input.value = supporterQuery;
+	const results = element('<div></div>');
+	const showResults = (page) => {
+		results.replaceChildren();
+		if (!page) return;
+		results.appendChild(element('<h3>Results</h3>'));
+		results.appendChild(userTable(page.users, 'No account has that name.'));
+		if (page.more) {
+			results.appendChild(element('<p class="hint">Showing the first 50. Add the #tag to narrow it down.</p>'));
+		}
+	};
+	showResults(found);
+
+	form.onsubmit = (event) => {
+		event.preventDefault();
+		run(async () => {
+			const query = input.value.trim();
+			showResults(query ? await searchUsers(query) : null);
+			supporterQuery = query;
+			return false;
+		}, form.querySelector('button'));
+	};
+
+	const page = element('<div></div>');
+	page.appendChild(form);
+	page.appendChild(results);
+	page.appendChild(element('<h3>Current supporters (' + supporters.length + ')</h3>'));
+	page.appendChild(userTable(supporters, 'Nobody has a crown yet.'));
+	return page;
+}
+
+function userTable(users, emptyMessage) {
+	if (!users.length) return empty(emptyMessage);
+	const table = element(
+		'<table><thead><tr><th>User</th><th>Status</th><th>Comments</th><th>Last seen</th><th></th></tr></thead>' +
+		'<tbody></tbody></table>',
+	);
+	const body = table.querySelector('tbody');
+
+	users.forEach((user) => {
+		const marks = [];
+		if (user.supporter) marks.push('<span class="tag">👑 supporter</span>');
+		if (user.banned) marks.push('<span class="tag banned">banned</span>');
+		if (user.shadowbanned) marks.push('<span class="tag shadowed">shadowbanned</span>');
+
+		const row = element(
+			'<tr>' +
+				'<td>' + escapeHtml(user.user) + '</td>' +
+				'<td>' + marks.join(' ') + '</td>' +
+				'<td>' + user.comments + '</td>' +
+				'<td>' + when(user.last_seen_at) + '</td>' +
+				'<td class="actions"></td>' +
+			'</tr>',
+		);
+		const actions = row.querySelector('.actions');
+		const add = (label, handler) => {
+			const button = element('<button>' + label + '</button>');
+			button.onclick = () => run(handler, button);
+			actions.appendChild(button);
+		};
+
+		const title = (user.supporter ? 'Remove the crown from ' : 'Give the crown to ') + user.user;
+		add(user.supporter ? 'Remove crown' : 'Give crown', async () => {
+			const reason = await askReason(
+				title,
+				'A little crown next to their name on comments, as a thank-you for donating.',
+				false,
+			);
+			if (reason === null) return false;
+			const path = user.supporter ? 'unsupporter' : 'supporter';
+			await api('/users/' + user.user_id + '/' + path, { method: 'POST', body: JSON.stringify({ reason }) });
+			return true;
+		});
+		add('Their comments', async () => {
+			const page = await api('/users/' + user.user_id + '/comments');
+			show('Comments by ' + user.user, 'Everything they wrote, including what is shadowed or removed.',
+				commentList(page.comments, 'Nothing from this account.'));
+			return false;
+		});
+		body.appendChild(row);
+	});
+	return table;
+}
+
 function actionList(actions) {
 	if (!actions.length) return empty('Nothing yet.');
 	const table = element(
@@ -713,7 +822,7 @@ async function refreshCounts() {
 
 function buildNav() {
 	const queueKeys = ['overview', 'disliked', 'recent', 'flagged', 'blocked', 'ban-evasion', 'brigades', 'disputes'];
-	const adminKeys = ['health', 'sanctions', 'filter-stats', 'actions', 'account', 'devices', 'moderators'];
+	const adminKeys = ['health', 'sanctions', 'supporters', 'filter-stats', 'actions', 'account', 'devices', 'moderators'];
 	const countKeys = {
 		disliked: 'disliked',
 		flagged: 'flagged',

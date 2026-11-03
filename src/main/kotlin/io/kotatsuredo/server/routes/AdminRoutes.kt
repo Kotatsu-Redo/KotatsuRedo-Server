@@ -28,6 +28,7 @@ import io.kotatsuredo.server.moderation.QueuedBrigade
 import io.kotatsuredo.server.moderation.QueuedComment
 import io.kotatsuredo.server.moderation.QueuedDispute
 import io.kotatsuredo.server.moderation.SanctionedUser
+import io.kotatsuredo.server.moderation.UserSummary
 import io.ktor.http.CookieEncoding
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
@@ -56,6 +57,9 @@ private const val MAX_BACKFILL_BATCH = 5_000
 private const val MAX_LOGIN_USERNAME = 64
 private const val MAX_LOGIN_PASSWORD = 1024
 private const val MAX_LOGIN_CODE = 16
+private const val MAX_USER_QUERY = 64
+private const val USER_SEARCH_LIMIT = 50
+private const val MAX_SUPPORTERS = 500
 internal const val ADMIN_CSRF_HEADER = "X-KotatsuRedo-CSRF"
 internal const val ADMIN_CSRF_VALUE = "1"
 private val passwordVerificationDispatcher = Dispatchers.Default.limitedParallelism(2)
@@ -585,6 +589,27 @@ fun Route.adminRoutes(
 			call.respond(moderation.sanctionedUsers().map { it.toDto() })
 		}
 
+		/** Accounts by display name. Nicknames are shared, so the panel picks one of these rather than a name. */
+		get("/users/search") {
+			call.requireEnrolled(moderation)
+			val query = call.request.queryParameters["q"]?.trim().orEmpty()
+			if (query.isEmpty() || query.length > MAX_USER_QUERY || query.any { it.isISOControl() }) {
+				throw ApiException(ApiError.BadRequest("q"))
+			}
+			val found = queues.searchUsers(query, USER_SEARCH_LIMIT + 1)
+			call.respond(
+				UserSearchResponse(
+					users = found.take(USER_SEARCH_LIMIT).map { it.toDto() },
+					more = found.size > USER_SEARCH_LIMIT,
+				),
+			)
+		}
+
+		get("/supporters") {
+			call.requireEnrolled(moderation)
+			call.respond(queues.supporters(MAX_SUPPORTERS).map { it.toDto() })
+		}
+
 		// -- comment actions -----------------------------------------------------------------------
 
 		post("/comments/{id}/remove") {
@@ -922,6 +947,30 @@ data class SanctionDto(
 	val comments: Int,
 	@SerialName("removed_comments") val removedComments: Int,
 	@SerialName("last_seen_at") val lastSeenAt: String,
+)
+
+@Serializable
+data class UserSummaryDto(
+	@SerialName("user_id") val userId: String,
+	val user: String,
+	val supporter: Boolean,
+	val banned: Boolean,
+	val shadowbanned: Boolean,
+	val comments: Int,
+	@SerialName("last_seen_at") val lastSeenAt: String,
+)
+
+@Serializable
+data class UserSearchResponse(val users: List<UserSummaryDto>, val more: Boolean)
+
+private fun UserSummary.toDto() = UserSummaryDto(
+	userId = userId,
+	user = displayName,
+	supporter = supporter,
+	banned = banned,
+	shadowbanned = shadowbanned,
+	comments = comments,
+	lastSeenAt = lastSeenAt.iso(),
 )
 
 private fun SanctionedUser.toDto() = SanctionDto(
