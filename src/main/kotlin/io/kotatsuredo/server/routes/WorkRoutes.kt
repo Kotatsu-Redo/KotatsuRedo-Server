@@ -18,17 +18,23 @@ import io.kotatsuredo.server.works.WorkLimits
 import io.kotatsuredo.server.works.WorkResolver
 import io.kotatsuredo.server.works.WorkRepository
 import io.kotatsuredo.server.works.WorkResolutionOverloaded
+import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.request.receive
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -125,6 +131,15 @@ data class LinkRequest(
 
 @Serializable
 data class FingerprintRef(val source: String, val key: String)
+
+/** Name the work by [workId], by the source entry ([source] and [key] together), or both. */
+@Serializable
+data class PassRequest(
+	@SerialName("work_id") val workId: String? = null,
+	val source: String? = null,
+	val key: String? = null,
+	val passed: Boolean,
+)
 
 @Serializable
 data class LinkResponse(val outcome: String, @SerialName("work_id") val workId: String? = null)
@@ -272,6 +287,41 @@ fun Route.workRoutes(
 			throw ApiException(ApiError.Overloaded(1, "work_resolution"))
 		}
 		call.respond(ResolveResponse(resolved))
+	}
+
+	/**
+	 * "Not interested": a reader passing on a suggested manga, or taking that back.
+	 *
+	 * Deliberately read-only about works: it never creates a work, an alias or an observation,
+	 * because saying no to a suggestion is not having opened or read it. A manga the server does not
+	 * know is answered `recorded: false` and nothing is written. The one write is the account's own
+	 * `work_pass` row, which only ever counts in aggregate once ten accounts agree.
+	 */
+	post("/pass") {
+		val caller = call.requireCaller(identities)
+
+		val body = call.receive<PassRequest>()
+		val byId = body.workId?.let { it.toLongOrNull() ?: throw ApiException(ApiError.BadRequest("work_id")) }
+		if ((body.source == null) != (body.key == null)) throw ApiException(ApiError.BadRequest("source"))
+		if (body.source != null && !FingerprintRef(body.source, body.key!!).isValid()) {
+			throw ApiException(ApiError.BadRequest("source"))
+		}
+		if (byId == null && body.source == null) throw ApiException(ApiError.BadRequest("work_id"))
+		// Charged once the request is known to be well formed, so a typo costs nothing, and for every
+		// well formed write whether or not the manga is known: the lookup is what an abuser would use.
+		call.enforceLimit(limiter, RateLimiter.Bucket.PASSES, caller.tier, caller.identity.id)
+
+		val workId = works.applyPass(byId, body.source, body.key, caller.identity.id, body.passed)
+		val recorded = workId != null && body.passed
+		// Built by hand: the API's JSON omits nulls, and the contract says an unknown manga is answered
+		// with an explicit `"work_id": null`.
+		call.respondText(
+			buildJsonObject {
+				put("work_id", workId?.let { JsonPrimitive(it.toString()) } ?: JsonNull)
+				put("recorded", recorded)
+			}.toString(),
+			ContentType.Application.Json,
+		)
 	}
 
 	/**

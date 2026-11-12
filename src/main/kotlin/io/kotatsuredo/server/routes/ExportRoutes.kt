@@ -82,6 +82,13 @@ data class ExportedCoverDto(
 	@SerialName("reported_at") val reportedAt: String,
 )
 
+/** A manga this account said it was not interested in. */
+@Serializable
+data class ExportedPassDto(
+	@SerialName("work_id") val workId: String,
+	@SerialName("passed_at") val passedAt: String,
+)
+
 @Serializable
 data class ExportDto(
 	@SerialName("exported_at") val exportedAt: String,
@@ -98,6 +105,8 @@ data class ExportDto(
 	val genres: List<ExportedGenreDto> = emptyList(),
 	/** Cover addresses those sources showed, as reported from this account. */
 	val covers: List<ExportedCoverDto> = emptyList(),
+	/** Manga this account said it was not interested in. */
+	val passes: List<ExportedPassDto> = emptyList(),
 	/**
 	 * What is deliberately absent, said out loud rather than left to be noticed.
 	 *
@@ -235,6 +244,19 @@ fun Route.exportRoutes(
 					)
 				}
 				coverCursor = page.lastOrNull()?.let { it.source to it.sourceKey } ?: coverCursor
+			} while (page.size == EXPORT_PAGE_SIZE)
+
+			write("],\"passes\":[")
+			first = true
+			var passCursor = 0L
+			do {
+				val page = works.passesByPage(identity.id, passCursor, EXPORT_PAGE_SIZE)
+				page.forEach { pass ->
+					if (!first) write(",")
+					first = false
+					write(exportJson.encodeToString(ExportedPassDto(pass.workId.toString(), pass.createdAt.iso())))
+				}
+				passCursor = page.lastOrNull()?.workId ?: passCursor
 			} while (page.size == EXPORT_PAGE_SIZE)
 
 			write("],\"notes\":${exportJson.encodeToString(NOTES)}}")

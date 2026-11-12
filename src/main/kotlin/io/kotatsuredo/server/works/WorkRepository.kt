@@ -90,6 +90,21 @@ data class AliasObservation(
 	val updatedAt: java.time.OffsetDateTime,
 )
 
+/** How "not interested" lowers a work in [WorkRepository.similarTo]. */
+object PassRule {
+	/** Accounts that must have passed on a work before it is lowered at all. */
+	const val MIN_ACCOUNTS = 10
+
+	/** The most a work can be lowered: if all of its readers passed on it, by this share. */
+	const val WEIGHT = 0.3
+}
+
+/** A work an account said it was not interested in, for the account's own data export. */
+data class WorkPass(
+	val workId: Long,
+	val createdAt: java.time.OffsetDateTime,
+)
+
 /** A cover address an account reported for a source entry, for the account's own data export. */
 data class CoverObservation(
 	val source: String,
@@ -1284,7 +1299,19 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * Quality comes from the rating aggregate, whose Bayesian prior already pulls a thinly rated work
 	 * to the mean; readership is distinct accounts, so a widely read work wins a tie without drowning
 	 * a niche match; era applies only when both years are known. Every input is an aggregate - nothing
-	 * here can describe one person. Scores compare within one answer only: their scale depends on the
+	 * here can describe one person.
+	 *
+	 * One more adjustment only ever lowers, and only once enough readers agree. A work that at least
+	 * [PassRule.MIN_ACCOUNTS] distinct, unsanctioned accounts said they were not interested in (`work_pass`)
+	 * is multiplied by
+	 *
+	 *     passed    = 1 - PassRule.WEIGHT * passers / (passers + readers)      (exactly 1 below the minimum)
+	 *
+	 * with `readers` the same distinct-account readership used above, so a work most of its readers
+	 * passed on loses nearly a third of its score and a widely read one that a few dozen passed on
+	 * barely moves. Passers must also be past the lowest trust tier (see [passersOf]), so a crowd of
+	 * fresh accounts cannot lower a work. Below the minimum this adjustment does nothing, so a handful of
+	 * passes cannot be read off an answer; the other effect of a pass, on co-reading, is described there. Scores compare within one answer only: their scale depends on the
 	 * work asked about.
 	 */
 	fun similarTo(workId: Long, limit: Int = MAX_SIMILAR): List<SimilarWork> =
@@ -1299,6 +1326,7 @@ class WorkRepository(private val dataSource: DataSource) {
 
 			val readers = readersOf(connection, candidates.keys + workId)
 			val (globalMean, bayesian) = qualityOf(connection, candidates.keys)
+			val passers = passersOf(connection, candidates.keys)
 			val ownYear = yearOf(connection, workId)
 			val bestGenre = byGenre.values.maxOfOrNull { it.score }?.takeIf { it > 0.0 } ?: 1.0
 			val ownReaders = readers[workId] ?: 0
@@ -1322,6 +1350,7 @@ class WorkRepository(private val dataSource: DataSource) {
 							readers = theirReaders,
 							year = candidate.year,
 							ownYear = ownYear,
+							passers = passers[candidate.workId] ?: 0,
 						),
 					)
 				}
@@ -1489,6 +1518,39 @@ class WorkRepository(private val dataSource: DataSource) {
 			}
 		}
 
+	/**
+	 * Distinct accounts that passed on each work - only for works at least [PassRule.MIN_ACCOUNTS] did,
+	 * so a count below the minimum never leaves the database.
+	 *
+	 * Only established-enough accounts count: not banned, not shadowbanned, and above trust tier 0.
+	 * Accounts are free to create, so without the tier rule ten throwaway ones could lower any work.
+	 * Tier comes from the `user_trust` view (V19), the same definition [IdentityRepository.trustTier]
+	 * implements in code, so the two cannot be told apart: a new account's pass is stored, exported
+	 * and removable, but counts only once the account is no longer in tier 0.
+	 */
+	private fun passersOf(connection: Connection, ids: Collection<Long>): Map<Long, Int> =
+		connection.prepareStatement(
+			"""
+			SELECT pass.work_id, count(*)
+			FROM work_pass pass
+			JOIN app_user account ON account.id = pass.user_id
+			JOIN user_trust trust ON trust.user_id = pass.user_id
+			WHERE pass.work_id = ANY(?)
+			  AND NOT account.is_banned AND NOT account.is_shadowbanned
+			  AND trust.tier > 0
+			GROUP BY pass.work_id
+			HAVING count(*) >= ?
+			""".trimIndent(),
+		).use { statement ->
+			statement.setArray(1, connection.createArrayOf("bigint", ids.toTypedArray()))
+			statement.setInt(2, PassRule.MIN_ACCOUNTS)
+			statement.executeQuery().use { rows ->
+				val result = HashMap<Long, Int>()
+				while (rows.next()) result[rows.getLong(1)] = rows.getInt(2)
+				result
+			}
+		}
+
 	/** The global mean rating (null before anyone has rated) and each rated work's Bayesian average. */
 	private fun qualityOf(connection: Connection, ids: Collection<Long>): Pair<Double?, Map<Long, Double>> {
 		val globalMean = connection.createStatement().use { statement ->
@@ -1527,7 +1589,8 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * contributes only its [perAccountCap] most recently opened works, which bounds the pairs one
 	 * account can generate (`cap * (cap - 1) / 2`) and keeps one bulk-opening account from defining
 	 * everyone's neighbours. A pair is stored only when at least [minReaders] accounts share it, and
-	 * nothing about which accounts they were is stored at all.
+	 * nothing about which accounts they were is stored at all. A work an account passed on (`work_pass`)
+	 * is left out of that account's contribution.
 	 *
 	 * Built in session-local scratch tables, in slices, so no single statement outgrows the pool's
 	 * statement timeout as the data grows: accounts are read in hash buckets, pairs counted in ranges
@@ -1558,6 +1621,12 @@ class WorkRepository(private val dataSource: DataSource) {
 					JOIN app_user account ON account.id = observation.user_id
 					JOIN work w ON w.id = observation.work_id AND w.merged_into IS NULL
 					WHERE NOT account.is_banned AND NOT account.is_shadowbanned
+					  -- A work the account said it was not interested in is not something it read together
+					  -- with the rest.
+					  AND NOT EXISTS (
+					    SELECT 1 FROM work_pass pass
+					    WHERE pass.user_id = observation.user_id AND pass.work_id = observation.work_id
+					  )
 					  AND ((hashtext(observation.user_id)::bigint % ?) + ?) % ? = ?
 					GROUP BY observation.user_id, observation.work_id
 				) ranked
@@ -1633,6 +1702,125 @@ class WorkRepository(private val dataSource: DataSource) {
 		}
 		return (estimate / CO_READ_OBSERVATIONS_PER_BUCKET + 1).toInt().coerceIn(1, CO_READ_MAX_BATCHES)
 	}
+
+	// -- passes ("not interested") ----------------------------------------------------------------
+
+	/**
+	 * Records or takes back an account's pass, and says which work it was about (null if none is known).
+	 *
+	 * Read-only about works by design: saying "not interested" is not opening or reading a work, so this
+	 * never creates a work, an alias or an observation. A [workId] that exists wins; otherwise the
+	 * [source] entry's alias. A merge is followed to the survivor, as ratings do.
+	 *
+	 * One transaction does the lookup and the write, holding a shared lock on every work row it walks
+	 * through. [mergeWorks] takes those rows for update before it moves anything, so the pass either
+	 * lands before a merge and is moved with it, or waits and finds the work already merged away - it
+	 * can never be written to, or lost from, a work a merge has just emptied.
+	 */
+	fun applyPass(workId: Long?, source: String?, sourceKey: String?, userId: String, passed: Boolean): Long? =
+		dataSource.connection.use { connection ->
+			connection.autoCommit = false
+			try {
+				val start = workId?.takeIf { lockedWork(connection, it) != null }
+					?: if (source != null && sourceKey != null) {
+						connection.prepareStatement("SELECT work_id FROM work_alias WHERE source = ? AND source_key = ?")
+							.use { statement ->
+								statement.setString(1, source)
+								statement.setString(2, sourceKey)
+								statement.executeQuery().use { if (it.next()) it.getLong(1) else null }
+							}
+					} else {
+						null
+					}
+				var current = start
+				var hops = 0
+				var survivor: Long? = null
+				while (current != null) {
+					// Locking is what makes the read below current: a merge in flight holds this row.
+					val next = lockedWork(connection, current) ?: break
+					if (next.mergedInto == null) {
+						survivor = current
+						break
+					}
+					if (++hops > MAX_MERGE_HOPS) break
+					current = next.mergedInto
+				}
+				if (survivor != null) {
+					if (passed) {
+						connection.prepareStatement(
+							"INSERT INTO work_pass (work_id, origin_work_id, user_id) SELECT ?, ?, id FROM app_user " +
+								"WHERE id = ? ON CONFLICT DO NOTHING",
+						).use { statement ->
+							statement.setLong(1, survivor)
+							statement.setLong(2, survivor)
+							statement.setString(3, userId)
+							statement.executeUpdate()
+						}
+					} else {
+						connection.prepareStatement("DELETE FROM work_pass WHERE work_id = ? AND user_id = ?")
+							.use { statement ->
+								statement.setLong(1, survivor)
+								statement.setString(2, userId)
+								statement.executeUpdate()
+							}
+					}
+				}
+				connection.commit()
+				survivor
+			} catch (error: Exception) {
+				connection.rollback()
+				throw error
+			} finally {
+				connection.autoCommit = true
+			}
+		}
+
+	private class LockedWork(val mergedInto: Long?)
+
+	/** Takes a shared row lock on a work and reads what it was merged into, or null if there is no such work. */
+	private fun lockedWork(connection: Connection, workId: Long): LockedWork? =
+		connection.prepareStatement("SELECT merged_into FROM work WHERE id = ? FOR SHARE").use { statement ->
+			statement.setLong(1, workId)
+			statement.executeQuery().use { rows ->
+				if (rows.next()) LockedWork(rows.getLong(1).takeUnless { rows.wasNull() }) else null
+			}
+		}
+
+	/** Records a pass on exactly this work, without following merges. For callers that already hold the survivor. */
+	fun setPass(workId: Long, userId: String) {
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"INSERT INTO work_pass (work_id, origin_work_id, user_id) SELECT ?, ?, id FROM app_user WHERE id = ? " +
+					"ON CONFLICT DO NOTHING",
+			).use { statement ->
+				statement.setLong(1, workId)
+				statement.setLong(2, workId)
+				statement.setString(3, userId)
+				statement.executeUpdate()
+			}
+		}
+	}
+
+
+	/** This account's passes in work id order, for the data export. */
+	fun passesByPage(userId: String, afterWorkId: Long, limit: Int): List<WorkPass> =
+		dataSource.connection.use { connection ->
+			connection.prepareStatement(
+				"SELECT work_id, created_at FROM work_pass WHERE user_id = ? AND work_id > ? " +
+					"ORDER BY work_id LIMIT ?",
+			).use { statement ->
+				statement.setString(1, userId)
+				statement.setLong(2, afterWorkId)
+				statement.setInt(3, limit)
+				statement.executeQuery().use { rows ->
+					buildList {
+						while (rows.next()) {
+							add(WorkPass(rows.getLong(1), rows.getObject(2, java.time.OffsetDateTime::class.java)))
+						}
+					}
+				}
+			}
+		}
 
 	// -- per-account records, for the data export ---------------------------------------------
 
@@ -1999,6 +2187,7 @@ class WorkRepository(private val dataSource: DataSource) {
 		readers: Int,
 		year: Int?,
 		ownYear: Int?,
+		passers: Int = 0,
 	): Double {
 		val base = genre + CO_READ_WEIGHT * bestGenre * coReadCosine
 		val quality = if (bayesian != null && globalMean != null) {
@@ -2013,7 +2202,12 @@ class WorkRepository(private val dataSource: DataSource) {
 		} else {
 			1.0
 		}
-		return base * quality * readership * era
+		val passed = if (passers >= PassRule.MIN_ACCOUNTS) {
+			1.0 - PassRule.WEIGHT * passers / (passers + readers).toDouble()
+		} else {
+			1.0
+		}
+		return base * quality * readership * era * passed
 	}
 
 	/** A work still its own, never queued, never described by any catalogue, and one they cover. */
@@ -2407,8 +2601,8 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * and are recorded in `work_merge_log.moved_rows`; comments and ratings move and carry their own
 	 * origin; titles are copied, so the losing work can still describe itself if it comes back.
 	 *
-	 * Rows that would collide - a cover hash from the same source, a rating by a user who rated both -
-	 * stay where they are rather than being dropped. They are unreachable while the merge stands,
+	 * Rows that would collide - a cover hash from the same source, a rating or a pass by a user who did
+	 * both - stay where they are rather than being dropped. They are unreachable while the merge stands,
 	 * because every lookup ignores merged works, and they are correct again the moment it is undone.
 	 */
 	fun mergeWorks(from: Long, into: Long, reason: String, moderatorId: String? = null) {
@@ -2416,6 +2610,14 @@ class WorkRepository(private val dataSource: DataSource) {
 		dataSource.connection.use { connection ->
 			connection.autoCommit = false
 			try {
+				// Taken first, in id order, and held to the end: a pass being written ([applyPass]) takes
+				// the same rows, so it either lands before the merge and is moved with it, or waits and
+				// sees the work merged away. Nothing can land on a work this is emptying.
+				connection.prepareStatement("SELECT id FROM work WHERE id IN (?, ?) ORDER BY id FOR UPDATE").use { statement ->
+					statement.setLong(1, from)
+					statement.setLong(2, into)
+					statement.executeQuery().use { while (it.next()) Unit }
+				}
 				val moved = buildJsonObject {
 					put("aliases", movedAliases(connection, from))
 					put("observations", movedObservations(connection, from))
@@ -2452,6 +2654,8 @@ class WorkRepository(private val dataSource: DataSource) {
 						"AND source NOT IN (SELECT source FROM work_cover_hash WHERE work_id = ?)",
 					"UPDATE rating SET work_id = ? WHERE work_id = ? " +
 						"AND user_id NOT IN (SELECT user_id FROM rating WHERE work_id = ?)",
+					"UPDATE work_pass SET work_id = ? WHERE work_id = ? " +
+						"AND user_id NOT IN (SELECT user_id FROM work_pass WHERE work_id = ?)",
 				).forEach { sql ->
 					connection.prepareStatement(sql).use { statement ->
 						statement.setLong(1, into)
@@ -2591,6 +2795,7 @@ class WorkRepository(private val dataSource: DataSource) {
 			listOf(
 				"UPDATE comment SET work_id = origin_work_id WHERE work_id = ? AND origin_work_id = ?",
 				"UPDATE rating SET work_id = origin_work_id WHERE work_id = ? AND origin_work_id = ?",
+				"UPDATE work_pass SET work_id = origin_work_id WHERE work_id = ? AND origin_work_id = ?",
 			).forEach { sql ->
 				connection.prepareStatement(sql).use { statement ->
 					statement.setLong(1, into)

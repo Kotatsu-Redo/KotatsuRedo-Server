@@ -379,6 +379,88 @@ class SimilarityTest {
 		assertTrue(scores.getValue("Undated") >= scores.getValue("Recent"), "no year, no penalty: $scores")
 	}
 
+	// -- passes ("not interested") --------------------------------------------------------------
+
+	private fun passedBy(workId: Long, users: Collection<String>) {
+		users.forEach { repository.setPass(workId, it) }
+	}
+
+	/** Two otherwise identical candidates, the first passed on by [passers], both read by twelve accounts. */
+	private fun passScores(passers: Collection<String>, readerCount: Int = 12): Pair<Double, Double> {
+		val seed = work("Seed", genres = listOf("Villainess", "Isekai"))
+		val passed = work("Passed", genres = listOf("Villainess", "Isekai"))
+		val control = work("Control", genres = listOf("Villainess", "Isekai"))
+		val readers = users("pr", readerCount)
+		seen(passed, "MANGADEX", "passed", readers)
+		seen(control, "MANGADEX", "control", readers)
+		passedBy(passed, passers)
+		val scores = repository.similarTo(seed).associate { it.title to it.score }
+		return scores.getValue("Passed") to scores.getValue("Control")
+	}
+
+	@Test
+	fun `below ten passers nothing changes`() {
+		val (passed, control) = passScores(established("p", 9))
+
+		assertEquals(control, passed, 1e-12)
+	}
+
+	@Test
+	fun `ten passers lower a work by the documented share`() {
+		val (passed, control) = passScores(established("p", 10))
+
+		// 1 - 0.3 * 10 / (10 + 12) of the same score
+		assertEquals(control * (1.0 - 0.3 * 10 / 22), passed, 1e-9)
+		assertTrue(passed < control)
+	}
+
+	@Test
+	fun `more passers lower it further but never by more than thirty percent`() {
+		val (passed, control) = passScores(established("p", 40))
+
+		assertEquals(control * (1.0 - 0.3 * 40 / 52), passed, 1e-9)
+		assertTrue(passed > control * 0.7)
+	}
+
+	@Test
+	fun `ten passers with no readers at all lower a work to exactly seventy percent`() {
+		val (passed, control) = passScores(established("p", 10), readerCount = 0)
+
+		assertEquals(control * 0.7, passed, 1e-12)
+	}
+
+	/** Accounts are free to make, so ten fresh ones must not be able to lower a work. */
+	@Test
+	fun `passes by brand new accounts are stored but not counted until they are not new`() {
+		val passers = users("fresh", 10) // tier 0: younger than a day, no active days
+		val seed = work("Seed", genres = listOf("Villainess", "Isekai"))
+		val passed = work("Passed", genres = listOf("Villainess", "Isekai"))
+		val control = work("Control", genres = listOf("Villainess", "Isekai"))
+		passers.forEach { repository.setPass(passed, it) }
+
+		fun ratio(): Double {
+			val scores = repository.similarTo(seed).associate { it.title to it.score }
+			return scores.getValue("Passed") / scores.getValue("Control")
+		}
+		assertEquals(1.0, ratio(), 1e-12)
+
+		passers.forEach { settled(it) }
+		assertEquals(1.0 - 0.3 * 10 / 10, ratio(), 1e-9)
+	}
+
+	@Test
+	fun `banned and shadowbanned passers are not counted`() {
+		val clean = established("p", 8)
+		val banned = established("p-banned", 1).single()
+		val shadowbanned = established("p-shadow", 1).single()
+		ban(banned)
+		sql("UPDATE app_user SET is_shadowbanned = TRUE WHERE id = '$shadowbanned'")
+
+		val (passed, control) = passScores(clean + banned + shadowbanned)
+
+		assertEquals(control, passed, 1e-12)
+	}
+
 	// -- co-reading --------------------------------------------------------------------------------
 
 	@Test
@@ -479,5 +561,42 @@ class SimilarityTest {
 		val order = repository.similarTo(seed).map { it.title }
 
 		assertEquals("Shared readers", order.first(), "$order")
+	}
+
+	/** A work an account passed on is not something it read together with the rest. */
+	@Test
+	fun `a pair is not counted for an account that passed on one of the two`() {
+		val first = work("First")
+		val second = work("Second")
+		val readers = users("cp", 11)
+		seen(first, "MANGADEX", "f", readers)
+		seen(second, "MANGADEX", "s", readers)
+
+		repository.refreshCoReading()
+		assertEquals(listOf(Triple(first, second, 11)), coReadPairs())
+
+		repository.setPass(second, readers[0])
+		repository.refreshCoReading()
+		assertEquals(listOf(Triple(first, second, 10)), coReadPairs(), "the passer no longer counts")
+
+		repository.setPass(first, readers[1])
+		repository.refreshCoReading()
+		assertTrue(coReadPairs().isEmpty(), "down to nine")
+	}
+
+	@Test
+	fun `a pass only removes that work from the account's other pairs`() {
+		val first = work("First")
+		val second = work("Second")
+		val third = work("Third")
+		val readers = users("cq", 10)
+		seen(first, "MANGADEX", "f", readers)
+		seen(second, "MANGADEX", "s", readers)
+		seen(third, "MANGADEX", "t", readers)
+		repository.setPass(third, readers[0])
+
+		repository.refreshCoReading()
+
+		assertEquals(listOf(Triple(first, second, 10)), coReadPairs())
 	}
 }

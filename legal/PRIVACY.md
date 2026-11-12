@@ -1,6 +1,6 @@
 # Privacy notice
 
-**Kotatsu-Redo community server** · last updated 2 November 2026
+**Kotatsu-Redo community server** · last updated 12 November 2026
 
 This describes the **official instance** at `community.kotatsuredo.app`, operated by the Kotatsu-Redo
 project and hosted in France. The server is open source, so other people run their own instances
@@ -111,6 +111,22 @@ what lets a suggestion say that people who read one manga often read another. A 
 when at least ten accounts opened both, and the count is all that is kept: it records no account. It
 is rebuilt from scratch every day, so an account deleted today has left it by tomorrow.
 
+### The manga you pass on
+
+When a suggestion is not for you and you tell the app so ("not interested"), the app keeps that on
+your phone, as it always did. With the community features on, it also sends it: which work it was,
+that you passed on it, and when. The server keeps one note for each work you passed on, under your
+account. It does not take that as having opened or read the work: passing on a manga neither adds it
+to the notes of what you opened nor makes the server learn the manga if it did not already know it.
+
+It is used only in aggregate, in two ways. First, a work you passed on is left out of what your own
+account adds to the counts of works opened together; since a pair is kept only while at least ten
+accounts share it, that can by itself decide whether a pair is still counted. Second, a work is ranked
+lower in suggestions because of passes only once at least ten accounts, none of them brand new, have
+passed on it, and then only a little. Nobody is ever shown that you, or anyone, passed on something.
+Taking it back in the app removes the note, and deleting your account removes all of them. They are in
+your export.
+
 ### Suggestions, with the community features off
 
 Suggestions are on by default, whether or not you use the community features. With those off, the
@@ -189,6 +205,9 @@ works and what it needs to recognise them, and nothing else.
   a work.
 - **Your votes** are never shown to anyone, including the person you voted on.
 - **Which manga you opened** is never shown to anyone. Only what several accounts agree on is used.
+- **Which manga you passed on** is never shown to anyone. It lowers a work in suggestions only once
+  at least ten accounts that are not brand new agree, and it removes that work from what your own
+  account adds to the counts of works opened together.
 - **Moderators** can see everything above plus the moderation queues and the block log. They cannot
   see your key, your device hashes in any usable form, or your IP address, because the server does
   not have them.
@@ -204,6 +223,7 @@ works and what it needs to recognise them, and nothing else.
 | Rejected comment text | 30 days |
 | Rejected comment counts | Indefinitely — not linked to you after account deletion |
 | Notes of the manga you opened | Until you delete your account |
+| Manga you passed on | Until you take it back, or you delete your account |
 | Counts of works opened together | Refreshed daily; contains no account |
 | Suggestion lookups without an account | Not kept at all |
 | Raw telemetry | 7 days |
@@ -238,6 +258,7 @@ What happens:
 - Your notes of the manga you opened, and the cover addresses in them, are **erased**. What they
   helped establish — that two sources carry the same work, or what genre it is — describes the manga
   rather than you, and stays.
+- Your notes of the manga you passed on are **erased**.
 - Your comments are **blanked**. The empty rows stay so that replies other people wrote underneath
   them still have a thread to hang from — they carry no text, no nickname and no id. Nothing of yours
   remains in them.
@@ -259,7 +280,7 @@ Two of them are buttons in the app rather than requests to us, which is delibera
 - **Access and portability** — *Settings → Community → Export my data*. Downloads everything the
   server holds about your account as a JSON file: your comments (including any a moderator removed),
   your ratings, your votes, the notes of the manga you opened including the genres and cover addresses
-  in them, your nickname, whether you are marked as a supporter, and when the account was created.
+  in them, the manga you passed on, your nickname, whether you are marked as a supporter, and when the account was created.
 
 For correction, restriction or objection, or to complain about how this is run, reach us through the
 [Discord](https://discord.gg/eu3gnd89gP) or the

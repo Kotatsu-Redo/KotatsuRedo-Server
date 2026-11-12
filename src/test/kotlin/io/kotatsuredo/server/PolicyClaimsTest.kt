@@ -129,6 +129,52 @@ class PolicyClaimsTest {
 		)
 	}
 
+	/**
+	 * "Which manga you passed on ... one note for each work, under your account ... when."
+	 *
+	 * A pass is which work, that it was passed, and when - nothing else - and is tied to the account by
+	 * a key that deletes with it. `origin_work_id` is only the work the pass was made on, so a merge can
+	 * be undone; it is the same work the pass names. A column more would be something the notice does
+	 * not say.
+	 */
+	@Test
+	fun `a pass holds the work, the account and the date, and nothing else`() {
+		val pass = columns().filter { it.first == "work_pass" }.map { it.second }.toSet()
+		assertEquals(setOf("work_id", "user_id", "created_at", "origin_work_id"), pass, "work_pass changed shape - check legal/PRIVACY.md")
+	}
+
+	/** "Deleting your account removes all of them." - by the database, not by code somebody must remember. */
+	@Test
+	fun `passes are deleted with the account or the work`() {
+		val rules = PostgresTestBase.database.source.connection.use { connection ->
+			connection.prepareStatement(
+				"""
+				SELECT k.column_name, rc.delete_rule
+				FROM information_schema.referential_constraints rc
+				JOIN information_schema.key_column_usage k ON k.constraint_name = rc.constraint_name
+				WHERE k.table_name = 'work_pass'
+				""".trimIndent(),
+			).use { statement ->
+				statement.executeQuery().use { rows ->
+					buildMap { while (rows.next()) put(rows.getString(1), rows.getString(2)) }
+				}
+			}
+		}
+		assertEquals(mapOf("user_id" to "CASCADE", "work_id" to "CASCADE"), rules)
+	}
+
+	/**
+	 * "A work is ranked lower in suggestions only once at least ten accounts have passed on it."
+	 *
+	 * That is the lowering only. A pass also removes the work from the passing account's own
+	 * contribution to co-reading, which the notice says separately and which can by itself change whether
+	 * a pair is still counted. The minimum the notice states is the one the ranking uses.
+	 */
+	@Test
+	fun `passes count in suggestions only from ten accounts`() {
+		assertEquals(10, io.kotatsuredo.server.works.PassRule.MIN_ACCOUNTS)
+	}
+
 	/** "That text is kept for 30 days and then erased." */
 	@Test
 	fun `blocked text retention is what the notice says`() {

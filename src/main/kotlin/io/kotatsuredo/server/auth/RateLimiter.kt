@@ -66,6 +66,11 @@ class RateLimiter(
 			),
 			3600,
 		),
+		// "Not interested" writes. A reader sweeping a suggestions list can pass on a lot at once, so the
+		// ceiling is generous; it bounds the write rate of one account, nothing more. What stops accounts
+		// pushing a work down is not this: a work is only lowered once ten accounts past the new tier have
+		// passed on it (WorkRepository.passersOf), and a new account cannot count.
+		PASSES(mapOf(TrustTier.NEW to 300, TrustTier.NORMAL to 300, TrustTier.ESTABLISHED to 300), 86_400),
 		GENERAL(mapOf(TrustTier.NEW to 300, TrustTier.NORMAL to 300, TrustTier.ESTABLISHED to 300), 60),
 		// Anonymous lookups have no account to key on, so this is only ever checked per network, where
 		// it becomes 600 a minute. One reader asks once per manga page and at most eight times per
