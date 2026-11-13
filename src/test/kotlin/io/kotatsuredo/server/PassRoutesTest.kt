@@ -475,6 +475,27 @@ class PassRoutesTest {
 		users.forEach { works.observeAlias("SOURCE_A", key, it, workId, listOf("key")) }
 	}
 
+	/** Past the lowest trust tier: more than a day old and active on three days. */
+	private fun establish(vararg users: String) {
+		source.connection.use { connection ->
+			users.forEach { user ->
+				connection.prepareStatement("UPDATE app_user SET created_at = now() - interval '10 days' WHERE id = ?").use {
+					it.setString(1, user)
+					it.executeUpdate()
+				}
+				(1..3).forEach { daysAgo ->
+					connection.prepareStatement(
+						"INSERT INTO user_active_day (user_id, day) VALUES (?, current_date - ?) ON CONFLICT DO NOTHING",
+					).use {
+						it.setString(1, user)
+						it.setInt(2, daysAgo)
+						it.executeUpdate()
+					}
+				}
+			}
+		}
+	}
+
 	private suspend fun ApplicationTestBuilder.passByEntry(seed: String, key: String) = pass(seed, """{"source":"SOURCE_A","key":"$key","passed":true}""")
 
 	@Test
@@ -498,6 +519,7 @@ class PassRoutesTest {
 		val me = user("me")
 		val first = user("first")
 		val second = user("second")
+		establish(first, second)
 		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
 		observe(id, "/manga/two", first)
 
@@ -519,6 +541,7 @@ class PassRoutesTest {
 		val banned = user("banned")
 		val shadowbanned = user("shadowbanned")
 		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		establish(banned, shadowbanned)
 		observe(id, "/manga/sanctioned", banned, shadowbanned)
 		source.connection.use { connection ->
 			connection.createStatement().use { statement ->
@@ -560,6 +583,7 @@ class PassRoutesTest {
 		val me = user("me")
 		val first = user("first")
 		val second = user("second")
+		establish(first, second)
 		val mine = works.createWork("Mine", 2020, "manga", false)
 		val theirs = works.createWork("Theirs", 2020, "manga", false)
 		observe(mine, "/manga/disputed", me)
@@ -573,6 +597,79 @@ class PassRoutesTest {
 	}
 
 	@Test
+	fun `a verified alias wins over what the caller itself observed`() = testApplication {
+		setup()
+		val me = user("me")
+		val mine = works.createWork("Mine", 2020, "manga", false)
+		val verified = works.createWork("Verified", 2020, "manga", false)
+		observe(mine, "/manga/contested", me)
+		works.linkAlias("SOURCE_A", "/manga/contested", verified, 1.0, "test")
+
+		val response = passByEntry("me", "/manga/contested")
+
+		assertEquals(verified.toString(), response.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals(1, count("SELECT count(*) FROM work_pass WHERE work_id = $verified AND user_id = '$me'"))
+		assertEquals(0, count("SELECT count(*) FROM work_pass WHERE work_id = $mine"))
+	}
+
+	/** Two accounts made today must not be able to decide where somebody else's pass is recorded. */
+	@Test
+	fun `fresh accounts do not corroborate a pass but established ones do, and the public route is unchanged`() = testApplication {
+		setup()
+		val me = user("me")
+		val first = user("first")
+		val second = user("second")
+		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		observe(id, "/manga/fresh", first, second)
+		val publicBefore = client.get("/v1/public/similar?source=SOURCE_A&key=/manga/fresh")
+
+		val fresh = passByEntry("me", "/manga/fresh")
+		assertEquals(JsonNull, fresh.obj().getValue("work_id"))
+		assertEquals(0, passes(me))
+
+		establish(first, second)
+		val established = passByEntry("me", "/manga/fresh")
+		assertEquals(id.toString(), established.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals(1, passes(me))
+
+		// The similar-works route keeps its own, older rule: two accounts of any age are enough for it.
+		val publicAfter = client.get("/v1/public/similar?source=SOURCE_A&key=/manga/fresh")
+		assertEquals(HttpStatusCode.OK, publicBefore.status)
+		assertEquals(publicBefore.status, publicAfter.status)
+		assertEquals(publicBefore.bodyAsText(), publicAfter.bodyAsText())
+	}
+
+	/**
+	 * A pass walking a merge holds the merged work and then waits for its own pass row, which an unmerge
+	 * moves back. The unmerge must therefore wait for the work first and move nothing until it has it. The
+	 * merged work has the higher id here, the order a lock taken lowest id first would get wrong.
+	 */
+	@Test
+	fun `a pass in flight on the merged work holds an unmerge back without moving anything`() {
+		val me = user("me")
+		val survivor = works.createWork("Survivor", 2020, "manga", false)
+		val duplicate = works.createWork("Duplicate", 2020, "manga", false)
+		works.setPass(duplicate, me)
+		works.mergeWorks(from = duplicate, into = survivor, reason = "test")
+
+		source.connection.use { connection ->
+			connection.autoCommit = false
+			connection.createStatement().use { it.execute("SELECT 1 FROM work WHERE id = $duplicate FOR SHARE") }
+			val unmerge = java.util.concurrent.CompletableFuture.supplyAsync { works.unmergeWork(duplicate) }
+
+			Thread.sleep(700)
+			assertTrue(!unmerge.isDone, "the unmerge must wait for the pass")
+			assertEquals(1, count("SELECT count(*) FROM work_pass WHERE work_id = $survivor"), "and move nothing meanwhile")
+			assertEquals(0, count("SELECT count(*) FROM work_pass WHERE work_id = $duplicate"))
+
+			connection.commit()
+			assertEquals(duplicate to survivor, unmerge.get(10, java.util.concurrent.TimeUnit.SECONDS))
+		}
+		assertEquals(1, count("SELECT count(*) FROM work_pass WHERE work_id = $duplicate"))
+		assertEquals(0, count("SELECT count(*) FROM work_pass WHERE work_id = $survivor"))
+	}
+
+	@Test
 	fun `a pass by source and key follows a merge to the survivor`() = testApplication {
 		setup()
 		val me = user("me")
@@ -580,6 +677,7 @@ class PassRoutesTest {
 		val first = user("first")
 		val second = user("second")
 		val survivor = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		establish(first, second)
 		val duplicate = works.createWork("Tower of Mirrors (dup)", 2020, "manga", false)
 		observe(duplicate, "/manga/own-dup", me)
 		observe(duplicate, "/manga/shared-dup", first, second)

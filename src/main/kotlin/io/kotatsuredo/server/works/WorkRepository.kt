@@ -464,8 +464,19 @@ class WorkRepository(val dataSource: DataSource) {
 	fun corroboratedWorkFor(source: String, sourceKey: String): Long? =
 		dataSource.connection.use { connection -> corroboratedWork(connection, source, sourceKey) }
 
-	/** [corroboratedWorkFor] on a connection the caller already holds, so that it can run inside a transaction. */
-	private fun corroboratedWork(connection: Connection, source: String, sourceKey: String): Long? =
+	/**
+	 * [corroboratedWorkFor] on a connection the caller already holds, so that it can run inside a transaction.
+	 *
+	 * With [established], only accounts past the lowest trust tier count towards an observed work: more than a
+	 * day old and active on at least three days, written out as [passersOf] and [agreedCovers] write it. A
+	 * verified alias needs no such accounts, so it is unaffected.
+	 */
+	private fun corroboratedWork(
+		connection: Connection,
+		source: String,
+		sourceKey: String,
+		established: Boolean = false,
+	): Long? =
 		connection.prepareStatement(
 			"""
 			SELECT work_id FROM (
@@ -478,6 +489,7 @@ class WorkRepository(val dataSource: DataSource) {
 				JOIN app_user account ON account.id = observation.user_id
 				WHERE observation.source = ? AND observation.source_key = ?
 				  AND NOT account.is_banned AND NOT account.is_shadowbanned
+				${if (established) ESTABLISHED_ACCOUNT_SQL else ""}
 				GROUP BY observation.work_id
 				HAVING count(DISTINCT observation.user_id) >= ?
 			) candidates
@@ -490,6 +502,16 @@ class WorkRepository(val dataSource: DataSource) {
 			statement.setString(3, source)
 			statement.setString(4, sourceKey)
 			statement.setInt(5, SOURCE_CORROBORATION_REQUIRED)
+			statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
+		}
+
+	/** [findVerifiedAlias] on a connection the caller already holds. */
+	private fun verifiedAlias(connection: Connection, source: String, sourceKey: String): Long? =
+		connection.prepareStatement(
+			"SELECT work_id FROM work_alias WHERE source = ? AND source_key = ? AND is_verified",
+		).use { statement ->
+			statement.setString(1, source)
+			statement.setString(2, sourceKey)
 			statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
 		}
 
@@ -1721,11 +1743,13 @@ class WorkRepository(val dataSource: DataSource) {
 	 *
 	 * Read-only about works by design: saying "not interested" is not opening or reading a work, so this
 	 * never creates a work, an alias or an observation. A [workId] that exists wins; otherwise the work
-	 * the [source] entry is, by the first of these that knows: what this same account has itself observed
-	 * the entry as (its own note, so nothing it could not already read), then what [corroboratedWorkFor]
-	 * answers for anybody - a verified alias, else the work at least [SOURCE_CORROBORATION_REQUIRED]
-	 * distinct unsanctioned accounts observed it as. An alias nobody has verified is not trusted. A merge
-	 * is followed to the survivor, as ratings do.
+	 * the [source] entry is, by the first of these that knows, in the order [WorkResolver] resolves for an
+	 * account: a verified alias, then what this same account has itself observed the entry as (its own note,
+	 * so nothing it could not already read), then the work at least [SOURCE_CORROBORATION_REQUIRED] distinct
+	 * unsanctioned accounts observed it as. Only accounts past the lowest trust tier (more than a day old and
+	 * active on at least three days) count for that last step, so that two accounts made today cannot decide
+	 * where another reader's pass is recorded; [corroboratedWorkFor], which the public route uses, keeps its
+	 * own rule. An alias nobody has verified is not trusted. A merge is followed to the survivor, as ratings do.
 	 *
 	 * One transaction does the lookup and the write, holding a shared lock on every work row it walks
 	 * through. [mergeWorks] takes those rows for no-key update before it moves anything, which conflicts
@@ -1739,8 +1763,9 @@ class WorkRepository(val dataSource: DataSource) {
 			try {
 				val start = workId?.takeIf { lockedWork(connection, it) != null }
 					?: if (source != null && sourceKey != null) {
-						ownObservation(connection, source, sourceKey, userId)
-							?: corroboratedWork(connection, source, sourceKey)
+						verifiedAlias(connection, source, sourceKey)
+							?: ownObservation(connection, source, sourceKey, userId)
+							?: corroboratedWork(connection, source, sourceKey, established = true)
 					} else {
 						null
 					}
@@ -2785,6 +2810,25 @@ class WorkRepository(val dataSource: DataSource) {
 			val (logId, into, moved) = pending
 			val record = moved?.let { Json.parseToJsonElement(it).jsonObject }
 
+			// Taken before anything is moved, and held to the end, like the lock [mergeWorks] takes. Without
+			// it a pass being written for the merged work ([applyPass]) holds a shared lock on the work row
+			// and waits for its own work_pass row, which this is moving back, while this waits at its final
+			// update of the work for that shared lock: each waits for the other. With it, the pass either
+			// lands first and is moved back with the rest, or waits here and finds the work unmerged.
+			//
+			// NO KEY UPDATE, as in [mergeWorks], so that inserts referencing a work do not wait for it. The
+			// order differs on purpose: [mergeWorks] takes the lower id first, but a pass walking a merge
+			// takes the merged work and then the survivor, whichever id is lower. Taking them in that same
+			// order here is what keeps this from deadlocking with a pass when the merged work has the higher id.
+			// Two lock-takers could only clash on the same pair, in opposite orders, which needs a merge and
+			// an unmerge of one pair at once, and the database ends that with an error rather than a hang.
+			connection.prepareStatement("SELECT id FROM work WHERE id = ? FOR NO KEY UPDATE").use { statement ->
+				listOf(from, into).forEach { id ->
+					statement.setLong(1, id)
+					statement.executeQuery().use { while (it.next()) Unit }
+				}
+			}
+
 			record?.get("aliases")?.jsonArray?.forEach { element ->
 				val alias = element.jsonObject
 				connection.prepareStatement(
@@ -3000,6 +3044,15 @@ class WorkRepository(val dataSource: DataSource) {
 		 * library and nothing aggregate about it.
 		 */
 		const val SOURCE_CORROBORATION_REQUIRED = 2
+
+		/**
+		 * An account past the lowest trust tier, which is what tier 1 of the `user_trust` view means: more than
+		 * a day old and active on at least three days. Written out, as [passersOf] and [agreedCovers] do, rather
+		 * than joined to the view. Expects the account to be aliased `account`.
+		 */
+		private const val ESTABLISHED_ACCOUNT_SQL =
+			"AND account.created_at < now() - interval '1 day' " +
+				"AND EXISTS (SELECT 1 FROM user_active_day active WHERE active.user_id = account.id OFFSET 2)"
 
 		/**
 		 * Accounts that must independently report a genre before it is published. A wrong genre is

@@ -295,9 +295,11 @@ fun Route.workRoutes(
 	 * Deliberately read-only about works: it never creates a work, an alias or an observation,
 	 * because saying no to a suggestion is not having opened or read it. A manga the server does not
 	 * know is answered `recorded: false` and nothing is written. An entry named by `source` and `key` is
-	 * known when the caller has itself observed it, or when a verified alias or at least two accounts'
-	 * observations say which work it is; an alias nobody verified does not count. The one write is the
-	 * account's own `work_pass` row, which only ever counts in aggregate once ten accounts agree.
+	 * known when a verified alias says which work it is, else when the caller has itself observed it, else
+	 * when at least two established accounts' observations agree: more than a day old and active on three
+	 * days, so that accounts made today cannot decide where another reader's pass goes. An alias nobody
+	 * verified does not count. The one write is the account's own `work_pass` row, which only ever counts
+	 * in aggregate once ten accounts agree.
 	 */
 	post("/pass") {
 		val caller = call.requireCaller(identities)
