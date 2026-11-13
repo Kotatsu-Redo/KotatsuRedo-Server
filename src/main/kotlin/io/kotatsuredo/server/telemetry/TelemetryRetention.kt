@@ -10,6 +10,7 @@ import java.time.Clock
 import java.time.LocalDate
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
 
 private val log = LoggerFactory.getLogger("TelemetryRetention")
 
@@ -49,7 +50,12 @@ class TelemetryRetention(
 	 */
 	fun purgeNow(): Int {
 		val cutoff = LocalDate.now(clock).minusDays(retentionDays)
-		val unrolled = repository.oldestUnrolledDay()
+		// Only tells what is about to be lost. It reads every raw day, so it is the first thing here that
+		// would time out as the table grows, and it must never keep the deletion from happening: the
+		// deletion is the promise, this is a note in the log.
+		val unrolled = runCatching { repository.oldestUnrolledDay() }
+			.onFailure { log.warn("Could not tell whether the purge is about to delete days that were never rolled up", it) }
+			.getOrNull()
 		if (unrolled != null && unrolled.isBefore(cutoff)) {
 			log.error(
 				"Deleting raw probe rows from {} that never reached the daily rollup: retention comes " +
@@ -64,7 +70,18 @@ class TelemetryRetention(
 		return deleted
 	}
 
-	fun schedule(scope: CoroutineScope, interval: Duration = 6.hours) = scope.launch(Dispatchers.IO) {
+	/**
+	 * Not at once after a start: that is when every cache is cold and every other job runs, and the rollup
+	 * now runs for as long as it needs instead of giving up at the request limit. Neither the rollup nor the
+	 * purge is urgent to the minute: a day is rolled up six days before its rows are due, and the purge only
+	 * has to happen within the day.
+	 */
+	fun schedule(
+		scope: CoroutineScope,
+		interval: Duration = 6.hours,
+		initialDelay: Duration = 10.minutes,
+	) = scope.launch(Dispatchers.IO) {
+		delay(initialDelay)
 		while (isActive) {
 			runCatching { rollUpNow() }
 				.onFailure { log.warn("Telemetry rollup failed; scoring history will have a gap", it) }

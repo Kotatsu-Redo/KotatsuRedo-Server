@@ -1,5 +1,7 @@
 package io.kotatsuredo.server.routes
 
+import io.kotatsuredo.server.ApiError
+import io.kotatsuredo.server.ApiException
 import io.kotatsuredo.server.works.SimilarWork
 import io.kotatsuredo.server.works.WorkRepository
 import io.kotatsuredo.server.works.WorkSource
@@ -13,6 +15,7 @@ import kotlinx.serialization.Serializable
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Duration
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -60,8 +63,9 @@ data class ChartsResponse(
  * that has just started answers at once instead of building under the load of a start. A stored ranking
  * is served whatever its age, because an old chart beats an error and the first refresh replaces it. Only
  * a window with no ranking at all, such as in a database that never had one, is built by a request: one
- * request builds it and the others wait for that, as there is nothing to answer them with. If [store]
- * cannot be read or written that is logged and charts work as they would without one.
+ * request builds it, and the others wait a moment for that and are then told to come back, rather than
+ * fill the request slots while a slow first build runs. If [store] cannot be read or written that is
+ * logged and charts work as they would without one.
  */
 class Charts(
 	private val build: (ChartWindow) -> List<SimilarWorkDto>,
@@ -69,6 +73,7 @@ class Charts(
 	private val ttl: Duration = DEFAULT_TTL,
 	private val store: ChartStore? = null,
 	private val backgroundBuild: (ChartWindow) -> List<SimilarWorkDto> = build,
+	private val waitForFirstBuild: Duration = WAIT_FOR_FIRST_BUILD,
 ) {
 
 	constructor(works: WorkRepository) : this(
@@ -127,7 +132,12 @@ class Charts(
 	 */
 	fun refresh(window: ChartWindow) {
 		val slot = slots.getValue(window)
-		if (!slot.lock.tryLock()) {
+		if (slot.ranking == null) {
+			// Nothing is being served, and whoever holds the lock is a request trying to build under the
+			// short limits of a request. This is the build that is allowed to take long and whose result is
+			// kept, so it waits its turn rather than leaving the window empty until the next round.
+			slot.lock.lock()
+		} else if (!slot.lock.tryLock()) {
 			return
 		}
 		try {
@@ -158,7 +168,13 @@ class Charts(
 		// However old: rebuilding is the background refresh's job, and an old chart beats a slow request.
 		slot.ranking?.let { return it }
 		// Nothing to serve. One request builds it, and the others wait for that rather than each running it.
-		slot.lock.lock()
+		// Not for long, though: the lock may be held by the background refresh, which is allowed minutes, and
+		// a request waiting that long would sit on one of the few request slots, which the health check needs
+		// too. Past the wait the caller is told to come back, as it is when the server is short of room.
+		if (!slot.lock.tryLock(waitForFirstBuild.toMillis(), TimeUnit.MILLISECONDS)) {
+			slot.ranking?.let { return it }
+			throw ApiException(ApiError.Overloaded(RETRY_FIRST_BUILD_AFTER_S, "charts"))
+		}
 		try {
 			slot.ranking?.let { return it }
 			return Ranking(clock.millis(), build(window)).also { slot.ranking = it }
@@ -172,6 +188,16 @@ class Charts(
 		private val logger = LoggerFactory.getLogger(Charts::class.java)
 
 		val DEFAULT_TTL: Duration = Duration.ofMinutes(15)
+
+		/**
+		 * How long a request waits for the first ranking of a window while somebody else is building it:
+		 * enough to pick up a build that is about to finish, and short enough that a row of such requests
+		 * cannot fill the request slots for the length of a slow build.
+		 */
+		private val WAIT_FOR_FIRST_BUILD: Duration = Duration.ofSeconds(3)
+
+		/** What a caller turned away for lack of a first ranking is told to wait: a build and a little more. */
+		private const val RETRY_FIRST_BUILD_AFTER_S = 30L
 
 		/** Long enough for a starting server to finish what is more urgent. */
 		private val WARM_UP_DELAY: Duration = Duration.ofSeconds(30)

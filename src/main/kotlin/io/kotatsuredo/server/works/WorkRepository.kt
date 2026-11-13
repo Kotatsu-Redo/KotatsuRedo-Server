@@ -135,7 +135,7 @@ data class WorkSource(
 	val coverUrl: String? = null,
 )
 
-class WorkRepository(val dataSource: DataSource) {
+class WorkRepository(internal val dataSource: DataSource) {
 
 	/**
 	 * Creates or updates a work identified by an external id, and returns its id.

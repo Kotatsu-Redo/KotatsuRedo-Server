@@ -128,9 +128,14 @@ class TelemetryRepository(private val dataSource: DataSource) {
 
 	fun purgeOlderThan(cutoff: LocalDate): Int =
 		dataSource.connection.use { connection ->
-			connection.prepareStatement("DELETE FROM source_probe_raw WHERE day < ?").use { statement ->
-				statement.setObject(1, cutoff, Types.DATE)
-				statement.executeUpdate()
+			// A day of raw rows is hundreds of thousands of them, and after a few missed passes it is several
+			// days at once. Deleting them is the promise in the privacy notice, so it gets the time it needs
+			// rather than the few seconds a request may run.
+			connection.withBackgroundLimits {
+				connection.prepareStatement("DELETE FROM source_probe_raw WHERE day < ?").use { statement ->
+					statement.setObject(1, cutoff, Types.DATE)
+					statement.executeUpdate()
+				}
 			}
 		}
 

@@ -354,4 +354,83 @@ class ChartsCacheTest {
 		assertEquals(listOf(ChartWindow.WEEK), builds)
 		assertEquals(emptyList(), store.saved, "only a refresh stores")
 	}
+
+	/**
+	 * The one holding the lock may be the background refresh, which is allowed minutes: a request that waited for
+	 * it would sit on a request slot the whole time.
+	 */
+	@Test
+	fun `with nothing to serve a request waits only a moment for a build in progress, then is told to come back`() {
+		val building = CountDownLatch(1)
+		val finish = CountDownLatch(1)
+		val cache = Charts(
+			build = { error("this request must not build: somebody else is") },
+			backgroundBuild = {
+				building.countDown()
+				finish.await(10, TimeUnit.SECONDS)
+				ranking
+			},
+			clock = clock,
+			waitForFirstBuild = Duration.ofMillis(100),
+		)
+		val pool = Executors.newSingleThreadExecutor()
+		try {
+			val refresh = pool.submit { cache.refresh(ChartWindow.WEEK) }
+			building.await(5, TimeUnit.SECONDS)
+
+			val started = System.nanoTime()
+			val refused = assertFailsWith<ApiException> { cache.responseFor(query()) }
+			val waitedMillis = (System.nanoTime() - started) / 1_000_000
+			val error = refused.error
+			assertEquals(true, error is ApiError.Overloaded && error.resource == "charts", "told to come back: $error")
+			assertEquals(true, waitedMillis < 5_000, "waited $waitedMillis ms, far short of the build")
+
+			// Once the build is done the same request is answered from it
+			finish.countDown()
+			refresh.get(5, TimeUnit.SECONDS)
+			assertEquals(4, cache.responseFor(query()).works.size)
+		} finally {
+			finish.countDown()
+			pool.shutdownNow()
+		}
+	}
+
+	/** Skipping the window, as a refresh does when a ranking is being served, would leave it empty for a quarter of an hour. */
+	@Test
+	fun `with nothing to serve a refresh waits for a request's attempt and then builds and stores`() {
+		val requestBuilding = CountDownLatch(1)
+		val failRequest = CountDownLatch(1)
+		val store = MemoryStore()
+		val cache = Charts(
+			build = {
+				requestBuilding.countDown()
+				failRequest.await(10, TimeUnit.SECONDS)
+				error("timed out, as a request's build does on a busy start")
+			},
+			backgroundBuild = { window -> builds += window; ranking },
+			clock = clock,
+			store = store,
+		)
+		val pool = Executors.newFixedThreadPool(2)
+		try {
+			val request = pool.submit { runCatching { cache.responseFor(query()) } }
+			requestBuilding.await(5, TimeUnit.SECONDS)
+			val refresh = pool.submit { cache.refresh(ChartWindow.WEEK) }
+
+			// The refresh is waiting behind the request, not gone
+			Thread.sleep(200)
+			assertEquals(false, refresh.isDone)
+			assertEquals(emptyList(), builds)
+
+			failRequest.countDown()
+			request.get(5, TimeUnit.SECONDS)
+			refresh.get(5, TimeUnit.SECONDS)
+			assertEquals(listOf(ChartWindow.WEEK), builds)
+			assertEquals(listOf(ChartWindow.WEEK to StoredRanking(clock.millis(), ranking)), store.saved)
+			assertEquals(4, cache.responseFor(query()).works.size)
+		} finally {
+			failRequest.countDown()
+			pool.shutdownNow()
+		}
+	}
 }
