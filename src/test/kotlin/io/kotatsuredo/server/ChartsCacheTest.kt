@@ -2,8 +2,10 @@ package io.kotatsuredo.server
 
 import io.kotatsuredo.server.routes.ChartQuery
 import io.kotatsuredo.server.routes.ChartWindow
+import io.kotatsuredo.server.routes.ChartStore
 import io.kotatsuredo.server.routes.Charts
 import io.kotatsuredo.server.routes.SimilarWorkDto
+import io.kotatsuredo.server.routes.StoredRanking
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -73,16 +75,22 @@ class ChartsCacheTest {
 		assertEquals(Instant.parse("2026-10-16T12:00:00Z").toEpochMilli(), second.generatedAt)
 	}
 
+	/** Was "a ranking is rebuilt once it is fifteen minutes old": rebuilding is now the refresh's job alone. */
 	@Test
-	fun `a ranking is rebuilt once it is fifteen minutes old`() {
+	fun `a request never rebuilds an old ranking, a refresh does`() {
 		val cache = cache()
 
-		cache.responseFor(query())
+		val first = cache.responseFor(query())
 		clock.now = clock.now.plus(Duration.ofMinutes(15))
-		val rebuilt = cache.responseFor(query())
+		val old = cache.responseFor(query())
+
+		assertEquals(1, builds.size)
+		assertEquals(first.generatedAt, old.generatedAt)
+
+		cache.refresh(ChartWindow.WEEK)
 
 		assertEquals(2, builds.size)
-		assertEquals(clock.millis(), rebuilt.generatedAt)
+		assertEquals(clock.millis(), cache.responseFor(query()).generatedAt)
 	}
 
 	/** What a cache keyed on the whole query could not promise: walking the filters costs nothing. */
@@ -118,8 +126,9 @@ class ChartsCacheTest {
 		assertEquals(emptyList(), cache.ids(query(genre = "comedy")))
 	}
 
+	/** Was "a failed rebuild keeps serving the previous ranking": the rebuild that can fail is now the refresh. */
 	@Test
-	fun `a failed rebuild keeps serving the previous ranking and tries again next time`() {
+	fun `a failed refresh keeps serving the previous ranking and tries again next time`() {
 		var fail = false
 		var calls = 0
 		val cache = Charts(
@@ -134,12 +143,14 @@ class ChartsCacheTest {
 
 		fail = true
 		clock.now = clock.now.plus(Duration.ofMinutes(20))
+		cache.refresh(ChartWindow.WEEK)
 		val served = cache.responseFor(query())
 
 		assertEquals(first, served)
 		assertEquals(2, calls)
 
 		fail = false
+		cache.refresh(ChartWindow.WEEK)
 		assertEquals(clock.millis(), cache.responseFor(query()).generatedAt)
 		assertEquals(3, calls)
 	}
@@ -184,16 +195,17 @@ class ChartsCacheTest {
 		assertFailsWith<IllegalStateException> { cache.responseFor(query()) }
 	}
 
+	/** Was "while one request rebuilds an expired ranking the others are answered at once": nobody rebuilds now. */
 	@Test
-	fun `while one request rebuilds an expired ranking the others are answered at once`() {
-		val rebuilding = CountDownLatch(1)
-		val finishRebuild = CountDownLatch(1)
+	fun `a refresh in progress does not hold up requests, and a request does not start one`() {
+		val refreshing = CountDownLatch(1)
+		val finishRefresh = CountDownLatch(1)
 		val calls = AtomicInteger()
 		val cache = Charts(
 			build = {
 				if (calls.incrementAndGet() > 1) {
-					rebuilding.countDown()
-					finishRebuild.await(5, TimeUnit.SECONDS)
+					refreshing.countDown()
+					finishRefresh.await(5, TimeUnit.SECONDS)
 				}
 				ranking
 			},
@@ -204,17 +216,19 @@ class ChartsCacheTest {
 
 		val pool = Executors.newSingleThreadExecutor()
 		try {
-			val rebuild = pool.submit<Long> { cache.responseFor(query()).generatedAt }
-			rebuilding.await(5, TimeUnit.SECONDS)
+			val refresh = pool.submit { cache.refresh(ChartWindow.WEEK) }
+			refreshing.await(5, TimeUnit.SECONDS)
 
-			// This thread would hang until the timeout if it were queueing behind the rebuild
+			// This thread would hang until the timeout if it were queueing behind the refresh
 			assertEquals(previous.generatedAt, cache.responseFor(query()).generatedAt)
 			assertEquals(2, calls.get())
 
-			finishRebuild.countDown()
-			assertEquals(clock.millis(), rebuild.get(5, TimeUnit.SECONDS))
+			finishRefresh.countDown()
+			refresh.get(5, TimeUnit.SECONDS)
+			assertEquals(clock.millis(), cache.responseFor(query()).generatedAt)
+			assertEquals(2, calls.get())
 		} finally {
-			finishRebuild.countDown()
+			finishRefresh.countDown()
 			pool.shutdownNow()
 		}
 	}
@@ -245,5 +259,99 @@ class ChartsCacheTest {
 		} finally {
 			pool.shutdownNow()
 		}
+	}
+
+	private class MemoryStore(var stored: Map<ChartWindow, StoredRanking> = emptyMap()) : ChartStore {
+		val saved = mutableListOf<Pair<ChartWindow, StoredRanking>>()
+		override fun load() = stored
+		override fun save(window: ChartWindow, ranking: StoredRanking) {
+			saved += window to ranking
+		}
+	}
+
+	@Test
+	fun `a ranking loaded from the store is served without building`() {
+		val storedAt = clock.millis() - 1_000
+		val cache = Charts(
+			build = { window -> builds += window; ranking },
+			clock = clock,
+			store = MemoryStore(mapOf(ChartWindow.WEEK to StoredRanking(storedAt, ranking))),
+		)
+
+		val answer = cache.responseFor(query())
+
+		assertEquals(emptyList(), builds)
+		assertEquals(storedAt, answer.generatedAt)
+		assertEquals(4, answer.works.size)
+	}
+
+	@Test
+	fun `a stored ranking past the ttl is still served, with its real age, and a refresh replaces it`() {
+		val storedAt = clock.millis() - Duration.ofDays(3).toMillis()
+		val cache = Charts(
+			build = { window -> builds += window; ranking },
+			backgroundBuild = { window -> builds += window; ranking.take(2) },
+			clock = clock,
+			store = MemoryStore(mapOf(ChartWindow.WEEK to StoredRanking(storedAt, ranking))),
+		)
+
+		val old = cache.responseFor(query())
+		assertEquals(emptyList(), builds)
+		assertEquals(storedAt, old.generatedAt)
+		assertEquals(4, old.works.size)
+
+		cache.refresh(ChartWindow.WEEK)
+
+		val fresh = cache.responseFor(query())
+		assertEquals(listOf(ChartWindow.WEEK), builds)
+		assertEquals(clock.millis(), fresh.generatedAt)
+		assertEquals(2, fresh.works.size)
+	}
+
+	@Test
+	fun `a refresh builds under the background build and stores what it built`() {
+		val store = MemoryStore()
+		val cache = Charts(
+			build = { error("a request must not build here") },
+			backgroundBuild = { window -> builds += window; ranking },
+			clock = clock,
+			store = store,
+		)
+
+		cache.refresh(ChartWindow.MONTH)
+
+		assertEquals(listOf(ChartWindow.MONTH), builds)
+		assertEquals(listOf(ChartWindow.MONTH to StoredRanking(clock.millis(), ranking)), store.saved)
+	}
+
+	@Test
+	fun `a store that throws on read and on write changes nothing else`() {
+		val broken = object : ChartStore {
+			override fun load(): Map<ChartWindow, StoredRanking> = error("no table")
+			override fun save(window: ChartWindow, ranking: StoredRanking) = error("no table")
+		}
+		val cache = Charts(build = { window -> builds += window; ranking }, clock = clock, store = broken)
+
+		// Nothing was loaded, so the first request builds as it always did
+		assertEquals(4, cache.responseFor(query()).works.size)
+		assertEquals(listOf(ChartWindow.WEEK), builds)
+
+		// A refresh whose write fails still replaces the ranking in memory
+		clock.now = clock.now.plus(Duration.ofMinutes(14))
+		cache.refresh(ChartWindow.WEEK)
+		assertEquals(clock.millis(), cache.responseFor(query()).generatedAt)
+		assertEquals(listOf(ChartWindow.WEEK, ChartWindow.WEEK), builds)
+	}
+
+	@Test
+	fun `with nothing stored a request still builds the window`() {
+		val store = MemoryStore()
+		val cache = Charts(build = { window -> builds += window; ranking }, clock = clock, store = store)
+
+		cache.responseFor(query())
+		cache.responseFor(query())
+
+		assertEquals(listOf(ChartWindow.WEEK), builds)
+		assertEquals(emptyList(), store.saved, "only a refresh stores")
 	}
 }

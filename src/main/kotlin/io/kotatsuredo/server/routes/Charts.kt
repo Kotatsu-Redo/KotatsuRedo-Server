@@ -51,19 +51,31 @@ data class ChartsResponse(
  * is a cheap in-memory filter of the result. Cycling through filter combinations therefore costs the
  * database nothing, which a cache keyed on the whole query could not promise.
  *
- * [schedule] keeps the rankings fresh from the background, so requests normally find one ready. Should a
- * window expire anyway, one request rebuilds it and everyone else keeps being answered from the previous
- * ranking rather than queueing behind it. If that rebuild fails, the previous ranking also goes on being
- * served: a slightly old chart beats an error. Only requests in the first moments after a start can wait.
- * `generated_at` says how old an answer is.
+ * [schedule] keeps the rankings fresh from the background, and it is the only thing that rebuilds one:
+ * a request is always answered with the ranking there is, however old, and `generated_at` says how old.
+ * The scheduled build runs under the background limits of [backgroundBuild], because it is the one that
+ * must be allowed to take long; a request never has a reason to wait for the aggregate.
+ *
+ * Each refresh also writes its ranking to [store], and a new instance loads what is stored, so a server
+ * that has just started answers at once instead of building under the load of a start. A stored ranking
+ * is served whatever its age, because an old chart beats an error and the first refresh replaces it. Only
+ * a window with no ranking at all, such as in a database that never had one, is built by a request: one
+ * request builds it and the others wait for that, as there is nothing to answer them with. If [store]
+ * cannot be read or written that is logged and charts work as they would without one.
  */
 class Charts(
 	private val build: (ChartWindow) -> List<SimilarWorkDto>,
 	private val clock: Clock = Clock.systemUTC(),
 	private val ttl: Duration = DEFAULT_TTL,
+	private val store: ChartStore? = null,
+	private val backgroundBuild: (ChartWindow) -> List<SimilarWorkDto> = build,
 ) {
 
-	constructor(works: WorkRepository) : this(build = { window -> buildWorks(works, window) })
+	constructor(works: WorkRepository) : this(
+		build = { window -> buildWorks(works, window, background = false) },
+		store = DatabaseChartStore(works.dataSource),
+		backgroundBuild = { window -> buildWorks(works, window, background = true) },
+	)
 
 	private class Ranking(val generatedAt: Long, val works: List<SimilarWorkDto>)
 
@@ -75,6 +87,16 @@ class Charts(
 	}
 
 	private val slots = ChartWindow.entries.associateWith { Slot() }
+
+	init {
+		try {
+			store?.load()?.forEach { (window, stored) ->
+				slots.getValue(window).ranking = Ranking(stored.generatedAt, stored.works)
+			}
+		} catch (e: Exception) {
+			logger.warn("Could not load the stored charts, they will be built instead", e)
+		}
+	}
 
 	fun responseFor(query: ChartQuery): ChartsResponse {
 		val ranking = rankingFor(query.window)
@@ -99,14 +121,19 @@ class Charts(
 		}
 	}
 
-	/** Rebuilds a window now. A failure leaves what is there, and a rebuild already running is enough. */
+	/**
+	 * Rebuilds a window now, under the background limits, and stores the result. A failure leaves what is
+	 * there, and a rebuild already running is enough.
+	 */
 	fun refresh(window: ChartWindow) {
 		val slot = slots.getValue(window)
 		if (!slot.lock.tryLock()) {
 			return
 		}
 		try {
-			slot.ranking = Ranking(clock.millis(), build(window))
+			val ranking = Ranking(clock.millis(), backgroundBuild(window))
+			slot.ranking = ranking
+			save(window, ranking)
 		} catch (e: Exception) {
 			logger.warn("Could not refresh the {} chart", window.wire, e)
 		} finally {
@@ -117,32 +144,28 @@ class Charts(
 	/** For a genre no chart can carry: nothing to ask or keep. */
 	fun emptyFor(window: ChartWindow) = ChartsResponse(window.wire, clock.millis(), emptyList())
 
+	/** Costs nothing else when it fails: the ranking is already being served from memory. */
+	private fun save(window: ChartWindow, ranking: Ranking) {
+		try {
+			store?.save(window, StoredRanking(ranking.generatedAt, ranking.works))
+		} catch (e: Exception) {
+			logger.warn("Could not store the {} chart", window.wire, e)
+		}
+	}
+
 	private fun rankingFor(window: ChartWindow): Ranking {
 		val slot = slots.getValue(window)
-		val previous = slot.ranking
-		if (previous != null && previous.isFresh()) {
-			return previous
-		}
-		if (!slot.lock.tryLock()) {
-			// Someone is already rebuilding this one. With an answer to give, there is no need to wait.
-			if (previous != null) return previous
-			slot.lock.lock()
-		}
+		// However old: rebuilding is the background refresh's job, and an old chart beats a slow request.
+		slot.ranking?.let { return it }
+		// Nothing to serve. One request builds it, and the others wait for that rather than each running it.
+		slot.lock.lock()
 		try {
-			slot.ranking?.takeIf { it.isFresh() }?.let { return it }
-			return try {
-				Ranking(clock.millis(), build(window)).also { slot.ranking = it }
-			} catch (e: Exception) {
-				if (previous == null) throw e
-				logger.warn("Could not rebuild the {} chart, still serving the previous one", window.wire, e)
-				previous
-			}
+			slot.ranking?.let { return it }
+			return Ranking(clock.millis(), build(window)).also { slot.ranking = it }
 		} finally {
 			slot.lock.unlock()
 		}
 	}
-
-	private fun Ranking.isFresh() = clock.millis() - generatedAt < ttl.toMillis()
 
 	companion object {
 
@@ -153,7 +176,7 @@ class Charts(
 		/** Long enough for a starting server to finish what is more urgent. */
 		private val WARM_UP_DELAY: Duration = Duration.ofSeconds(30)
 
-		/** A refresh finishes this long before the ranking would expire and a request would have to do it. */
+		/** A refresh starts this long before the ranking is [ttl] old, so the next one is never late. */
 		private val REFRESH_MARGIN: Duration = Duration.ofMinutes(1)
 
 		/** Genres no chart lists, so asking for one is an empty chart without touching anything. */
@@ -172,9 +195,9 @@ class Charts(
 		 * Walks the ranking until it is full, because a work nobody could open is worth nothing to list
 		 * and cutting the ranking first would hand back a short chart.
 		 */
-		private fun buildWorks(works: WorkRepository, window: ChartWindow): List<SimilarWorkDto> {
+		private fun buildWorks(works: WorkRepository, window: ChartWindow, background: Boolean): List<SimilarWorkDto> {
 			val listed = ArrayList<Pair<SimilarWork, List<WorkSource>>>()
-			for (batch in works.chartCandidates(window.hours).chunked(SOURCE_BATCH)) {
+			for (batch in works.chartCandidates(window.hours, background).chunked(SOURCE_BATCH)) {
 				val sources = works.sourcesForAll(batch.map { it.workId }, limit = SimilarWorks.MAX_SOURCES_PER_SIMILAR)
 				batch.forEach { candidate ->
 					sources[candidate.workId]?.let { listed += candidate to it }

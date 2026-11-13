@@ -59,7 +59,8 @@ class PublicChartsRoutesTest {
 		PostgresTestBase.requireDatabase()
 		sql(
 			"TRUNCATE work, work_title, work_alias, work_alias_observation, work_genre_observation, " +
-				"work_genre, work_external_id, work_merge_log, app_user, user_active_day, app_device " +
+				"work_genre, work_external_id, work_merge_log, app_user, user_active_day, app_device, " +
+				"chart_ranking " +
 				"CASCADE",
 		)
 	}

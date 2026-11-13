@@ -1,6 +1,7 @@
 package io.kotatsuredo.server.works
 
 import io.kotatsuredo.server.comments.CommentState
+import io.kotatsuredo.server.db.withBackgroundLimits
 import java.sql.Connection
 import java.sql.Statement
 import java.sql.Types
@@ -134,7 +135,7 @@ data class WorkSource(
 	val coverUrl: String? = null,
 )
 
-class WorkRepository(private val dataSource: DataSource) {
+class WorkRepository(val dataSource: DataSource) {
 
 	/**
 	 * Creates or updates a work identified by an external id, and returns its id.
@@ -2126,8 +2127,19 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * the loser, so activity is followed along the merge chain to the work it now belongs to. Counting
 	 * distinct accounts keeps that person from counting twice.
 	 */
-	fun chartCandidates(hours: Int): List<SimilarWork> =
+	fun chartCandidates(hours: Int, background: Boolean = false): List<SimilarWork> =
 		dataSource.connection.use { connection ->
+			// The scheduled refresh asks for the background limits: this walk is the one query that grows with
+			// the library and can outlast a request's 15 seconds, and a timeout there fails the same way each time.
+			if (background) {
+				connection.withBackgroundLimits { chartCandidatesOn(connection, hours) }
+			} else {
+				chartCandidatesOn(connection, hours)
+			}
+		}
+
+	private fun chartCandidatesOn(connection: Connection, hours: Int): List<SimilarWork> =
+		run {
 			connection.prepareStatement(
 				"""
 				WITH RECURSIVE activity AS (
