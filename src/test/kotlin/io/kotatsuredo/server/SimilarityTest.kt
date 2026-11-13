@@ -448,6 +448,45 @@ class SimilarityTest {
 		assertEquals(1.0 - 0.3 * 10 / 10, ratio(), 1e-9)
 	}
 
+	/** The pass adjustment is an extra: if its query fails, the answer is the one without it. */
+	@Test
+	fun `a failing pass lookup costs only the pass adjustment`() {
+		val seed = work("Seed", genres = listOf("Villainess", "Isekai"))
+		val passed = work("Passed", genres = listOf("Villainess", "Isekai"))
+		val control = work("Control", genres = listOf("Villainess", "Isekai"))
+		passedBy(passed, established("p", 10))
+		fun ratio(repository: WorkRepository): Double {
+			val scores = repository.similarTo(seed).associate { it.title to it.score }
+			return scores.getValue("Passed") / scores.getValue("Control")
+		}
+		assertEquals(1.0 - 0.3 * 10 / 10, ratio(repository), 1e-9)
+
+		val real = PostgresTestBase.database.source
+		val breaking = javax.sql.DataSource::class.java.let { type ->
+			java.lang.reflect.Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { _, method, args ->
+				if (method.name != "getConnection") return@newProxyInstance delegateCall(method, real, args)
+				val connection = real.connection
+				java.lang.reflect.Proxy.newProxyInstance(
+					java.sql.Connection::class.java.classLoader,
+					arrayOf(java.sql.Connection::class.java),
+				) { _, call, callArgs ->
+					if (call.name == "prepareStatement" && (callArgs?.firstOrNull() as? String)?.contains("FROM work_pass") == true) {
+						throw java.sql.SQLException("the pass lookup is down")
+					}
+					delegateCall(call, connection, callArgs)
+				}
+			} as javax.sql.DataSource
+		}
+
+		assertEquals(1.0, ratio(WorkRepository(breaking)), 1e-12)
+	}
+
+	private fun delegateCall(method: java.lang.reflect.Method, target: Any, args: Array<Any?>?): Any? = try {
+		method.invoke(target, *(args ?: emptyArray()))
+	} catch (error: java.lang.reflect.InvocationTargetException) {
+		throw error.targetException
+	}
+
 	@Test
 	fun `banned and shadowbanned passers are not counted`() {
 		val clean = established("p", 8)

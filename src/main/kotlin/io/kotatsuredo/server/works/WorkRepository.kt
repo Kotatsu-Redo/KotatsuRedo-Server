@@ -461,33 +461,35 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * @return the work as stored, which may since have been merged - see [mergedInto]
 	 */
 	fun corroboratedWorkFor(source: String, sourceKey: String): Long? =
-		dataSource.connection.use { connection ->
-			connection.prepareStatement(
-				"""
-				SELECT work_id FROM (
-					SELECT work_id, 0 AS priority, 0 AS support
-					FROM work_alias
-					WHERE source = ? AND source_key = ? AND is_verified
-					UNION ALL
-					SELECT observation.work_id, 1, count(DISTINCT observation.user_id)
-					FROM work_alias_observation observation
-					JOIN app_user account ON account.id = observation.user_id
-					WHERE observation.source = ? AND observation.source_key = ?
-					  AND NOT account.is_banned AND NOT account.is_shadowbanned
-					GROUP BY observation.work_id
-					HAVING count(DISTINCT observation.user_id) >= ?
-				) candidates
-				ORDER BY priority, support DESC, work_id
-				LIMIT 1
-				""".trimIndent(),
-			).use { statement ->
-				statement.setString(1, source)
-				statement.setString(2, sourceKey)
-				statement.setString(3, source)
-				statement.setString(4, sourceKey)
-				statement.setInt(5, SOURCE_CORROBORATION_REQUIRED)
-				statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
-			}
+		dataSource.connection.use { connection -> corroboratedWork(connection, source, sourceKey) }
+
+	/** [corroboratedWorkFor] on a connection the caller already holds, so that it can run inside a transaction. */
+	private fun corroboratedWork(connection: Connection, source: String, sourceKey: String): Long? =
+		connection.prepareStatement(
+			"""
+			SELECT work_id FROM (
+				SELECT work_id, 0 AS priority, 0 AS support
+				FROM work_alias
+				WHERE source = ? AND source_key = ? AND is_verified
+				UNION ALL
+				SELECT observation.work_id, 1, count(DISTINCT observation.user_id)
+				FROM work_alias_observation observation
+				JOIN app_user account ON account.id = observation.user_id
+				WHERE observation.source = ? AND observation.source_key = ?
+				  AND NOT account.is_banned AND NOT account.is_shadowbanned
+				GROUP BY observation.work_id
+				HAVING count(DISTINCT observation.user_id) >= ?
+			) candidates
+			ORDER BY priority, support DESC, work_id
+			LIMIT 1
+			""".trimIndent(),
+		).use { statement ->
+			statement.setString(1, source)
+			statement.setString(2, sourceKey)
+			statement.setString(3, source)
+			statement.setString(4, sourceKey)
+			statement.setInt(5, SOURCE_CORROBORATION_REQUIRED)
+			statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
 		}
 
 	/** Only corroborated aliases may short-circuit resolution for every account. */
@@ -1522,22 +1524,26 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * Distinct accounts that passed on each work - only for works at least [PassRule.MIN_ACCOUNTS] did,
 	 * so a count below the minimum never leaves the database.
 	 *
-	 * Only established-enough accounts count: not banned, not shadowbanned, and above trust tier 0.
-	 * Accounts are free to create, so without the tier rule ten throwaway ones could lower any work.
-	 * Tier comes from the `user_trust` view (V19), the same definition [IdentityRepository.trustTier]
-	 * implements in code, so the two cannot be told apart: a new account's pass is stored, exported
-	 * and removable, but counts only once the account is no longer in tier 0.
+	 * Only established-enough accounts count: not banned, not shadowbanned, and past the lowest trust
+	 * tier. Accounts are free to create, so without the tier rule ten throwaway ones could lower any work.
+	 * Past the lowest tier means more than a day old and active on at least three days, which is what the
+	 * `user_trust` view (V19) and [IdentityRepository.trustTier] call tier 1 or above. It is written out here,
+	 * as [agreedCovers] does, rather than joined to the view: the view counts every active day of every
+	 * account it is joined to, and this runs on the path of every "similar works" answer. A new account's
+	 * pass is stored, exported and removable, but counts only once the account is no longer in tier 0.
+	 *
+	 * The adjustment is an extra on top of the answer, so this failing costs the adjustment and nothing else.
 	 */
-	private fun passersOf(connection: Connection, ids: Collection<Long>): Map<Long, Int> =
+	private fun passersOf(connection: Connection, ids: Collection<Long>): Map<Long, Int> = runCatching {
 		connection.prepareStatement(
 			"""
 			SELECT pass.work_id, count(*)
 			FROM work_pass pass
 			JOIN app_user account ON account.id = pass.user_id
-			JOIN user_trust trust ON trust.user_id = pass.user_id
 			WHERE pass.work_id = ANY(?)
 			  AND NOT account.is_banned AND NOT account.is_shadowbanned
-			  AND trust.tier > 0
+			  AND account.created_at < now() - interval '1 day'
+			  AND EXISTS (SELECT 1 FROM user_active_day active WHERE active.user_id = account.id OFFSET 2)
 			GROUP BY pass.work_id
 			HAVING count(*) >= ?
 			""".trimIndent(),
@@ -1550,6 +1556,10 @@ class WorkRepository(private val dataSource: DataSource) {
 				result
 			}
 		}
+	}.getOrElse { error ->
+		log.warn("Could not look up passes; answering without the pass adjustment", error)
+		emptyMap()
+	}
 
 	/** The global mean rating (null before anyone has rated) and each rated work's Bayesian average. */
 	private fun qualityOf(connection: Connection, ids: Collection<Long>): Pair<Double?, Map<Long, Double>> {
@@ -1709,13 +1719,18 @@ class WorkRepository(private val dataSource: DataSource) {
 	 * Records or takes back an account's pass, and says which work it was about (null if none is known).
 	 *
 	 * Read-only about works by design: saying "not interested" is not opening or reading a work, so this
-	 * never creates a work, an alias or an observation. A [workId] that exists wins; otherwise the
-	 * [source] entry's alias. A merge is followed to the survivor, as ratings do.
+	 * never creates a work, an alias or an observation. A [workId] that exists wins; otherwise the work
+	 * the [source] entry is, by the first of these that knows: what this same account has itself observed
+	 * the entry as (its own note, so nothing it could not already read), then what [corroboratedWorkFor]
+	 * answers for anybody - a verified alias, else the work at least [SOURCE_CORROBORATION_REQUIRED]
+	 * distinct unsanctioned accounts observed it as. An alias nobody has verified is not trusted. A merge
+	 * is followed to the survivor, as ratings do.
 	 *
 	 * One transaction does the lookup and the write, holding a shared lock on every work row it walks
-	 * through. [mergeWorks] takes those rows for update before it moves anything, so the pass either
-	 * lands before a merge and is moved with it, or waits and finds the work already merged away - it
-	 * can never be written to, or lost from, a work a merge has just emptied.
+	 * through. [mergeWorks] takes those rows for no-key update before it moves anything, which conflicts
+	 * with a shared lock, so the pass either lands before a merge and is moved with it, or waits and finds
+	 * the work already merged away - it can never be written to, or lost from, a work a merge has just
+	 * emptied.
 	 */
 	fun applyPass(workId: Long?, source: String?, sourceKey: String?, userId: String, passed: Boolean): Long? =
 		dataSource.connection.use { connection ->
@@ -1723,12 +1738,8 @@ class WorkRepository(private val dataSource: DataSource) {
 			try {
 				val start = workId?.takeIf { lockedWork(connection, it) != null }
 					?: if (source != null && sourceKey != null) {
-						connection.prepareStatement("SELECT work_id FROM work_alias WHERE source = ? AND source_key = ?")
-							.use { statement ->
-								statement.setString(1, source)
-								statement.setString(2, sourceKey)
-								statement.executeQuery().use { if (it.next()) it.getLong(1) else null }
-							}
+						ownObservation(connection, source, sourceKey, userId)
+							?: corroboratedWork(connection, source, sourceKey)
 					} else {
 						null
 					}
@@ -1773,6 +1784,17 @@ class WorkRepository(private val dataSource: DataSource) {
 			} finally {
 				connection.autoCommit = true
 			}
+		}
+
+	/** The work this account itself has observed a source entry as, if it has. */
+	private fun ownObservation(connection: Connection, source: String, sourceKey: String, userId: String): Long? =
+		connection.prepareStatement(
+			"SELECT work_id FROM work_alias_observation WHERE source = ? AND source_key = ? AND user_id = ?",
+		).use { statement ->
+			statement.setString(1, source)
+			statement.setString(2, sourceKey)
+			statement.setString(3, userId)
+			statement.executeQuery().use { rows -> if (rows.next()) rows.getLong(1) else null }
 		}
 
 	private class LockedWork(val mergedInto: Long?)
@@ -2613,7 +2635,13 @@ class WorkRepository(private val dataSource: DataSource) {
 				// Taken first, in id order, and held to the end: a pass being written ([applyPass]) takes
 				// the same rows, so it either lands before the merge and is moved with it, or waits and
 				// sees the work merged away. Nothing can land on a work this is emptying.
-				connection.prepareStatement("SELECT id FROM work WHERE id IN (?, ?) ORDER BY id FOR UPDATE").use { statement ->
+				//
+				// NO KEY UPDATE rather than UPDATE: every insert that references a work by foreign key (a
+				// rating, a comment, an observation, a co-reading pair) takes FOR KEY SHARE on the work row,
+				// and FOR UPDATE conflicts with that, so those inserts would wait for a merge and could
+				// deadlock with it. FOR NO KEY UPDATE does not conflict with FOR KEY SHARE, and still
+				// conflicts with the FOR SHARE that applyPass takes, which is all the pass logic needs.
+				connection.prepareStatement("SELECT id FROM work WHERE id IN (?, ?) ORDER BY id FOR NO KEY UPDATE").use { statement ->
 					statement.setLong(1, from)
 					statement.setLong(2, into)
 					statement.executeQuery().use { while (it.next()) Unit }

@@ -468,4 +468,130 @@ class PassRoutesTest {
 		val body = pass("me", """{"source":"SOURCE_A","key":"/manga/never","passed":false}""").obj()
 		assertEquals(JsonNull, body.getValue("work_id"))
 	}
+
+	// -- finding a work by source entry ----------------------------------------------------------
+
+	private fun observe(workId: Long, key: String, vararg users: String) {
+		users.forEach { works.observeAlias("SOURCE_A", key, it, workId, listOf("key")) }
+	}
+
+	private suspend fun ApplicationTestBuilder.passByEntry(seed: String, key: String) = pass(seed, """{"source":"SOURCE_A","key":"$key","passed":true}""")
+
+	@Test
+	fun `an entry the caller itself observed is found by source and key`() = testApplication {
+		setup()
+		val me = user("me")
+		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		observe(id, "/manga/mine", me)
+
+		val response = passByEntry("me", "/manga/mine")
+
+		assertEquals(id.toString(), response.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals("true", response.obj().getValue("recorded").jsonPrimitive.content)
+		assertEquals(1, passes(me))
+		assertEquals(1, count("SELECT count(*) FROM work_alias_observation WHERE user_id = '$me'"), "no new note of the entry")
+	}
+
+	@Test
+	fun `an entry two other accounts observed is found, one is not enough`() = testApplication {
+		setup()
+		val me = user("me")
+		val first = user("first")
+		val second = user("second")
+		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		observe(id, "/manga/two", first)
+
+		val one = passByEntry("me", "/manga/two")
+		assertEquals(JsonNull, one.obj().getValue("work_id"))
+		assertEquals(0, passes(me))
+
+		observe(id, "/manga/two", second)
+		val two = passByEntry("me", "/manga/two")
+		assertEquals(id.toString(), two.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals(1, passes(me))
+		assertEquals(0, count("SELECT count(*) FROM work_alias_observation WHERE user_id = '$me'"), "passing is not opening")
+	}
+
+	@Test
+	fun `observations by sanctioned accounts do not corroborate an entry`() = testApplication {
+		setup()
+		val me = user("me")
+		val banned = user("banned")
+		val shadowbanned = user("shadowbanned")
+		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		observe(id, "/manga/sanctioned", banned, shadowbanned)
+		source.connection.use { connection ->
+			connection.createStatement().use { statement ->
+				statement.execute("UPDATE app_user SET is_banned = TRUE WHERE id = '$banned'")
+				statement.execute("UPDATE app_user SET is_shadowbanned = TRUE WHERE id = '$shadowbanned'")
+			}
+		}
+
+		val response = passByEntry("me", "/manga/sanctioned")
+
+		assertEquals(JsonNull, response.obj().getValue("work_id"))
+		assertEquals(0, passes(me))
+	}
+
+	@Test
+	fun `an alias nobody verified is not trusted on its own`() = testApplication {
+		setup()
+		val me = user("me")
+		val id = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		source.connection.use { connection ->
+			connection.prepareStatement(
+				"INSERT INTO work_alias (source, source_key, work_id, is_verified) VALUES ('SOURCE_A', '/manga/legacy', ?, FALSE)",
+			).use { statement ->
+				statement.setLong(1, id)
+				statement.executeUpdate()
+			}
+		}
+
+		val response = passByEntry("me", "/manga/legacy")
+
+		assertEquals(JsonNull, response.obj().getValue("work_id"))
+		assertEquals("false", response.obj().getValue("recorded").jsonPrimitive.content)
+		assertEquals(0, passes(me))
+	}
+
+	@Test
+	fun `what the caller observed wins over what other accounts agree on`() = testApplication {
+		setup()
+		val me = user("me")
+		val first = user("first")
+		val second = user("second")
+		val mine = works.createWork("Mine", 2020, "manga", false)
+		val theirs = works.createWork("Theirs", 2020, "manga", false)
+		observe(mine, "/manga/disputed", me)
+		observe(theirs, "/manga/disputed", first, second)
+
+		val response = passByEntry("me", "/manga/disputed")
+
+		assertEquals(mine.toString(), response.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals(1, count("SELECT count(*) FROM work_pass WHERE work_id = $mine AND user_id = '$me'"))
+		assertEquals(0, count("SELECT count(*) FROM work_pass WHERE work_id = $theirs"))
+	}
+
+	@Test
+	fun `a pass by source and key follows a merge to the survivor`() = testApplication {
+		setup()
+		val me = user("me")
+		val other = user("other")
+		val first = user("first")
+		val second = user("second")
+		val survivor = works.createWork("Tower of Mirrors", 2020, "manga", false)
+		val duplicate = works.createWork("Tower of Mirrors (dup)", 2020, "manga", false)
+		observe(duplicate, "/manga/own-dup", me)
+		observe(duplicate, "/manga/shared-dup", first, second)
+		works.mergeWorks(from = duplicate, into = survivor, reason = "test")
+
+		val own = passByEntry("me", "/manga/own-dup")
+		val shared = passByEntry("other", "/manga/shared-dup")
+
+		assertEquals(survivor.toString(), own.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals(survivor.toString(), shared.obj().getValue("work_id").jsonPrimitive.content)
+		assertEquals(1, count("SELECT count(*) FROM work_pass WHERE work_id = $survivor AND user_id = '$me'"))
+		assertEquals(1, count("SELECT count(*) FROM work_pass WHERE work_id = $survivor AND user_id = '$other'"))
+		assertEquals(0, count("SELECT count(*) FROM work_pass WHERE work_id = $duplicate"))
+	}
 }
