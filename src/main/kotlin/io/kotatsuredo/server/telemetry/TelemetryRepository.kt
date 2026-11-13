@@ -1,5 +1,6 @@
 package io.kotatsuredo.server.telemetry
 
+import io.kotatsuredo.server.db.withBackgroundLimits
 import java.sql.Types
 import java.time.LocalDate
 import javax.sql.DataSource
@@ -65,6 +66,14 @@ class TelemetryRepository(private val dataSource: DataSource) {
 	 */
 	fun rollUpThrough(throughDay: LocalDate): Int =
 		dataSource.connection.use { connection ->
+			// It reads every raw row up to the day, which in production now takes longer than the 15 seconds
+			// a request may run. Under those limits it failed on every pass, so no day was rolled up and the
+			// purge started deleting raw rows that never reached the history.
+			connection.withBackgroundLimits { rollUp(connection, throughDay) }
+		}
+
+	private fun rollUp(connection: java.sql.Connection, throughDay: LocalDate): Int =
+		run {
 			connection.prepareStatement(
 				"""
 				INSERT INTO source_probe_daily

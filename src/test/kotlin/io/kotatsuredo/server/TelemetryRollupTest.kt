@@ -85,6 +85,60 @@ class TelemetryRollupTest {
 		assertEquals(Triple(2, 30L, 4L), rolled(day, "SOURCE"))
 	}
 
+	/**
+	 * The rollup reads every raw row up to the day, which outgrew a request's 15 seconds and made every pass
+	 * fail. A trigger on the table it writes records the statement timeout the writing statement ran under.
+	 */
+	@Test
+	fun `the rollup runs under the background limits and leaves nothing behind`() {
+		val day = LocalDate.of(2026, 9, 1)
+		insertRaw(day, "SOURCE", "reporter-1", ok = 10, fail = 1)
+		val source = PostgresTestBase.database.source
+		fun execute(sql: String) = source.connection.use { it.createStatement().use { s -> s.execute(sql) } }
+		execute("DROP TRIGGER IF EXISTS record_rollup_limits ON source_probe_daily")
+		execute("DROP FUNCTION IF EXISTS record_rollup_limits()")
+		execute("DROP TABLE IF EXISTS rollup_limits_seen")
+		execute("CREATE TABLE rollup_limits_seen (statement_timeout TEXT)")
+		execute(
+			"""
+			CREATE FUNCTION record_rollup_limits() RETURNS trigger LANGUAGE plpgsql AS '
+			BEGIN
+				INSERT INTO rollup_limits_seen VALUES (current_setting(''statement_timeout''));
+				RETURN NEW;
+			END'
+			""".trimIndent(),
+		)
+		execute(
+			"CREATE TRIGGER record_rollup_limits AFTER INSERT ON source_probe_daily " +
+				"FOR EACH ROW EXECUTE FUNCTION record_rollup_limits()",
+		)
+		try {
+			repository.rollUpThrough(day)
+
+			val seen = source.connection.use { connection ->
+				connection.createStatement().use { statement ->
+					statement.executeQuery("SELECT statement_timeout FROM rollup_limits_seen").use { rows ->
+						buildList { while (rows.next()) add(rows.getString(1)) }
+					}
+				}
+			}
+			assertEquals(listOf("5min"), seen)
+			assertEquals(Triple(1, 10L, 1L), rolled(day, "SOURCE"), "and the result is committed")
+			source.connection.use { connection ->
+				connection.createStatement().use { statement ->
+					statement.executeQuery("SHOW statement_timeout").use { rows ->
+						rows.next()
+						assertEquals("0", rows.getString(1), "the limit ended with the call")
+					}
+				}
+			}
+		} finally {
+			execute("DROP TRIGGER record_rollup_limits ON source_probe_daily")
+			execute("DROP FUNCTION record_rollup_limits()")
+			execute("DROP TABLE rollup_limits_seen")
+		}
+	}
+
 	@Test
 	fun `rolling up twice does not double count`() {
 		val day = LocalDate.of(2026, 9, 1)
