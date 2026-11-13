@@ -37,7 +37,12 @@ ENV PORT=8787
 EXPOSE 8787
 
 # Container-aware heap sizing; the JVM otherwise assumes it owns the host.
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=70 -XX:+UseContainerSupport"
+#
+# ExitOnOutOfMemoryError: a server that has run out of memory once is not to be trusted again. Whichever
+# threads asked for memory at that moment are dead, request threads among them, while the health check can
+# still answer, so nothing restarts it and a share of requests fail for hours. Exiting at once lets Docker's
+# restart policy bring a whole one back within seconds.
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=70 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 	CMD ["/bin/sh", "-c", "wget -qO- http://127.0.0.1:${PORT}/v1/health >/dev/null || exit 1"]

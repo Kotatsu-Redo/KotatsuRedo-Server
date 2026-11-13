@@ -56,7 +56,6 @@ import io.kotatsuredo.server.telemetry.TelemetryRepository
 import io.kotatsuredo.server.telemetry.TelemetryRetention
 import io.kotatsuredo.server.telemetry.TelemetryService
 import io.kotatsuredo.server.works.CoReading
-import io.kotatsuredo.server.works.WorkDeduplicator
 import io.kotatsuredo.server.works.WorkEnricher
 import io.kotatsuredo.server.works.WorkLinker
 import io.kotatsuredo.server.works.WorkRepository
@@ -158,8 +157,13 @@ fun main(args: Array<String>) {
 	scoring.schedule(jobs)
 	// Forgets the text behind old blocks, and demotes rules that keep being wrong.
 	filters.schedule(jobs)
-	// Merges works that were split across sources, so nobody has to find them by hand.
-	WorkDeduplicator(workRepository, ratings).schedule(jobs)
+	// The duplicate sweep is NOT scheduled for now. It loads every active work, with all its titles and two
+	// indexes over them, into memory at once. At 670,000 works that is about as much as the whole heap: on
+	// 13 November 2026 it ran out of memory five minutes after every start, and an out-of-memory error
+	// leaves the server half alive (some request threads dead, the health check still green). Works that were
+	// split across sources stay split until the sweep is rewritten to work through them in bounded memory;
+	// the enricher below still merges the ones a catalogue identifies.
+	// WorkDeduplicator(workRepository, ratings).schedule(jobs)
 	// Describes newly seen works after the fact, so no reader waits on Kitsu or MangaUpdates.
 	WorkEnricher(workRepository, catalogue, ratings).schedule(jobs)
 	// Counts which works the same accounts open, for suggestions; aggregate, rebuilt daily.
